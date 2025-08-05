@@ -83,16 +83,27 @@ class SimpleMaskPLSONNXConverter:
         self.output_dir.mkdir(exist_ok=True)
         
     def convert_decoder_simple(self, max_points=30000):
-        """Simple decoder conversion focusing on core functionality"""
-        print(f"🔄 Converting decoder to ONNX (simplified, {max_points} points)...")
+        """Simple decoder conversion using real backbone features"""
+        print(f"🔄 Converting decoder to ONNX (using real backbone, {max_points} points)...")
         
         try:
-            # Extract the decoder
-            decoder = self.model.decoder
-            decoder.eval()
+            # Step 1: Generate realistic features using the backbone
+            print("   🔧 Generating realistic features using backbone...")
             
-            # Create a wrapper that's more ONNX-friendly
-            class SimpleDecoderWrapper(torch.nn.Module):
+            # Create sample input for backbone
+            sample_input = self.create_sample_input(max_points)
+            
+            # Run backbone to get real features
+            with torch.no_grad():
+                self.model.eval()
+                feats, coors, pad_masks, bb_logits = self.model.backbone(sample_input)
+            
+            print(f"   ✅ Backbone generated features:")
+            for i, feat in enumerate(feats):
+                print(f"      Level {i}: {feat.shape}")
+            
+            # Step 2: Create decoder wrapper
+            class RealisticDecoderWrapper(torch.nn.Module):
                 def __init__(self, original_decoder):
                     super().__init__()
                     self.decoder = original_decoder
@@ -100,75 +111,94 @@ class SimpleMaskPLSONNXConverter:
                 def forward(self, feats_0, feats_1, feats_2, feats_3, 
                            coors_0, coors_1, coors_2, coors_3,
                            pad_masks_0, pad_masks_1, pad_masks_2, pad_masks_3):
-                    """Simplified forward with separate inputs"""
+                    """Forward with correct feature dimensions"""
                     feats = [feats_0, feats_1, feats_2, feats_3]
                     coors = [coors_0, coors_1, coors_2, coors_3]
                     pad_masks = [pad_masks_0, pad_masks_1, pad_masks_2, pad_masks_3]
                     
-                    # Run original decoder logic but simplified
-                    try:
-                        outputs, padding = self.decoder(feats, coors, pad_masks)
-                        return outputs['pred_logits'], outputs['pred_masks'], padding
-                    except Exception as e:
-                        print(f"   Decoder forward failed: {e}")
-                        # Return dummy outputs with correct shapes
-                        batch_size = feats[0].shape[0]
-                        num_queries = 100
-                        num_classes = 20
-                        dummy_logits = torch.zeros(batch_size, num_queries, num_classes + 1)
-                        dummy_masks = torch.zeros(batch_size, max_points, num_queries)
-                        dummy_padding = torch.zeros(batch_size, max_points, dtype=torch.bool)
-                        return dummy_logits, dummy_masks, dummy_padding
+                    # Run decoder (should work now with correct dimensions)
+                    outputs, padding = self.decoder(feats, coors, pad_masks)
+                    return outputs['pred_logits'], outputs['pred_masks'], padding
             
-            wrapper = SimpleDecoderWrapper(decoder)
+            wrapper = RealisticDecoderWrapper(self.model.decoder)
             
-            # Create simple fixed-size inputs
-            batch_size = 1
-            hidden_dim = 256
-            
+            # Step 3: Reshape features to fixed size for ONNX
+            print("   🔧 Preparing ONNX inputs with correct dimensions...")
             dummy_inputs = []
             input_names = []
             
-            # Feature inputs
-            for i in range(4):
-                feat = torch.randn(batch_size, max_points, hidden_dim)
-                dummy_inputs.append(feat)
-                input_names.append(f'feats_{i}')
+            # Pad/trim features to fixed size
+            batch_size = feats[0].shape[0]
             
-            # Coordinate inputs  
-            for i in range(4):
-                coor = torch.randn(batch_size, max_points, 3)
-                dummy_inputs.append(coor)
-                input_names.append(f'coors_{i}')
+            for i, (feat, coor, mask) in enumerate(zip(feats, coors, pad_masks)):
+                current_points = feat.shape[1]
+                target_channels = feat.shape[2]
+                
+                if current_points >= max_points:
+                    # Trim to max_points
+                    feat_fixed = feat[:, :max_points, :]
+                    coor_fixed = coor[:, :max_points, :]
+                    mask_fixed = mask[:, :max_points]
+                else:
+                    # Pad to max_points
+                    pad_points = max_points - current_points
+                    feat_fixed = torch.cat([feat, torch.zeros(batch_size, pad_points, target_channels)], dim=1)
+                    coor_fixed = torch.cat([coor, torch.zeros(batch_size, pad_points, 3)], dim=1)
+                    mask_fixed = torch.cat([mask, torch.ones(batch_size, pad_points, dtype=torch.bool)], dim=1)
+                
+                dummy_inputs.extend([feat_fixed, coor_fixed, mask_fixed])
+                input_names.extend([f'feats_{i}', f'coors_{i}', f'pad_masks_{i}'])
             
-            # Padding mask inputs
-            for i in range(4):
-                mask = torch.zeros(batch_size, max_points, dtype=torch.bool)
-                dummy_inputs.append(mask)
-                input_names.append(f'pad_masks_{i}')
+            # Step 4: Export to ONNX
+            onnx_path = self.output_dir / f"realistic_decoder_{max_points}pts.onnx"
             
-            # Export to ONNX
-            onnx_path = self.output_dir / f"simple_decoder_{max_points}pts.onnx"
+            # Test the wrapper first
+            print("   🧪 Testing wrapper before ONNX export...")
+            test_inputs = []
+            for i in range(0, len(dummy_inputs), 3):  # Group by 3 (feat, coor, mask)
+                test_inputs.extend(dummy_inputs[i:i+3])
             
+            with torch.no_grad():
+                try:
+                    test_outputs = wrapper(*test_inputs)
+                    print(f"   ✅ Wrapper test successful, output shapes: {[o.shape for o in test_outputs]}")
+                except Exception as e:
+                    print(f"   ❌ Wrapper test failed: {e}")
+                    return None
+            
+            # Now export to ONNX
             torch.onnx.export(
                 wrapper,
-                tuple(dummy_inputs),
+                tuple(test_inputs),
                 str(onnx_path),
                 export_params=True,
                 opset_version=11,
                 do_constant_folding=True,
                 input_names=input_names,
                 output_names=['pred_logits', 'pred_masks', 'padding'],
-                dynamic_axes={name: {0: 'batch_size'} for name in input_names + ['pred_logits', 'pred_masks', 'padding']}
+                dynamic_axes={name: {0: 'batch_size'} for name in input_names + ['pred_logits', 'pred_masks', 'padding']},
+                verbose=False
             )
             
-            print(f"✅ Simple decoder exported to {onnx_path}")
+            print(f"✅ Realistic decoder exported to {onnx_path}")
             return onnx_path
             
         except Exception as e:
             print(f"❌ ONNX export failed: {e}")
-            print("   This is normal for first attempts - try with smaller max_points")
+            import traceback
+            traceback.print_exc()
             return None
+    
+    def create_sample_input(self, num_points):
+        """Create sample input for the backbone"""
+        # Generate realistic point cloud
+        points = torch.randn(num_points, 3) * 10  # 20m x 20m x 20m scene
+        features = torch.randn(num_points, 4)     # XYZI features
+        
+        return {
+            'pt_coord': [points.numpy()],
+            'feats': [features.numpy()],
+        }
     
     def validate_onnx_model(self, onnx_path):
         """Validate the ONNX model"""
@@ -235,3 +265,4 @@ def main():
         print("💡 Try with smaller --max_points (e.g., 10000)")
 
 if __name__ == "__main__":
+    main()
