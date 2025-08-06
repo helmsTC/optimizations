@@ -87,6 +87,104 @@ def apply_model_fixes(model):
         generate_attention_mask_fixed,
         model.decoder
     )
+    # Fix 5: NEW - Fix hanging on conditional checks
+    # Replace the decoder's forward method to avoid dynamic conditionals
+    original_forward = model.decoder.forward
+    
+    def forward_no_conditionals(self, feats, mask_features, pad_masks):
+        """Forward pass without dynamic conditionals that cause ONNX to hang"""
+        B = feats[0].shape[0] if feats else 1
+        
+        # Initialize queries
+        query_feat = self.query_feat.expand(B, -1, -1)
+        query_pos = self.query_pos.expand(B, -1, -1)
+        
+        # Project mask features and add positional encoding
+        # REMOVE the conditional check that causes hanging
+        mask_features = self.mask_feat_proj(mask_features)
+        # Always apply positional encoding (no conditional)
+        mask_features = mask_features + self.pos_encoder(mask_features)
+        
+        # Store predictions at each layer
+        predictions_class = []
+        predictions_mask = []
+        
+        # Initial prediction
+        outputs_class, outputs_mask = self.predict_masks(query_feat, mask_features)
+        predictions_class.append(outputs_class)
+        predictions_mask.append(outputs_mask)
+        
+        # Process through transformer layers
+        for i in range(self.num_layers):
+            level_index = i % self.num_feature_levels
+            
+            # Get features for current level
+            if level_index < len(feats):
+                level_features = self.input_proj[level_index](feats[level_index])
+                level_emb = self.level_embed.weight[level_index:level_index+1]
+                level_features = level_features + level_emb
+                level_features = level_features + self.pos_encoder(level_features)
+                
+                # Get padding mask
+                level_pad_mask = pad_masks[level_index] if level_index < len(pad_masks) else None
+                
+                # Generate attention mask
+                # Use None instead of conditional generation for first iteration
+                if i == 0:
+                    attn_mask = None
+                else:
+                    attn_mask = self.generate_attention_mask(predictions_mask[-1], level_pad_mask)
+                
+                # Transformer layer
+                query_feat = self.transformer_layers[i](
+                    query_feat,
+                    level_features,
+                    query_pos=query_pos,
+                    memory_mask=attn_mask,
+                    memory_key_padding_mask=level_pad_mask
+                )
+                
+                # Predict at this layer
+                outputs_class, outputs_mask = self.predict_masks(query_feat, mask_features)
+                predictions_class.append(outputs_class)
+                predictions_mask.append(outputs_mask)
+        
+        # Final output
+        out = {
+            'pred_logits': predictions_class[-1],
+            'pred_masks': predictions_mask[-1],
+            'aux_outputs': self.set_aux_outputs(predictions_class[:-1], predictions_mask[:-1])
+        }
+        
+        return out
+    
+    # Replace the forward method
+    model.decoder.forward = types.MethodType(forward_no_conditionals, model.decoder)
+    
+    # Also fix the predict_masks method to avoid conditionals
+    original_predict_masks = model.decoder.predict_masks
+    
+    def predict_masks_no_conditionals(self, query_feat, mask_features):
+        """Predict masks without conditionals"""
+        decoder_output = self.decoder_norm(query_feat)
+        outputs_class = self.class_embed(decoder_output)
+        mask_embed = self.mask_embed(decoder_output)
+        
+        # Always compute mask logits (no conditional)
+        # Use bmm which works better for ONNX
+        outputs_mask = torch.bmm(mask_features, mask_embed.transpose(1, 2))
+        
+        return outputs_class, outputs_mask
+    
+    model.decoder.predict_masks = types.MethodType(
+        predict_masks_no_conditionals, model.decoder
+    )
+    
+    print("  ✓ Fixed spatial dimensions: (128, 128, 32)")
+    print("  ✓ Applied flexible positional encoding")
+    print("  ✓ Fixed decoder dimension mismatches")
+    print("  ✓ Fixed attention mask shape")
+    print("  ✓ Fixed ONNX export hanging issue")
     
     return model
 
