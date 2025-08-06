@@ -1,287 +1,202 @@
 #!/usr/bin/env python3
 """
-analyze_bag_improved.py - Improved ROS 2 bag timestamp analyzer with CDR support
---------------------------------------------------------------------------------
-Handles CDR encapsulation and alignment properly.
+debug_bag_messages.py - Debug tool to understand ROS 2 bag message structure
+----------------------------------------------------------------------------
+This will help us figure out where the actual timestamps are.
 """
 
 import argparse
 import os
 import sqlite3
 import struct
-from collections import defaultdict
-from typing import Optional, Tuple
-
-import matplotlib.pyplot as plt
+from datetime import datetime
 
 
-def read_cdr_header(data: bytes, offset: int = 0) -> Tuple[int, int]:
-    """
-    Read CDR encapsulation header (4 bytes).
-    Returns (endianness, next_offset).
-    """
-    if len(data) < offset + 4:
-        return 0, offset
-    
-    # CDR header: 2 bytes for representation, 2 bytes options
-    repr_id, options = struct.unpack_from('<HH', data, offset)
-    
-    # Check endianness (0x0001 = little endian CDR, 0x0000 = big endian CDR)
-    is_little = (repr_id & 0xFF) == 0x01
-    
-    return 1 if is_little else 0, offset + 4
-
-
-def align_offset(offset: int, alignment: int) -> int:
-    """Align offset to the specified alignment boundary."""
-    remainder = offset % alignment
-    if remainder == 0:
-        return offset
-    return offset + (alignment - remainder)
-
-
-def extract_timestamp_from_cdr(data: bytes, skip_array_length: bool = False) -> Optional[float]:
-    """
-    Extract timestamp from CDR-encoded message data.
-    
-    Args:
-        data: Raw message bytes
-        skip_array_length: True for /tf messages (need to skip 4-byte array length)
-    
-    Returns:
-        Timestamp in seconds or None if extraction failed
-    """
-    try:
-        # Read CDR header
-        endian, offset = read_cdr_header(data, 0)
-        endian_char = '<' if endian else '>'
-        
-        # Skip array length for /tf messages
-        if skip_array_length:
-            if len(data) < offset + 4:
-                return None
-            # Read array length (typically for transforms[] array)
-            array_len = struct.unpack_from(f'{endian_char}I', data, offset)[0]
-            offset += 4
-            
-            # Sanity check array length
-            if array_len == 0 or array_len > 1000:  # arbitrary upper limit
-                return None
-        
-        # Align to 8-byte boundary for the timestamp structure
-        offset = align_offset(offset, 8)
-        
-        # Read timestamp (sec: uint32, nanosec: uint32)
-        if len(data) < offset + 8:
-            return None
-            
-        sec, nsec = struct.unpack_from(f'{endian_char}II', data, offset)
-        
-        # Validate nanoseconds
-        if nsec >= 1_000_000_000:
-            # Try alternate offset in case of alignment issues
-            offset_alt = offset + 4
-            if len(data) >= offset_alt + 8:
-                sec, nsec = struct.unpack_from(f'{endian_char}II', data, offset_alt)
-                if nsec >= 1_000_000_000:
-                    return None
-        
-        # Convert to seconds
-        return sec + nsec * 1e-9
-        
-    except Exception as e:
-        # Uncomment for debugging
-        # print(f"Error extracting timestamp: {e}")
+def analyze_bytes_as_timestamp(data: bytes, offset: int, name: str = ""):
+    """Try to interpret 8 bytes as a ROS timestamp and show if it makes sense."""
+    if len(data) < offset + 8:
         return None
+    
+    # Try little-endian
+    sec_le, nsec_le = struct.unpack_from('<II', data, offset)
+    stamp_le = sec_le + nsec_le * 1e-9
+    
+    # Try big-endian  
+    sec_be, nsec_be = struct.unpack_from('>II', data, offset)
+    stamp_be = sec_be + nsec_be * 1e-9
+    
+    # Check if these could be valid timestamps
+    results = []
+    
+    # Check little-endian
+    if nsec_le < 1_000_000_000:  # Valid nanoseconds
+        if 0 <= stamp_le <= 3600*24*365*10:  # Less than 10 years in seconds (simulation time)
+            results.append(f"  LE@{offset:3}: {stamp_le:12.6f}s (sim time: {sec_le}s + {nsec_le}ns)")
+        elif 1000000000 <= stamp_le <= 2000000000:  # Unix epoch between 2001 and 2033
+            dt = datetime.fromtimestamp(stamp_le)
+            results.append(f"  LE@{offset:3}: {stamp_le:12.6f}s (wall: {dt.strftime('%Y-%m-%d %H:%M:%S')})")
+    
+    # Check big-endian
+    if nsec_be < 1_000_000_000:  # Valid nanoseconds
+        if 0 <= stamp_be <= 3600*24*365*10:  # Less than 10 years in seconds
+            results.append(f"  BE@{offset:3}: {stamp_be:12.6f}s (sim time: {sec_be}s + {nsec_be}ns)")
+        elif 1000000000 <= stamp_be <= 2000000000:  # Unix epoch
+            dt = datetime.fromtimestamp(stamp_be)
+            results.append(f"  BE@{offset:3}: {stamp_be:12.6f}s (wall: {dt.strftime('%Y-%m-%d %H:%M:%S')})")
+    
+    return results
 
 
-def extract_message_stamp(topic_name: str, msg_bytes: bytes) -> Optional[float]:
-    """
-    Extract timestamp from message based on topic type.
+def debug_message_structure(topic_name: str, msg_bytes: bytes, sample_num: int = 1):
+    """Analyze a message to find potential timestamp locations."""
+    print(f"\n{'='*70}")
+    print(f"Topic: {topic_name} (Sample #{sample_num})")
+    print(f"Message size: {len(msg_bytes)} bytes")
+    print(f"{'='*70}")
     
-    Args:
-        topic_name: Name of the ROS topic
-        msg_bytes: Raw message data
+    # Show first 64 bytes in hex
+    print("\nFirst 64 bytes (hex):")
+    for i in range(0, min(64, len(msg_bytes)), 16):
+        hex_str = ' '.join(f'{b:02x}' for b in msg_bytes[i:i+16])
+        ascii_str = ''.join(chr(b) if 32 <= b < 127 else '.' for b in msg_bytes[i:i+16])
+        print(f"  {i:04x}: {hex_str:<48} |{ascii_str}|")
     
-    Returns:
-        Timestamp in seconds or None
-    """
-    # Special handling for tf messages
-    if topic_name in ['/tf', '/tf_static']:
-        return extract_timestamp_from_cdr(msg_bytes, skip_array_length=True)
+    # Check for CDR header
+    if len(msg_bytes) >= 4:
+        cdr_header = struct.unpack_from('<HH', msg_bytes, 0)
+        print(f"\nCDR Header: 0x{cdr_header[0]:04x} 0x{cdr_header[1]:04x}")
+        if cdr_header[0] & 0xFF == 0x01:
+            print("  -> Little-endian CDR")
+        elif cdr_header[0] & 0xFF == 0x00:
+            print("  -> Big-endian CDR")
     
-    # Standard header messages
-    return extract_timestamp_from_cdr(msg_bytes, skip_array_length=False)
+    # Look for potential timestamps at various offsets
+    print("\nSearching for valid timestamps (trying various offsets):")
+    found_any = False
+    
+    # Common offsets to try
+    offsets_to_try = [
+        (0, "Start of message"),
+        (4, "After CDR header"),
+        (8, "After CDR + alignment"),
+        (12, "After CDR + array length"),
+        (16, "After CDR + array length + align"),
+    ]
+    
+    # Also try every 4-byte boundary up to 64 bytes
+    for i in range(0, min(64, len(msg_bytes)-7), 4):
+        offsets_to_try.append((i, f"Offset {i}"))
+    
+    # Remove duplicates while preserving order
+    seen = set()
+    unique_offsets = []
+    for offset, desc in offsets_to_try:
+        if offset not in seen:
+            seen.add(offset)
+            unique_offsets.append((offset, desc))
+    
+    for offset, desc in unique_offsets:
+        results = analyze_bytes_as_timestamp(msg_bytes, offset, desc)
+        if results:
+            if not found_any:
+                print(f"\n✅ Potential timestamps found:")
+                found_any = True
+            print(f"  {desc}:")
+            for r in results:
+                print(r)
+    
+    if not found_any:
+        print("  ❌ No valid timestamp patterns found in first 64 bytes")
+    
+    # Special handling for /tf messages
+    if '/tf' in topic_name and len(msg_bytes) >= 8:
+        print("\n🔍 Special /tf message analysis:")
+        # Try to read array length
+        array_len_le = struct.unpack_from('<I', msg_bytes, 4)[0]
+        array_len_be = struct.unpack_from('>I', msg_bytes, 4)[0]
+        print(f"  Array length at offset 4: LE={array_len_le}, BE={array_len_be}")
+        
+        if 0 < array_len_le < 100:  # Reasonable array size
+            print(f"  Likely {array_len_le} transforms in message (LE)")
+        elif 0 < array_len_be < 100:
+            print(f"  Likely {array_len_be} transforms in message (BE)")
 
 
-def analyze_bag(bag_path: str, verbose: bool = False) -> None:
-    """
-    Analyze ROS 2 bag for timestamp drift.
+def debug_bag(bag_path: str, max_samples: int = 3):
+    """Debug ROS 2 bag to understand message structure."""
     
-    Args:
-        bag_path: Path to bag directory
-        verbose: Enable verbose output
-    """
-    # Find the database file
+    # Find database file
     db3 = os.path.join(bag_path, "data_0.db3")
     if not os.path.isfile(db3):
-        # Try alternate naming
         db3 = os.path.join(bag_path, "data.db3")
         if not os.path.isfile(db3):
-            raise FileNotFoundError(
-                f"Could not find database file in {bag_path}\n"
-                f"Expected 'data_0.db3' or 'data.db3'"
-            )
+            raise FileNotFoundError(f"No .db3 file found in {bag_path}")
     
-    print(f"📂 Opening bag: {db3}")
+    print(f"📂 Opening: {db3}")
     
     conn = sqlite3.connect(db3)
     cur = conn.cursor()
     
-    # Get topic information
-    try:
-        cur.execute("SELECT id, name FROM topics")
-        topics = dict(cur.fetchall())
-    except sqlite3.OperationalError as e:
-        print(f"❌ Error reading topics table: {e}")
-        print("   This may not be a valid ROS 2 bag database.")
-        return
+    # Get topics
+    cur.execute("SELECT id, name, type FROM topics")
+    topics = cur.fetchall()
     
-    print(f"📊 Found {len(topics)} topics")
-    if verbose:
-        for tid, name in topics.items():
-            print(f"   • {name}")
+    print(f"\n📊 Topics in bag:")
+    for tid, name, msg_type in topics:
+        print(f"  [{tid:2}] {name:40} ({msg_type})")
     
-    # Gather (msg_stamp, bag_stamp) pairs per topic
-    drift_data = defaultdict(list)
-    failed_extractions = defaultdict(int)
-    total_messages = defaultdict(int)
+    # Sample a few messages from each topic
+    print(f"\n🔍 Analyzing message structure (up to {max_samples} samples per topic)...")
     
-    for tid, tname in topics.items():
-        cur.execute("SELECT timestamp, data FROM messages WHERE topic_id = ?", (tid,))
+    topics_to_analyze = [
+        '/clock',      # Should be simple Time message
+        '/tf',         # Array of transforms
+        '/gt_pose',    # Likely PoseStamped
+        '/imu',        # IMU data with header
+        '/vision/color'  # Image with header
+    ]
+    
+    for tid, name, msg_type in topics:
+        if name not in topics_to_analyze:
+            continue
+            
+        cur.execute(
+            "SELECT timestamp, data FROM messages WHERE topic_id = ? LIMIT ?",
+            (tid, max_samples)
+        )
         messages = cur.fetchall()
         
-        for bag_stamp_ns, raw in messages:
-            total_messages[tname] += 1
-            msg_stamp = extract_message_stamp(tname, raw)
-            
-            if msg_stamp is None:
-                failed_extractions[tname] += 1
-                continue
-                
-            # Convert bag timestamp from nanoseconds to seconds
+        for i, (bag_stamp_ns, raw) in enumerate(messages, 1):
             bag_stamp_sec = bag_stamp_ns * 1e-9
-            drift_data[tname].append((msg_stamp, bag_stamp_sec))
-    
-    # Print extraction statistics
-    print("\n📈 Extraction Statistics:")
-    for topic in sorted(total_messages.keys()):
-        total = total_messages[topic]
-        failed = failed_extractions[topic]
-        success = total - failed
-        if total > 0:
-            success_rate = (success / total) * 100
-            status = "✅" if success_rate > 50 else "⚠️" if success_rate > 0 else "❌"
-            print(f"   {status} {topic:40} {success:5}/{total:5} messages "
-                  f"({success_rate:.1f}% success rate)")
-    
-    if not drift_data:
-        print("\n❌ No timestamped messages could be extracted.")
-        print("   Possible causes:")
-        print("   • Messages don't have std_msgs/Header as first field")
-        print("   • Non-standard CDR encoding")
-        print("   • Custom message types")
-        return
-    
-    # Plot results
-    print("\n📊 Generating drift plot...")
-    plt.figure(figsize=(12, 7))
-    
-    overall_max = 0.0
-    colors = plt.cm.tab10(range(10))
-    
-    for idx, (topic, pairs) in enumerate(drift_data.items()):
-        if not pairs:
-            continue
+            print(f"\n📦 Bag timestamp: {bag_stamp_sec:.6f}s")
             
-        msg_times, bag_times = zip(*pairs)
-        overall_max = max(overall_max, max(msg_times + bag_times))
-        
-        # Use different colors for different topics
-        color = colors[idx % len(colors)]
-        plt.plot(msg_times, bag_times, '.', markersize=3, 
-                label=f"{topic} ({len(pairs)} msgs)", color=color, alpha=0.7)
-    
-    # Add ideal line
-    plt.plot([0, overall_max], [0, overall_max], 'k--', 
-             linewidth=1, label="Ideal (no drift)", alpha=0.5)
-    
-    plt.xlabel("Message Timestamp [s]")
-    plt.ylabel("Bag Recording Time [s]")
-    plt.title("ROS 2 Bag - Timestamp Drift Analysis")
-    plt.grid(True, alpha=0.3)
-    plt.legend(fontsize=8, loc='upper left')
-    plt.tight_layout()
-    
-    # Add text box with statistics
-    stats_text = "Drift Statistics:\n"
-    for topic, pairs in sorted(drift_data.items()):
-        if not pairs:
-            continue
-        drifts = [abs(bag - msg) for msg, bag in pairs]
-        avg_drift = sum(drifts) / len(drifts)
-        max_drift = max(drifts)
-        stats_text += f"{topic.split('/')[-1]}: avg={avg_drift:.3f}s, max={max_drift:.3f}s\n"
-    
-    plt.text(0.02, 0.98, stats_text, transform=plt.gca().transAxes,
-             fontsize=8, verticalalignment='top',
-             bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
-    
-    plt.show()
-    
-    # Print drift statistics
-    print("\n📊 Timestamp Drift Analysis:")
-    print("   " + "="*70)
-    print(f"   {'Topic':<40} {'Avg Drift':>12} {'Max Drift':>12} {'Status':>8}")
-    print("   " + "-"*70)
-    
-    for topic, pairs in sorted(drift_data.items()):
-        if not pairs:
-            continue
+            # If it's a reasonable bag timestamp, show wall time
+            if 1000000000 <= bag_stamp_sec <= 2000000000:
+                dt = datetime.fromtimestamp(bag_stamp_sec)
+                print(f"   (Wall time: {dt.strftime('%Y-%m-%d %H:%M:%S')})")
             
-        drifts = [abs(bag - msg) for msg, bag in pairs]
-        avg_drift = sum(drifts) / len(drifts)
-        max_drift = max(drifts)
-        
-        # Determine status based on drift
-        if avg_drift < 0.01:
-            status = "✅ Good"
-        elif avg_drift < 0.1:
-            status = "⚠️  OK"
-        elif avg_drift < 1.0:
-            status = "⚠️  High"
-        else:
-            status = "❌ Bad"
-        
-        print(f"   {topic:<40} {avg_drift:>11.4f}s {max_drift:>11.4f}s  {status}")
-    
-    print("   " + "="*70)
+            debug_message_structure(name, raw, i)
+            
+            if i >= max_samples:
+                break
     
     conn.close()
+    print("\n" + "="*70)
+    print("Debugging complete!")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="ROS 2 bag timestamp drift analyzer (no ROS dependencies)"
+        description="Debug ROS 2 bag message structure to find timestamps"
     )
-    parser.add_argument("bag", help="Path to the bag directory containing .db3 file")
-    parser.add_argument("-v", "--verbose", action="store_true", 
-                       help="Enable verbose output")
+    parser.add_argument("bag", help="Path to bag directory")
+    parser.add_argument("-n", "--samples", type=int, default=2,
+                       help="Number of samples per topic to analyze")
     
     args = parser.parse_args()
     
     try:
-        analyze_bag(args.bag, args.verbose)
+        debug_bag(args.bag, args.samples)
     except Exception as e:
         print(f"❌ Error: {e}")
         import traceback
