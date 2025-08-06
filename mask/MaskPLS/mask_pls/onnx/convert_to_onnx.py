@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Simplified MaskPLS to ONNX converter with minimal dependencies
-This version includes automatic fixes for common issues
+This version includes ALL automatic fixes for common issues
 """
 
 import os
@@ -18,10 +18,10 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 def apply_model_fixes(model):
     """
-    Apply fixes for common ONNX export issues
-    - Spatial shape fix for kernel size error
-    - Flexible positional encoding for variable input sizes
+    Apply ALL 4 fixes for common ONNX export issues
     """
+    import torch.nn as nn
+    
     # Fix 1: Increase spatial dimensions to prevent kernel size errors
     model.backbone.spatial_shape = (128, 128, 32)
     model.spatial_shape = (128, 128, 32)
@@ -40,7 +40,25 @@ def apply_model_fixes(model):
         flexible_pe_forward, 
         model.decoder.pos_encoder
     )
-
+    
+    # Fix 3: Fix dimension mismatch in decoder (THIS WAS MISSING!)
+    # The backbone outputs [256, 128, 96] but decoder expects different dims
+    hidden_dim = 256  # Decoder hidden dimension
+    
+    # Recreate input projections with correct dimensions
+    new_input_proj = nn.ModuleList([
+        nn.Identity(),        # 256 -> 256 (no change needed)
+        nn.Linear(128, 256),  # 128 -> 256 (projection needed)
+        nn.Linear(96, 256),   # 96 -> 256 (projection needed)
+    ])
+    
+    # Replace the decoder's input projections
+    model.decoder.input_proj = new_input_proj
+    
+    # Also fix mask feature projection (last backbone output is 96 channels)
+    model.decoder.mask_feat_proj = nn.Linear(96, 256)
+    
+    # Fix 4: Fix attention mask shape
     def generate_attention_mask_fixed(self, mask_pred, pad_mask):
         """Generate attention mask with correct dimensions for cross-attention"""
         # Threshold predicted masks
@@ -68,6 +86,8 @@ def apply_model_fixes(model):
     model.decoder.generate_attention_mask = types.MethodType(
         generate_attention_mask_fixed,
         model.decoder
+    )
+    
     return model
 
 
@@ -143,6 +163,8 @@ def simple_convert():
     model = apply_model_fixes(model)
     print("  ✓ Fixed spatial dimensions: (128, 128, 32)")
     print("  ✓ Applied flexible positional encoding")
+    print("  ✓ Fixed decoder dimension mismatches")
+    print("  ✓ Fixed attention mask shape")
     
     model.eval()
     
