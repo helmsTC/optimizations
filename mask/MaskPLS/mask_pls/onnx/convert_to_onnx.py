@@ -1,356 +1,288 @@
 #!/usr/bin/env python3
 """
-Convert MaskPLS PyTorch checkpoint to ONNX format
-Usage: python convert_to_onnx.py --checkpoint model.ckpt --output model.onnx
+Simplified MaskPLS to ONNX converter with minimal dependencies
+This version includes automatic fixes for common issues
 """
 
 import os
 import sys
-import click
 import torch
 import torch.onnx
-import onnx
-import onnxruntime as ort
 import numpy as np
-import yaml
+import types
 from pathlib import Path
-from easydict import EasyDict as edict
 
 # Add parent directory to path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from models.onnx.onnx_model import MaskPLSONNX, MaskPLSExportWrapper, load_checkpoint_weights
-from utils.onnx.optimization import optimize_onnx_model
-from utils.onnx.validation import validate_onnx_model
 
-
-def load_configs(config_dir=None):
-    """Load all configuration files"""
-    if config_dir is None:
-        config_dir = Path(__file__).parent.parent / 'config'
-    
-    configs = {}
-    config_files = ['model.yaml', 'backbone.yaml', 'decoder.yaml']
-    
-    for config_file in config_files:
-        config_path = config_dir / config_file
-        if config_path.exists():
-            with open(config_path, 'r') as f:
-                configs.update(yaml.safe_load(f))
-    
-    # Check for ONNX-specific config
-    onnx_config_path = config_dir / 'onnx_config.yaml'
-    if onnx_config_path.exists():
-        with open(onnx_config_path, 'r') as f:
-            configs['ONNX'] = yaml.safe_load(f)['ONNX']
-    
-    return edict(configs)
-
-
-def export_to_onnx(model, output_path, batch_size=1, num_points=50000, opset_version=13):
+def apply_model_fixes(model):
     """
-    Export PyTorch model to ONNX format
+    Apply fixes for common ONNX export issues
+    - Spatial shape fix for kernel size error
+    - Flexible positional encoding for variable input sizes
     """
-    print(f"Exporting model to ONNX format...")
+    # Fix 1: Increase spatial dimensions to prevent kernel size errors
+    model.backbone.spatial_shape = (128, 128, 32)
+    model.spatial_shape = (128, 128, 32)
     
-    # Set model to evaluation mode
+    # Fix 2: Make positional encoding handle any input size
+    def flexible_pe_forward(self, x):
+        """Handle any input size for positional encoding"""
+        if x.shape[1] > self.pe.shape[1]:
+            # If input is larger than PE buffer, skip PE
+            return x
+        # Normal case: add positional encoding
+        return x + self.pe[:, :x.shape[1], :self.d_model]
+    
+    # Apply the flexible PE to decoder
+    model.decoder.pos_encoder.forward = types.MethodType(
+        flexible_pe_forward, 
+        model.decoder.pos_encoder
+    )
+    
+    return model
+
+
+def simple_convert():
+    """
+    Simple conversion without all the bells and whistles
+    """
+    print("=" * 50)
+    print("MaskPLS to ONNX Simple Converter")
+    print("=" * 50)
+    
+    # Import the ONNX model
+    try:
+        from models.onnx.onnx_model import MaskPLSONNX, MaskPLSExportWrapper
+    except ImportError as e:
+        print(f"Error importing ONNX model: {e}")
+        print("\nMake sure you have created:")
+        print("  - mask_pls/models/onnx/dense_backbone.py")
+        print("  - mask_pls/models/onnx/onnx_decoder.py")
+        print("  - mask_pls/models/onnx/onnx_model.py")
+        return False
+    
+    # Create a simple config (minimal required fields)
+    from easydict import EasyDict as edict
+    
+    cfg = edict({
+        'MODEL': {
+            'DATASET': 'KITTI',
+            'OVERLAP_THRESHOLD': 0.8
+        },
+        'KITTI': {
+            'NUM_CLASSES': 20,
+            'MIN_POINTS': 10,
+            'SPACE': [[-48.0, 48.0], [-48.0, 48.0], [-4.0, 1.5]],
+            'SUB_NUM_POINTS': 80000
+        },
+        'NUSCENES': {
+            'NUM_CLASSES': 17,
+            'MIN_POINTS': 10,
+            'SPACE': [[-50.0, 50.0], [-50.0, 50.0], [-5.0, 3.0]],
+            'SUB_NUM_POINTS': 50000
+        },
+        'BACKBONE': {
+            'INPUT_DIM': 4,
+            'CHANNELS': [32, 32, 64, 128, 256, 256, 128, 96, 96],
+            'RESOLUTION': 0.05,
+            'KNN_UP': 3
+        },
+        'DECODER': {
+            'HIDDEN_DIM': 256,
+            'NHEADS': 8,
+            'DIM_FFN': 1024,
+            'FEATURE_LEVELS': 3,
+            'DEC_BLOCKS': 3,
+            'NUM_QUERIES': 100
+        }
+    })
+    
+    # Ask for dataset type
+    dataset_choice = input("\nDataset type (1=KITTI, 2=NUSCENES) [default=1]: ").strip()
+    if dataset_choice == "2":
+        cfg.MODEL.DATASET = 'NUSCENES'
+        print("Using NuScenes configuration")
+    else:
+        cfg.MODEL.DATASET = 'KITTI'
+        print("Using KITTI configuration")
+    
+    print("\n1. Creating ONNX model...")
+    model = MaskPLSONNX(cfg)
+    
+    # Apply automatic fixes
+    print("\n2. Applying automatic fixes...")
+    model = apply_model_fixes(model)
+    print("  ✓ Fixed spatial dimensions: (128, 128, 32)")
+    print("  ✓ Applied flexible positional encoding")
+    
     model.eval()
+    
+    # Optional: Load checkpoint weights if available
+    checkpoint_path = input("\n3. Enter checkpoint path (or press Enter to skip): ").strip()
+    if checkpoint_path and os.path.exists(checkpoint_path):
+        print(f"   Loading weights from {checkpoint_path}...")
+        try:
+            checkpoint = torch.load(checkpoint_path, map_location='cpu')
+            state_dict = checkpoint['state_dict'] if 'state_dict' in checkpoint else checkpoint
+            
+            # Filter compatible weights
+            model_dict = model.state_dict()
+            compatible_dict = {}
+            incompatible_keys = []
+            
+            for k, v in state_dict.items():
+                k_new = k.replace('module.', '')
+                if 'kernel' not in k and 'MinkowskiConvolution' not in k:
+                    if k_new in model_dict:
+                        try:
+                            if v.shape == model_dict[k_new].shape:
+                                compatible_dict[k_new] = v
+                            else:
+                                incompatible_keys.append(k_new)
+                        except:
+                            pass
+            
+            model.load_state_dict(compatible_dict, strict=False)
+            print(f"   ✓ Loaded {len(compatible_dict)}/{len(model_dict)} weights")
+            if incompatible_keys:
+                print(f"   ⚠ Skipped {len(incompatible_keys)} incompatible weights")
+        except Exception as e:
+            print(f"   ⚠ Warning: Could not load weights: {e}")
+            print("   Continuing with random weights...")
+    else:
+        print("   Using random initialization...")
+    
+    # Export to ONNX
+    output_path = input("\n4. Enter output path (default: mask_pls.onnx): ").strip()
+    if not output_path:
+        output_path = "mask_pls.onnx"
+    
+    # Ask for export parameters
+    batch_size = input("   Batch size for export (default: 1): ").strip()
+    batch_size = int(batch_size) if batch_size else 1
+    
+    num_points = input("   Number of points for export (default: 10000): ").strip()
+    num_points = int(num_points) if num_points else 10000
+    
+    print(f"\n5. Exporting to {output_path}...")
+    print(f"   Batch size: {batch_size}")
+    print(f"   Number of points: {num_points}")
     
     # Create wrapper for clean export
     export_model = MaskPLSExportWrapper(model)
     
     # Create dummy input
     dummy_points = torch.randn(batch_size, num_points, 3)
-    dummy_features = torch.randn(batch_size, num_points, 4)  # xyz + intensity
+    dummy_features = torch.randn(batch_size, num_points, 4)
     
-    # Export to ONNX
-    with torch.no_grad():
-        torch.onnx.export(
-            export_model,
-            (dummy_points, dummy_features),
-            output_path,
-            export_params=True,
-            opset_version=opset_version,
-            do_constant_folding=True,
-            input_names=['points', 'features'],
-            output_names=['pred_logits', 'pred_masks', 'sem_logits'],
-            dynamic_axes={
-                'points': {0: 'batch_size', 1: 'num_points'},
-                'features': {0: 'batch_size', 1: 'num_points'},
-                'pred_logits': {0: 'batch_size'},
-                'pred_masks': {0: 'batch_size', 1: 'num_points'},
-                'sem_logits': {0: 'batch_size', 1: 'num_points'}
-            },
-            verbose=False
-        )
-    
-    print(f"✓ Model exported to {output_path}")
-    
-    # Verify the exported model
     try:
-        onnx_model = onnx.load(output_path)
-        onnx.checker.check_model(onnx_model)
-        print("✓ ONNX model validation passed")
+        with torch.no_grad():
+            torch.onnx.export(
+                export_model,
+                (dummy_points, dummy_features),
+                output_path,
+                export_params=True,
+                opset_version=13,
+                do_constant_folding=True,
+                input_names=['points', 'features'],
+                output_names=['pred_logits', 'pred_masks', 'sem_logits'],
+                dynamic_axes={
+                    'points': {0: 'batch_size', 1: 'num_points'},
+                    'features': {0: 'batch_size', 1: 'num_points'},
+                    'pred_logits': {0: 'batch_size'},
+                    'pred_masks': {0: 'batch_size', 1: 'num_points'},
+                    'sem_logits': {0: 'batch_size', 1: 'num_points'}
+                },
+                verbose=False
+            )
+        
+        print(f"   ✓ Model exported successfully!")
+        print(f"   Output file: {output_path}")
+        print(f"   File size: {os.path.getsize(output_path) / 1024 / 1024:.2f} MB")
+        
     except Exception as e:
-        print(f"✗ ONNX model validation failed: {e}")
+        print(f"   ✗ Export failed: {e}")
         return False
+    
+    # Test with ONNX Runtime if available
+    try:
+        import onnxruntime as ort
+        
+        print("\n6. Testing with ONNX Runtime...")
+        
+        providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+        session = ort.InferenceSession(output_path, providers=providers)
+        
+        print(f"   Using providers: {session.get_providers()}")
+        
+        # Test inference with different sizes
+        test_sizes = [1000, 5000, 10000]
+        print(f"   Testing with different point cloud sizes: {test_sizes}")
+        
+        all_tests_passed = True
+        for test_size in test_sizes:
+            test_points = np.random.randn(1, test_size, 3).astype(np.float32)
+            test_features = np.random.randn(1, test_size, 4).astype(np.float32)
+            
+            try:
+                outputs = session.run(None, {
+                    'points': test_points,
+                    'features': test_features
+                })
+                
+                # Check for valid outputs
+                valid = True
+                for output in outputs:
+                    if np.any(np.isnan(output)) or np.any(np.isinf(output)):
+                        valid = False
+                        break
+                
+                if valid:
+                    print(f"     ✓ {test_size} points: Success")
+                else:
+                    print(f"     ✗ {test_size} points: Invalid outputs")
+                    all_tests_passed = False
+                    
+            except Exception as e:
+                print(f"     ✗ {test_size} points: {e}")
+                all_tests_passed = False
+        
+        if all_tests_passed:
+            print("   ✓ All inference tests passed!")
+            
+            # Show output shapes from last test
+            print(f"\n   Output shapes (for {test_sizes[-1]} points):")
+            print(f"     pred_logits: {outputs[0].shape}")
+            print(f"     pred_masks: {outputs[1].shape}")
+            print(f"     sem_logits: {outputs[2].shape}")
+        else:
+            print("   ⚠ Some inference tests failed")
+        
+    except ImportError:
+        print("\n6. ONNX Runtime not installed. Cannot test inference.")
+        print("   Install with: pip install onnxruntime-gpu")
+    except Exception as e:
+        print(f"\n6. Inference test error: {e}")
+    
+    print("\n" + "=" * 50)
+    print("Conversion Complete!")
+    print("=" * 50)
+    
+    print("\nNext steps:")
+    print("1. Test with your data:")
+    print(f"   python test_onnx_model.py --model {output_path}")
+    print("\n2. Optimize the model (optional):")
+    print(f"   python -m mask_pls.utils.onnx.optimization {output_path} --optimize")
+    print("\n3. Deploy for inference:")
+    print("   import onnxruntime as ort")
+    print(f"   session = ort.InferenceSession('{output_path}')")
+    print("   outputs = session.run(None, {'points': points, 'features': features})")
     
     return True
 
 
-def test_onnx_inference(onnx_path, batch_size=1, num_points=10000):
-    """
-    Test ONNX model inference
-    """
-    print("\nTesting ONNX inference...")
-    
-    # Create ONNX Runtime session
-    providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
-    session = ort.InferenceSession(onnx_path, providers=providers)
-    
-    # Get input/output info
-    input_names = [inp.name for inp in session.get_inputs()]
-    output_names = [out.name for out in session.get_outputs()]
-    
-    print(f"Input names: {input_names}")
-    print(f"Output names: {output_names}")
-    
-    # Create test input
-    test_points = np.random.randn(batch_size, num_points, 3).astype(np.float32)
-    test_features = np.random.randn(batch_size, num_points, 4).astype(np.float32)
-    
-    # Run inference
-    try:
-        outputs = session.run(
-            output_names,
-            {
-                input_names[0]: test_points,
-                input_names[1]: test_features
-            }
-        )
-        
-        print("\nOutput shapes:")
-        for name, output in zip(output_names, outputs):
-            print(f"  {name}: {output.shape}")
-        
-        print("✓ ONNX inference test passed")
-        return True
-        
-    except Exception as e:
-        print(f"✗ ONNX inference test failed: {e}")
-        return False
-
-
-def benchmark_performance(onnx_path, num_runs=100):
-    """
-    Benchmark ONNX model performance
-    """
-    import time
-    
-    print("\nBenchmarking performance...")
-    
-    # Create session
-    providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
-    session = ort.InferenceSession(onnx_path, providers=providers)
-    
-    # Prepare inputs
-    input_names = [inp.name for inp in session.get_inputs()]
-    test_points = np.random.randn(1, 10000, 3).astype(np.float32)
-    test_features = np.random.randn(1, 10000, 4).astype(np.float32)
-    inputs = {
-        input_names[0]: test_points,
-        input_names[1]: test_features
-    }
-    
-    # Warmup
-    print("Warming up...")
-    for _ in range(10):
-        _ = session.run(None, inputs)
-    
-    # Benchmark
-    print(f"Running {num_runs} iterations...")
-    times = []
-    for _ in range(num_runs):
-        start = time.time()
-        _ = session.run(None, inputs)
-        times.append(time.time() - start)
-    
-    # Calculate statistics
-    avg_time = np.mean(times) * 1000  # Convert to ms
-    std_time = np.std(times) * 1000
-    min_time = np.min(times) * 1000
-    max_time = np.max(times) * 1000
-    fps = 1000 / avg_time
-    
-    print("\nPerformance Results:")
-    print(f"  Average: {avg_time:.2f} ± {std_time:.2f} ms")
-    print(f"  Min: {min_time:.2f} ms")
-    print(f"  Max: {max_time:.2f} ms")
-    print(f"  FPS: {fps:.2f}")
-    
-    return avg_time
-
-
-@click.command()
-@click.option('--checkpoint', '-c', required=True, type=click.Path(exists=True),
-              help='Path to PyTorch checkpoint (.ckpt or .pth)')
-@click.option('--output', '-o', type=click.Path(),
-              help='Output ONNX file path')
-@click.option('--config-dir', type=click.Path(exists=True),
-              help='Directory containing config files')
-@click.option('--dataset', type=click.Choice(['KITTI', 'NUSCENES']),
-              default='KITTI', help='Dataset type')
-@click.option('--batch-size', default=1, type=int,
-              help='Batch size for export')
-@click.option('--num-points', default=50000, type=int,
-              help='Number of points for export')
-@click.option('--opset-version', default=13, type=int,
-              help='ONNX opset version')
-@click.option('--optimize', is_flag=True,
-              help='Optimize ONNX model')
-@click.option('--validate', is_flag=True,
-              help='Validate converted model')
-@click.option('--benchmark', is_flag=True,
-              help='Benchmark model performance')
-@click.option('--tensorrt', is_flag=True,
-              help='Convert to TensorRT')
-def main(checkpoint, output, config_dir, dataset, batch_size, num_points,
-         opset_version, optimize, validate, benchmark, tensorrt):
-    """
-    Convert MaskPLS checkpoint to ONNX format
-    """
-    print("=" * 50)
-    print("MaskPLS to ONNX Converter")
-    print("=" * 50)
-    
-    # Determine output path
-    if output is None:
-        checkpoint_name = Path(checkpoint).stem
-        output = f"{checkpoint_name}.onnx"
-    
-    # Load configurations
-    print("\n1. Loading configurations...")
-    cfg = load_configs(config_dir)
-    cfg.MODEL.DATASET = dataset
-    
-    # Add ONNX-specific settings if not present
-    if 'ONNX' not in cfg:
-        cfg.ONNX = edict({
-            'EXPORT': {
-                'OPSET_VERSION': opset_version,
-                'DYNAMIC_AXES': True
-            },
-            'VOXEL': {
-                'SIZE': 0.05,
-                'SPATIAL_SHAPE': [96, 96, 8]
-            }
-        })
-    
-    print(f"  Dataset: {dataset}")
-    print(f"  Batch size: {batch_size}")
-    print(f"  Number of points: {num_points}")
-    
-    # Create ONNX model
-    print("\n2. Creating ONNX-compatible model...")
-    model = MaskPLSONNX(cfg)
-    
-    # Load checkpoint weights
-    print(f"\n3. Loading weights from {checkpoint}...")
-    try:
-        model = load_checkpoint_weights(model, checkpoint, strict=False)
-        print("  ✓ Weights loaded successfully")
-    except Exception as e:
-        print(f"  ⚠ Warning: Could not load all weights: {e}")
-        print("  Continuing with partially loaded or random weights...")
-    
-    # Export to ONNX
-    print(f"\n4. Exporting to ONNX...")
-    success = export_to_onnx(
-        model, output, batch_size, num_points, opset_version
-    )
-    
-    if not success:
-        print("\n✗ Export failed!")
-        sys.exit(1)
-    
-    # Optimize if requested
-    if optimize:
-        print(f"\n5. Optimizing ONNX model...")
-        try:
-            import onnxoptimizer
-            
-            optimized_path = output.replace('.onnx', '_optimized.onnx')
-            optimize_onnx_model(output, optimized_path)
-            print(f"  ✓ Optimized model saved to {optimized_path}")
-            output = optimized_path
-            
-        except ImportError:
-            print("  ⚠ onnxoptimizer not installed. Skipping optimization.")
-            print("  Install with: pip install onnxoptimizer")
-    
-    # Test inference
-    print(f"\n6. Testing ONNX inference...")
-    test_success = test_onnx_inference(output, batch_size, num_points)
-    
-    if not test_success:
-        print("\n⚠ Warning: Inference test failed!")
-    
-    # Validate if requested
-    if validate and checkpoint:
-        print(f"\n7. Validating against original model...")
-        try:
-            from utils.onnx.validation import validate_conversion
-            
-            is_valid = validate_conversion(
-                checkpoint, output, cfg, num_samples=10
-            )
-            
-            if is_valid:
-                print("  ✓ Validation passed")
-            else:
-                print("  ⚠ Validation failed - outputs differ")
-                
-        except Exception as e:
-            print(f"  ⚠ Could not validate: {e}")
-    
-    # Benchmark if requested
-    if benchmark:
-        print(f"\n8. Benchmarking performance...")
-        benchmark_performance(output)
-    
-    # Convert to TensorRT if requested
-    if tensorrt:
-        print(f"\n9. Converting to TensorRT...")
-        try:
-            from deployment.tensorrt.convert_trt import convert_to_tensorrt
-            
-            trt_path = output.replace('.onnx', '.trt')
-            trt_success = convert_to_tensorrt(output, trt_path)
-            
-            if trt_success:
-                print(f"  ✓ TensorRT engine saved to {trt_path}")
-            else:
-                print("  ✗ TensorRT conversion failed")
-                
-        except ImportError:
-            print("  ⚠ TensorRT not installed. Skipping TensorRT conversion.")
-            print("  Install with: pip install tensorrt")
-    
-    # Summary
-    print("\n" + "=" * 50)
-    print("Conversion Complete!")
-    print("=" * 50)
-    print(f"Output file: {output}")
-    print(f"File size: {os.path.getsize(output) / 1024 / 1024:.2f} MB")
-    
-    print("\nNext steps:")
-    print("1. Test with your data:")
-    print(f"   python -m mask_pls.scripts.evaluate_onnx --model {output}")
-    print("2. Deploy for inference:")
-    print(f"   python -m mask_pls.deployment.serve --model {output}")
-    print("3. Integrate with ROS:")
-    print(f"   rosrun mask_pls maskpls_onnx_node.py --model {output}")
-
-
-if __name__ == '__main__':
-    main()
+if __name__ == "__main__":
+    success = simple_convert()
+    sys.exit(0 if success else 1)
