@@ -40,7 +40,34 @@ def apply_model_fixes(model):
         flexible_pe_forward, 
         model.decoder.pos_encoder
     )
+
+    def generate_attention_mask_fixed(self, mask_pred, pad_mask):
+        """Generate attention mask with correct dimensions for cross-attention"""
+        # Threshold predicted masks
+        attn_mask = (mask_pred.sigmoid() < 0.5)
+        
+        # Apply padding mask if provided
+        if pad_mask is not None:
+            attn_mask = attn_mask | pad_mask.unsqueeze(-1)
+        
+        # Shape is [B, N, Q] where B=batch, N=points, Q=queries
+        B, N, Q = attn_mask.shape
+        
+        # Cross-attention expects [B*nheads, Q, N] not [B*nheads, N, Q]
+        # So we need to transpose BEFORE reshaping
+        attn_mask = attn_mask.transpose(1, 2)  # [B, Q, N]
+        
+        # Expand for multi-head attention
+        attn_mask = attn_mask.unsqueeze(1)  # [B, 1, Q, N]
+        attn_mask = attn_mask.expand(-1, self.nheads, -1, -1)  # [B, nheads, Q, N]
+        attn_mask = attn_mask.reshape(B * self.nheads, Q, N)  # [B*nheads, Q, N]
+        
+        return attn_mask
     
+    # Replace the method
+    model.decoder.generate_attention_mask = types.MethodType(
+        generate_attention_mask_fixed,
+        model.decoder
     return model
 
 
