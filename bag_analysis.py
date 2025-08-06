@@ -1,123 +1,123 @@
+#!/usr/bin/env python3
+"""
+analyze_bag_simple.py  –  Drop-in timestamp-drift checker for ROS 2 bags
+-----------------------------------------------------------------------
+
+• No ROS imports – works even in a bare Python venv.
+• Handles any topic whose message *starts* with std_msgs/Header.
+• Handles /tf and /tf_static (first transform's header.stamp).
+• Produces a drift plot + console stats.
+
+Usage:
+    python analyze_bag_simple.py /path/to/my_bag
+"""
+
+import argparse
 import os
 import sqlite3
-import argparse
 import struct
 from collections import defaultdict
+
 import matplotlib.pyplot as plt
 
-def extract_tf_transforms(data: bytes):
-    """Extract list of (frame_id, child_frame_id, timestamp) from TFMessage binary."""
-    transforms = []
 
-    try:
-        offset = 0
-        (array_len,) = struct.unpack_from('<I', data, offset)
-        offset += 4
+# ---------------------------------------------------------------------#
+#  Low-level helpers
+# ---------------------------------------------------------------------#
 
-        for _ in range(array_len):
-            # Get timestamp
-            sec, nanosec = struct.unpack_from('<II', data, offset)
-            msg_time = sec + nanosec * 1e-9
-            offset += 8
-
-            # Extract frame_id string
-            (frame_id_len,) = struct.unpack_from('<I', data, offset)
-            offset += 4
-            frame_id = data[offset:offset+frame_id_len].decode('utf-8')
-            offset += frame_id_len
-
-            # Extract child_frame_id string (after pose)
-            offset += 56  # skip transform (translation + rotation)
-            (child_id_len,) = struct.unpack_from('<I', data, offset)
-            offset += 4
-            child_frame_id = data[offset:offset+child_id_len].decode('utf-8')
-            offset += child_frame_id_len
-
-            label = f"{frame_id} TO {child_frame_id}"
-            transforms.append((label, msg_time))
-    except Exception:
-        pass
-
-    return transforms
-
-def extract_header_stamp(data: bytes):
-    """Extract header.stamp.sec + .nanosec from messages like PoseStamped (first 8 bytes after header)."""
-    try:
-        offset = 0
-        sec, nanosec = struct.unpack_from('<II', data, offset)
-        return sec + nanosec * 1e-9
-    except Exception:
+def _try_extract_stamp(data: bytes, offset: int) -> float | None:
+    """Return sec+nanosec from (sec:uint32, nanosec:uint32) at offset, else None."""
+    if len(data) < offset + 8:
         return None
+    sec, nsec = struct.unpack_from("<II", data, offset)
+    # basic sanity check: nsec must be < 1_000_000_000
+    if nsec >= 1_000_000_000:
+        return None
+    # accept either real epoch (>2000) or sim-time small numbers
+    return sec + nsec * 1e-9
 
-def analyze_bag(bag_path):
-    db3_file = os.path.join(bag_path, "data_0.db3")
-    if not os.path.exists(db3_file):
-        raise FileNotFoundError(f"No DB3 file found in: {bag_path}")
 
-    conn = sqlite3.connect(db3_file)
-    cursor = conn.cursor()
+def extract_message_stamp(topic_name: str, msg_bytes: bytes) -> float | None:
+    """
+    Heuristic stamp extractor:
+      • /tf or /tf_static  -> read at offset 4
+      • everything else    -> read at offset 0
+    """
+    if "/tf" in topic_name:
+        return _try_extract_stamp(msg_bytes, 4)  # skip array-length
+    return _try_extract_stamp(msg_bytes, 0)
 
-    # Get topics
-    cursor.execute("SELECT id, name, type FROM topics")
-    topics = {tid: {"name": name, "type": type_} for tid, name, type_ in cursor.fetchall()}
 
-    # Store series: {label: [(msg_time, bag_time)]}
-    time_data = defaultdict(list)
+# ---------------------------------------------------------------------#
+#  Main analysis routine
+# ---------------------------------------------------------------------#
 
-    for topic_id, topic in topics.items():
-        name = topic["name"]
-        type_ = topic["type"]
+def analyze_bag(bag_path: str) -> None:
+    db3 = os.path.join(bag_path, "data_0.db3")
+    if not os.path.isfile(db3):
+        raise FileNotFoundError(f"Could not find {db3}")
 
-        cursor.execute(f"SELECT timestamp, data FROM messages WHERE topic_id = {topic_id}")
-        for bag_time_ns, data in cursor.fetchall():
-            bag_time = bag_time_ns * 1e-9
+    conn = sqlite3.connect(db3)
+    cur = conn.cursor()
 
-            if "tf2_msgs/msg/TFMessage" in type_ or "/tf" in name:
-                transforms = extract_tf_transforms(data)
-                for label, msg_time in transforms:
-                    time_data[f"/tf {label}"].append((msg_time, bag_time))
+    cur.execute("SELECT id, name FROM topics")
+    topics = dict(cur.fetchall())               # {topic_id: name}
 
-            elif "PoseStamped" in type_ or "geometry_msgs" in type_ or "/lidar" in name:
-                msg_time = extract_header_stamp(data)
-                if msg_time:
-                    time_data[name].append((msg_time, bag_time))
+    # Gather (msg_stamp, bag_stamp) pairs per topic
+    drift_data: defaultdict[str, list[tuple[float, float]]] = defaultdict(list)
 
-    if not time_data:
-        print("❌ No timestamp data found in bag.")
+    for tid, tname in topics.items():
+        cur.execute("SELECT timestamp, data FROM messages WHERE topic_id = ?", (tid,))
+        for bag_stamp_ns, raw in cur.fetchall():
+            msg_stamp = extract_message_stamp(tname, raw)
+            if msg_stamp is None:
+                continue
+            drift_data[tname].append((msg_stamp, bag_stamp_ns * 1e-9))
+
+    if not drift_data:
+        print("❌  No stamped messages could be parsed. "
+              "Bag may use custom types whose first field isn't a std_msgs/Header.")
         return
 
-    # Plot
+    # ------------------------------------------------------------------#
+    #  Plot
+    # ------------------------------------------------------------------#
     plt.figure(figsize=(10, 6))
-    for label, points in time_data.items():
-        if not points:
+
+    overall_max = 0.0
+    for topic, pairs in drift_data.items():
+        if not pairs:
             continue
-        x, y = zip(*points)
-        plt.plot(x, y, ".", label=label)
+        xs, ys = zip(*pairs)
+        overall_max = max(overall_max, max(xs + ys))
+        plt.plot(xs, ys, ".", markersize=3, label=topic)
 
-    max_t = max(max(max(x for x, _ in pts), max(y for _, y in pts)) for pts in time_data.values())
-    plt.plot([0, max_t], [0, max_t], "k--", label="IDEAL")
-
-    plt.xlabel("Message Timestamp [s]")
-    plt.ylabel("Bag Timestamp [s]")
-    plt.title("Message vs Bag Time (Grouped by Frame or Topic)")
-    plt.legend(loc="upper left", bbox_to_anchor=(1.0, 1.0))
+    plt.plot([0, overall_max], [0, overall_max], "k--", label="IDEAL")
+    plt.xlabel("Message timestamp [s]")
+    plt.ylabel("Bag recording time [s]")
+    plt.title("ROS 2 Bag – Timestamp vs Bag Time")
     plt.grid(True)
+    plt.legend(fontsize=8)
     plt.tight_layout()
     plt.show()
 
-    # Report drift
-    for label, points in time_data.items():
-        diffs = [abs(b - m) for m, b in points]
-        avg_diff = sum(diffs) / len(diffs)
-        max_diff = max(diffs)
-        print(f"{label}")
-        print(f"  Avg Drift: {avg_diff:.3f}s | Max Drift: {max_diff:.3f}s")
-        if avg_diff > 0.5:
-            print("  ⚠️ High drift — possible time sync or sim_time issue")
+    # ------------------------------------------------------------------#
+    #  Console drift stats
+    # ------------------------------------------------------------------#
+    for topic, pairs in drift_data.items():
+        diffs = [abs(bag - msg) for msg, bag in pairs]
+        if not diffs:
+            continue
+        avg_d, max_d = sum(diffs) / len(diffs), max(diffs)
+        print(f"{topic:40}  avg drift {avg_d:8.3f}s   max drift {max_d:8.3f}s"
+              + ("   ⚠️" if avg_d > 0.5 else ""))
+
+
+# ---------------------------------------------------------------------#
+#  Entrypoint
+# ---------------------------------------------------------------------#
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("bag_path", help="Path to ROS 2 bag directory")
-    args = parser.parse_args()
-
-    analyze_bag(args.bag_path)
+    ap = argparse.ArgumentParser(description="ROS 2 bag timestamp diagnostic (no ROS deps)")
+    ap.add_argument("bag", help="Path to the bag directory (containing data_0.db3)")
+    analyze_bag(ap.parse_args().bag)
