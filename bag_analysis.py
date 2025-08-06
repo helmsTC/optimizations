@@ -6,55 +6,78 @@ from collections import defaultdict
 import matplotlib.pyplot as plt
 
 def analyze_bag(bag_path):
-    db_file = os.path.join(bag_path, "metadata.yaml")
-    db3_file = os.path.join(bag_path, "data_0.db3")
-    if not os.path.exists(db3_file):
+    import rclpy
+    from rclpy.serialization import deserialize_message
+    import rosidl_runtime_py.utilities as rosidl_utils
+
+    rclpy.init()
+
+    db_file = os.path.join(bag_path, "data_0.db3")
+    if not os.path.exists(db_file):
         raise FileNotFoundError(f"No DB3 file found in: {bag_path}")
 
-    conn = sqlite3.connect(db3_file)
+    conn = sqlite3.connect(db_file)
     cursor = conn.cursor()
 
     # Get topic info
     cursor.execute("SELECT id, name, type FROM topics")
-    topics = {tid: {"name": name, "type": type_} for tid, name, type_ in cursor.fetchall()}
+    topic_info = {tid: {"name": name, "type": type_} for tid, name, type_ in cursor.fetchall()}
 
-    # Store (message_timestamp, bag_timestamp) pairs
     time_data = defaultdict(list)
+    failed_topics = set()
 
-    for topic_id in topics:
+    for topic_id, info in topic_info.items():
+        topic_name = info["name"]
+        topic_type = info["type"]
+
+        try:
+            msg_class = rosidl_utils.get_message_class(topic_type)
+        except Exception:
+            print(f"⚠️ Skipping {topic_name} (can't load message class for type {topic_type})")
+            failed_topics.add(topic_name)
+            continue
+
         cursor.execute(f"SELECT timestamp, data FROM messages WHERE topic_id = {topic_id}")
-        messages = cursor.fetchall()
-        for bag_time_ns, data in messages:
-            # Assume timestamp is in the header
-            # Extract seconds and nanoseconds from raw serialized msg
-            # For simplicity, we approximate:
-            # - bag_time in seconds
-            # - msg_time in seconds from embedded data (dummy parse)
+        for bag_time_ns, data in cursor.fetchall():
             try:
-                # In production, use `rosbag2_py` and deserialize properly
-                from rclpy.serialization import deserialize_message
-                from std_msgs.msg import Header
-                import rosidl_runtime_py.utilities as rosidl_utils
+                msg = deserialize_message(data, msg_class)
 
-                msg_type = rosidl_utils.get_message_class(topics[topic_id]["type"])
-                msg = deserialize_message(data, msg_type)
-                msg_time = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
-            except Exception:
-                # Can't parse the message properly
-                continue
+                # Try to extract header timestamp
+                if hasattr(msg, 'header'):
+                    stamp = msg.header.stamp
+                    msg_time = stamp.sec + stamp.nanosec * 1e-9
+                elif hasattr(msg, 'transforms'):  # TFMessage
+                    if len(msg.transforms) == 0:
+                        continue
+                    stamp = msg.transforms[0].header.stamp
+                    msg_time = stamp.sec + stamp.nanosec * 1e-9
+                else:
+                    continue  # Skip messages without timestamp
 
-            bag_time = bag_time_ns * 1e-9
-            time_data[topics[topic_id]["name"]].append((msg_time, bag_time))
+                bag_time = bag_time_ns * 1e-9
+                time_data[topic_name].append((msg_time, bag_time))
+
+            except Exception as e:
+                continue  # Skip corrupted messages
+
+    if not time_data:
+        print("❌ No valid time data found. Nothing to analyze.")
+        return
 
     # Plot
     plt.figure(figsize=(10, 6))
     for topic, times in time_data.items():
+        if not times:
+            continue
         x, y = zip(*times)
         plt.plot(x, y, ".", label=topic)
 
-    plt.plot([0, max(max(x) for x, y in time_data.values())], 
-             [0, max(max(y) for x, y in time_data.values())], 
-             "k--", label="IDEAL")
+    try:
+        max_x = max(max(x for x, _ in times) for times in time_data.values() if times)
+        max_y = max(max(y for _, y in times) for times in time_data.values() if times)
+        plt.plot([0, max(max_x, max_y)], [0, max(max_x, max_y)], "k--", label="IDEAL")
+    except ValueError:
+        print("⚠️ Could not determine max X/Y for IDEAL line.")
 
     plt.xlabel("Message Timestamp [s]")
     plt.ylabel("Bag Timestamp [s]")
@@ -64,16 +87,22 @@ def analyze_bag(bag_path):
     plt.tight_layout()
     plt.show()
 
-    # Flag time drifts
+    # Report drift
     for topic, times in time_data.items():
+        if not times:
+            continue
         diffs = [abs(bag - msg) for msg, bag in times]
-        avg_diff = sum(diffs) / len(diffs) if diffs else 0
-        max_diff = max(diffs) if diffs else 0
+        avg_diff = sum(diffs) / len(diffs)
+        max_diff = max(diffs)
         print(f"Topic: {topic}")
-        print(f"  Average Timestamp Drift: {avg_diff:.3f}s")
-        print(f"  Max Timestamp Drift:     {max_diff:.3f}s")
+        print(f"  Avg Drift: {avg_diff:.3f}s | Max Drift: {max_diff:.3f}s")
         if avg_diff > 0.5:
-            print("  ⚠️ WARNING: High average drift. Check sim time usage.")
+            print("  ⚠️ Potential clock or sim_time issue.")
+
+    if failed_topics:
+        print("\n⚠️ The following topics were skipped due to missing message types:")
+        for topic in failed_topics:
+            print(f"  - {topic}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
