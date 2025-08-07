@@ -1,5 +1,5 @@
 """
-Minimal working ONNX decoder - fixes all interface issues
+ONNX-compatible decoder with CORRECT attribute/method names
 Replace mask_pls/onnx/onnx_decoder.py with this
 """
 
@@ -7,52 +7,39 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import List, Optional, Dict
+import math
 
 
 class ONNXCompatibleDecoder(nn.Module):
     """
-    ONNX-compatible MaskedTransformerDecoder
-    This version properly handles the backbone output format
+    ONNX-compatible version matching EXACTLY the original decoder interface
     """
     def __init__(self, cfg, bb_cfg, data_cfg):
         super().__init__()
-        
         hidden_dim = cfg.HIDDEN_DIM
+        
         self.hidden_dim = hidden_dim
-        self.num_queries = cfg.NUM_QUERIES
-        self.num_classes = data_cfg.NUM_CLASSES
-        self.num_feature_levels = cfg.FEATURE_LEVELS
-        self.num_layers = min(cfg.FEATURE_LEVELS * cfg.DEC_BLOCKS, 9)  # Cap at 9
+        self.num_layers = cfg.FEATURE_LEVELS * cfg.DEC_BLOCKS
         self.nheads = cfg.NHEADS
+        self.num_queries = cfg.NUM_QUERIES
+        self.num_feature_levels = cfg.FEATURE_LEVELS
+        self.num_classes = data_cfg.NUM_CLASSES
         
-        # Query embeddings
-        self.query_feat = nn.Parameter(torch.randn(1, cfg.NUM_QUERIES, hidden_dim))
-        self.query_embed = nn.Parameter(torch.randn(1, cfg.NUM_QUERIES, hidden_dim))
-        
-        # Level embedding
-        self.level_embed = nn.Embedding(self.num_feature_levels, hidden_dim)
-        
-        # Input projections - match backbone output channels
-        in_channels = bb_cfg.CHANNELS
-        # The backbone outputs features at different scales
-        # Typically: [256, 128, 96, 96] for the last 4 levels
-        self.input_proj = nn.ModuleList()
-        
-        # Take the last num_feature_levels channels
-        start_idx = len(in_channels) - self.num_feature_levels - 1
-        for i in range(self.num_feature_levels):
-            ch = in_channels[start_idx + i] if start_idx + i < len(in_channels) else hidden_dim
-            if ch != hidden_dim:
-                self.input_proj.append(nn.Linear(ch, hidden_dim))
-            else:
-                self.input_proj.append(nn.Identity())
-        
-        # Mask feature projection (last feature level)
-        last_ch = in_channels[-1]
-        if last_ch != hidden_dim:
-            self.mask_feat_proj = nn.Linear(last_ch, hidden_dim)
+        # Initialize positional encoder FIRST (matching original)
+        # Check if POS_ENC config exists
+        if hasattr(cfg, 'POS_ENC'):
+            cfg.POS_ENC.FEAT_SIZE = cfg.HIDDEN_DIM
+            self.pe_layer = PositionalEncoder(cfg.POS_ENC)
         else:
-            self.mask_feat_proj = nn.Identity()
+            # Create default config
+            pos_cfg = type('obj', (object,), {
+                'MAX_FREQ': 10000,
+                'DIMENSIONALITY': 3,
+                'FEAT_SIZE': hidden_dim,
+                'NUM_BANDS': hidden_dim // 6,  # Approximate
+                'BASE': 2
+            })()
+            self.pe_layer = PositionalEncoder(pos_cfg)
         
         # Transformer layers
         self.transformer_self_attention_layers = nn.ModuleList()
@@ -60,144 +47,188 @@ class ONNXCompatibleDecoder(nn.Module):
         self.transformer_ffn_layers = nn.ModuleList()
         
         for _ in range(self.num_layers):
-            # Self attention
             self.transformer_self_attention_layers.append(
-                SelfAttentionLayer(hidden_dim, self.nheads)
+                SelfAttentionLayer(d_model=hidden_dim, nhead=self.nheads, dropout=0.0)
             )
-            # Cross attention
             self.transformer_cross_attention_layers.append(
-                CrossAttentionLayer(hidden_dim, self.nheads)
+                CrossAttentionLayer(d_model=hidden_dim, nhead=self.nheads, dropout=0.0)
             )
-            # FFN
             self.transformer_ffn_layers.append(
-                FFNLayer(hidden_dim, cfg.DIM_FFN)
+                FFNLayer(d_model=hidden_dim, dim_feedforward=cfg.DIM_FFN, dropout=0.0)
             )
         
-        # Output heads
         self.decoder_norm = nn.LayerNorm(hidden_dim)
+        
+        # Query embeddings (matching original names)
+        self.query_feat = nn.Embedding(cfg.NUM_QUERIES, hidden_dim)
+        self.query_embed = nn.Embedding(cfg.NUM_QUERIES, hidden_dim)
+        self.level_embed = nn.Embedding(self.num_feature_levels, hidden_dim)
+        
+        # Projections
+        self.mask_feat_proj = nn.Sequential()
+        in_channels = bb_cfg.CHANNELS
+        if in_channels[-1] != hidden_dim:
+            self.mask_feat_proj = nn.Linear(in_channels[-1], hidden_dim)
+        
+        # Input projections for each feature level
+        in_channels = in_channels[:-1][-self.num_feature_levels:]
+        self.input_proj = nn.ModuleList()
+        for ch in in_channels:
+            if ch != hidden_dim:
+                self.input_proj.append(nn.Linear(ch, hidden_dim))
+            else:
+                self.input_proj.append(nn.Sequential())
+        
+        # Output FFNs (matching original)
         self.class_embed = nn.Linear(hidden_dim, data_cfg.NUM_CLASSES + 1)
         self.mask_embed = MLP(hidden_dim, hidden_dim, hidden_dim, 3)
-        
-        # Simple positional encoding
-        self.pos_enc = PositionalEncoding(hidden_dim)
     
-    def forward(self, feats: List[torch.Tensor], 
-                coors: List[torch.Tensor],
-                pad_masks: List[torch.Tensor]) -> tuple:
+    def forward(self, feats, coors, pad_masks):
         """
+        Forward matching original decoder interface
         Args:
-            feats: List of feature tensors [B, N, C] at different scales
-            coors: List of coordinate tensors [B, N, 3]  
-            pad_masks: List of padding masks [B, N]
+            feats: List of [B, N, C] features
+            coors: List of [B, N, 3] coordinates  
+            pad_masks: List of [B, N] padding masks
         Returns:
-            outputs: dict with pred_logits and pred_masks
-            padding: padding mask for last level
+            outputs: dict with predictions
+            last_pad: padding mask
         """
-        # Handle empty input
+        # Handle the features similar to original
         if not feats or len(feats) == 0:
             B = 1
-            outputs = {
+            out = {
                 'pred_logits': torch.zeros(B, self.num_queries, self.num_classes + 1),
                 'pred_masks': torch.zeros(B, 1, self.num_queries),
                 'aux_outputs': []
             }
-            padding = torch.zeros(B, 1, dtype=torch.bool)
-            return outputs, padding
+            return out, torch.zeros(B, 1, dtype=torch.bool)
         
-        # Extract mask features from last level
-        last_coors = coors[-1] if coors else None
-        mask_features = self.mask_feat_proj(feats[-1])
+        # Pop last level for mask features (like original)
+        last_coors = coors.pop() if coors else None
+        mask_features = self.mask_feat_proj(feats.pop())
         
-        # Add positional encoding
-        if mask_features.shape[1] > 0:
-            mask_features = mask_features + self.pos_enc(mask_features)
+        # Add positional encoding if we have coordinates
+        if last_coors is not None and mask_features.shape[1] > 0:
+            mask_features = mask_features + self.pe_layer(last_coors)
         
-        last_pad = pad_masks[-1] if pad_masks else None
+        last_pad = pad_masks.pop() if pad_masks else None
         
-        # Prepare multi-scale features
+        # Prepare source features
         src = []
         pos = []
+        size_list = []
         
-        # Only use first num_feature_levels features
-        for i in range(min(self.num_feature_levels, len(feats) - 1)):
-            feat = self.input_proj[i](feats[i])
-            src.append(feat)
-            # Simple positional encoding
-            pos.append(self.pos_enc(feat))
+        for i in range(self.num_feature_levels):
+            if i < len(feats):
+                size_list.append(feats[i].shape[1])
+                # Add positional encoding
+                if i < len(coors) and coors[i] is not None:
+                    pos.append(self.pe_layer(coors[i]))
+                else:
+                    pos.append(torch.zeros_like(feats[i]))
+                feat = self.input_proj[i](feats[i])
+                src.append(feat)
         
         # Initialize queries
-        bs = feats[0].shape[0]
-        query_embed = self.query_embed.expand(bs, -1, -1)
-        output = self.query_feat.expand(bs, -1, -1)
+        bs = feats[0].shape[0] if feats else 1
+        query_embed = self.query_embed.weight.unsqueeze(0).repeat(bs, 1, 1)
+        output = self.query_feat.weight.unsqueeze(0).repeat(bs, 1, 1)
         
         predictions_class = []
         predictions_mask = []
         
-        # Initial prediction
-        outputs_class, outputs_mask = self.pred_heads(
-            output, mask_features, last_pad
+        # Initial prediction (matching original method name)
+        outputs_class, outputs_mask, _ = self.pred_heads(
+            output, mask_features, pad_mask=last_pad
         )
         predictions_class.append(outputs_class)
         predictions_mask.append(outputs_mask)
         
-        # Transformer layers
-        for i in range(self.num_layers):
-            level_index = i % len(src) if src else 0
+        # Process through transformer layers
+        for i in range(min(self.num_layers, 9)):  # Cap at 9 for ONNX
+            level_index = i % self.num_feature_levels
             
             if level_index < len(src):
-                # Self-attention
-                output = self.transformer_self_attention_layers[i](
-                    output, query_pos=query_embed
-                )
-                
-                # Cross-attention
+                # Cross-attention first (like original)
                 output = self.transformer_cross_attention_layers[i](
-                    output, 
+                    output,
                     src[level_index],
                     pos=pos[level_index] if level_index < len(pos) else None,
+                    query_pos=query_embed,
+                    padding_mask=None  # Don't use padding mask for ONNX
+                )
+                
+                # Self-attention
+                output = self.transformer_self_attention_layers[i](
+                    output, 
                     query_pos=query_embed
                 )
                 
                 # FFN
                 output = self.transformer_ffn_layers[i](output)
                 
-                # Predict
-                outputs_class, outputs_mask = self.pred_heads(
-                    output, mask_features, last_pad
+                # Get predictions
+                outputs_class, outputs_mask, _ = self.pred_heads(
+                    output, mask_features, pad_mask=last_pad
                 )
                 predictions_class.append(outputs_class)
                 predictions_mask.append(outputs_mask)
         
-        # Output
+        # Format output
         out = {
-            'pred_logits': predictions_class[-1],
-            'pred_masks': predictions_mask[-1],
-            'aux_outputs': self.set_aux(predictions_class[:-1], predictions_mask[:-1])
+            "pred_logits": predictions_class[-1],
+            "pred_masks": predictions_mask[-1]
         }
+        
+        # Set auxiliary outputs
+        out["aux_outputs"] = self.set_aux(predictions_class, predictions_mask)
         
         return out, last_pad if last_pad is not None else torch.zeros(bs, mask_features.shape[1], dtype=torch.bool)
     
     def pred_heads(self, output, mask_features, pad_mask=None):
-        """Predict classes and masks"""
+        """
+        Prediction heads - matching original name and interface
+        """
         decoder_output = self.decoder_norm(output)
         outputs_class = self.class_embed(decoder_output)
         mask_embed = self.mask_embed(decoder_output)
         
-        # Compute mask logits
+        # Compute masks
         if mask_features.shape[1] == 0:
             B, Q = output.shape[:2]
             outputs_mask = torch.zeros(B, 1, Q, device=output.device)
         else:
             outputs_mask = torch.einsum("bqc,bpc->bpq", mask_embed, mask_features)
         
-        # No dynamic attention mask generation for ONNX
+        # For ONNX, don't generate dynamic attention mask
+        # Just return None for attn_mask
+        attn_mask = None
+        
+        return outputs_class, outputs_mask, attn_mask
+    
+    def predict_masks(self, query_feat, mask_features):
+        """
+        Alias for compatibility if something calls predict_masks
+        """
+        decoder_output = self.decoder_norm(query_feat)
+        outputs_class = self.class_embed(decoder_output)
+        mask_embed = self.mask_embed(decoder_output)
+        
+        if mask_features.shape[1] == 0:
+            B, Q = query_feat.shape[:2]
+            outputs_mask = torch.zeros(B, 1, Q, device=query_feat.device)
+        else:
+            outputs_mask = torch.einsum("bqc,bpc->bpq", mask_embed, mask_features)
+        
         return outputs_class, outputs_mask
     
+    @torch.jit.unused
     def set_aux(self, outputs_class, outputs_seg_masks):
-        """Set auxiliary outputs"""
+        """Set auxiliary outputs - matching original"""
         return [
             {"pred_logits": a, "pred_masks": b}
-            for a, b in zip(outputs_class, outputs_seg_masks)
+            for a, b in zip(outputs_class[:-1], outputs_seg_masks[:-1])
         ]
 
 
@@ -210,15 +241,20 @@ class SelfAttentionLayer(nn.Module):
         self.norm = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
     
-    def forward(self, q_embed, query_pos=None):
-        if query_pos is not None:
-            q = k = q_embed + query_pos
-        else:
-            q = k = q_embed
-        q_embed2 = self.self_attn(q, k, value=q_embed)[0]
+    def forward(self, q_embed, query_pos=None, attn_mask=None, padding_mask=None):
+        """Forward with optional args for compatibility"""
+        q = k = self.with_pos_embed(q_embed, query_pos)
+        q_embed2 = self.self_attn(
+            q, k, value=q_embed,
+            attn_mask=None,  # Don't use dynamic masks for ONNX
+            key_padding_mask=None
+        )[0]
         q_embed = q_embed + self.dropout(q_embed2)
         q_embed = self.norm(q_embed)
         return q_embed
+    
+    def with_pos_embed(self, tensor, pos):
+        return tensor if pos is None else tensor + pos
 
 
 class CrossAttentionLayer(nn.Module):
@@ -230,18 +266,25 @@ class CrossAttentionLayer(nn.Module):
         self.norm = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
     
-    def forward(self, q_embed, bb_feat, pos=None, query_pos=None):
+    def forward(self, q_embed, bb_feat, attn_mask=None, padding_mask=None, 
+                pos=None, query_pos=None):
+        """Forward with all original args for compatibility"""
         q_embed = self.norm(q_embed)
-        q = q_embed + query_pos if query_pos is not None else q_embed
-        k = v = bb_feat + pos if pos is not None else bb_feat
+        q = self.with_pos_embed(q_embed, query_pos)
+        k = v = self.with_pos_embed(bb_feat, pos)
         
         q_embed2 = self.multihead_attn(
             query=q,
             key=k,
-            value=v
+            value=v,
+            attn_mask=None,  # Don't use for ONNX
+            key_padding_mask=None
         )[0]
         q_embed = q_embed + self.dropout(q_embed2)
         return q_embed
+    
+    def with_pos_embed(self, tensor, pos):
+        return tensor if pos is None else tensor + pos
 
 
 class FFNLayer(nn.Module):
@@ -261,6 +304,7 @@ class FFNLayer(nn.Module):
 
 
 class MLP(nn.Module):
+    """MLP as in original"""
     def __init__(self, input_dim, hidden_dim, output_dim, num_layers):
         super().__init__()
         self.num_layers = num_layers
@@ -275,20 +319,63 @@ class MLP(nn.Module):
         return x
 
 
-class PositionalEncoding(nn.Module):
-    def __init__(self, d_model, max_len=10000):
+class PositionalEncoder(nn.Module):
+    """Matching the original positional encoder interface"""
+    def __init__(self, cfg):
         super().__init__()
-        self.d_model = d_model
-        pe = torch.zeros(max_len, d_model)
-        position = torch.arange(0, max_len).unsqueeze(1).float()
-        div_term = torch.exp(torch.arange(0, d_model, 2).float() *
-                           -(torch.log(torch.tensor(10000.0)) / d_model))
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term[:d_model//2])
-        self.register_buffer('pe', pe.unsqueeze(0))
+        # Handle both config object and dict
+        if hasattr(cfg, 'MAX_FREQ'):
+            self.max_freq = cfg.MAX_FREQ
+            self.dimensionality = cfg.DIMENSIONALITY
+            self.num_bands = math.floor(cfg.FEAT_SIZE / cfg.DIMENSIONALITY / 2)
+            self.base = cfg.BASE
+            feat_size = cfg.FEAT_SIZE
+        else:
+            # Default values
+            self.max_freq = 10000
+            self.dimensionality = 3
+            feat_size = 256
+            self.num_bands = math.floor(feat_size / self.dimensionality / 2)
+            self.base = 2
+        
+        pad = feat_size - self.num_bands * 2 * self.dimensionality
+        self.zero_pad = nn.ZeroPad2d((pad, 0, 0, 0))  # left padding
     
-    def forward(self, x):
-        """Add positional encoding"""
-        if x.shape[1] > self.pe.shape[1]:
-            return x
-        return x + self.pe[:, :x.shape[1], :self.d_model]
+    def forward(self, _x):
+        """
+        _x [B,N,3]: batched point coordinates
+        returns: [B,N,C]: positional encoding
+        """
+        # Handle different input shapes
+        if len(_x.shape) == 2:
+            _x = _x.unsqueeze(0)
+        
+        x = _x.clone()
+        
+        # Normalize coordinates (like original)
+        x[:, :, 0] = x[:, :, 0] / 48
+        x[:, :, 1] = x[:, :, 1] / 48
+        if x.shape[2] > 2:
+            x[:, :, 2] = x[:, :, 2] / 4
+        
+        x = x.unsqueeze(-1)
+        
+        scales = torch.logspace(
+            0.0,
+            math.log(self.max_freq / 2) / math.log(self.base),
+            self.num_bands,
+            base=self.base,
+            device=x.device,
+            dtype=x.dtype,
+        )
+        
+        scales = scales[(*((None,) * (len(x.shape) - 1)), Ellipsis)]
+        x = x * scales * math.pi
+        x = torch.cat([x.sin(), x.cos()], dim=-1)
+        x = x.flatten(2)
+        enc = self.zero_pad(x)
+        return enc
+
+
+# Also add compatibility for if something expects PositionalEncodingONNX
+PositionalEncodingONNX = PositionalEncoder
