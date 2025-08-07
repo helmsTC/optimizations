@@ -16,7 +16,7 @@ class SimpleVoxelEncoder(nn.Module):
     Simplified voxel-based encoder that's ONNX-friendly
     Pre-computes voxel grid outside the model
     """
-    def __init__(self, cfg):
+    def __init__(self, cfg, opset_version=14):
         super().__init__()
         
         input_dim = cfg.INPUT_DIM
@@ -64,6 +64,51 @@ class SimpleVoxelEncoder(nn.Module):
             encoded_features: [B, C', D', H', W'] encoded voxels
         """
         return self.encoder(voxel_features)
+
+
+class SimplePointDecoderV11(nn.Module):
+    """
+    Decoder compatible with ONNX opset 11 (no grid_sample)
+    """
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        
+        self.feature_proj = nn.Conv3d(in_channels, out_channels, kernel_size=1)
+        self.mlp = nn.Sequential(
+            nn.Linear(out_channels, 256),
+            nn.ReLU(inplace=True),
+            nn.Linear(256, out_channels)
+        )
+        
+    def forward(self, voxel_features, point_coords):
+        B, C, D, H, W = voxel_features.shape
+        B_p, N, _ = point_coords.shape
+        
+        # Project features
+        voxel_features = self.feature_proj(voxel_features)
+        C_out = voxel_features.shape[1]
+        
+        # Flatten voxel features
+        voxel_flat = voxel_features.view(B, C_out, -1)
+        
+        # Convert coordinates to indices
+        voxel_coords = point_coords * torch.tensor([D, H, W], device=point_coords.device)
+        voxel_coords = torch.clamp(voxel_coords, 0, torch.tensor([D-1, H-1, W-1], device=point_coords.device))
+        voxel_coords = voxel_coords.long()
+        
+        # Flat indices
+        flat_indices = (voxel_coords[..., 0] * H * W + 
+                       voxel_coords[..., 1] * W + 
+                       voxel_coords[..., 2])
+        flat_indices = flat_indices.unsqueeze(1).expand(-1, C_out, -1)
+        
+        # Gather features
+        point_features = torch.gather(voxel_flat, 2, flat_indices)
+        point_features = point_features.transpose(1, 2)
+        
+        # MLP
+        point_features = self.mlp(point_features)
+        return point_features
 
 
 class SimplePointDecoder(nn.Module):
@@ -224,11 +269,19 @@ class MaskPLSSimplifiedONNX(nn.Module):
         # Encoder
         self.encoder = SimpleVoxelEncoder(cfg.BACKBONE)
         
-        # Point decoder
-        self.point_decoder = SimplePointDecoder(
-            self.encoder.feat_dim,
-            cfg.DECODER.HIDDEN_DIM
-        )
+        # Point decoder (choose based on ONNX opset version)
+        if opset_version < 14:
+            print(f"Using opset {opset_version} compatible decoder (nearest neighbor)")
+            self.point_decoder = SimplePointDecoderV11(
+                self.encoder.feat_dim,
+                cfg.DECODER.HIDDEN_DIM
+            )
+        else:
+            print(f"Using opset {opset_version} decoder (trilinear interpolation)")
+            self.point_decoder = SimplePointDecoder(
+                self.encoder.feat_dim,
+                cfg.DECODER.HIDDEN_DIM
+            )
         
         # Mask decoder
         self.mask_decoder = SimplifiedMaskDecoder(
@@ -299,12 +352,12 @@ class MaskPLSSimplifiedONNX(nn.Module):
         return pred_logits, pred_masks, sem_logits
 
 
-def create_onnx_model(cfg):
+def create_onnx_model(cfg, opset_version=14):
     """Create the simplified ONNX model"""
-    return MaskPLSSimplifiedONNX(cfg)
+    return MaskPLSSimplifiedONNX(cfg, opset_version)
 
 
-def export_model_to_onnx(model, output_path, batch_size=1, num_points=10000):
+def export_model_to_onnx(model, output_path, batch_size=1, num_points=10000, opset_version=14):
     """
     Export the model to ONNX format
     """
@@ -327,7 +380,7 @@ def export_model_to_onnx(model, output_path, batch_size=1, num_points=10000):
             (dummy_voxels, dummy_coords),
             output_path,
             export_params=True,
-            opset_version=11,
+            opset_version=opset_version,  # Use provided opset version
             do_constant_folding=True,
             input_names=['voxel_features', 'point_coords'],
             output_names=['pred_logits', 'pred_masks', 'sem_logits'],
@@ -370,5 +423,10 @@ if __name__ == "__main__":
     })
     
     # Create and export model
-    model = create_onnx_model(cfg)
-    export_model_to_onnx(model, "maskpls_simplified.onnx")
+    # Option 1: Use opset 14 (better quality with trilinear interpolation)
+    model = create_onnx_model(cfg, opset_version=14)
+    export_model_to_onnx(model, "maskpls_simplified.onnx", opset_version=14)
+    
+    # Option 2: Use opset 11 (wider compatibility, nearest neighbor)
+    # model = create_onnx_model(cfg, opset_version=11)
+    # export_model_to_onnx(model, "maskpls_simplified_v11.onnx", opset_version=11)
