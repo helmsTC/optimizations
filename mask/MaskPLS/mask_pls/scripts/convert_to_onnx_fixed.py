@@ -84,7 +84,7 @@ def test_model(model, batch_size=1, num_points=10000):
             return False
 
 
-def export_to_onnx(model, output_path, batch_size=1, num_points=10000):
+def export_to_onnx(model, output_path, batch_size=1, num_points=10000, opset_version=14):
     """Export model to ONNX"""
     print(f"\nExporting to ONNX...")
     
@@ -104,7 +104,7 @@ def export_to_onnx(model, output_path, batch_size=1, num_points=10000):
                 (dummy_voxels, dummy_coords),
                 output_path,
                 export_params=True,
-                opset_version=11,
+                opset_version=opset_version,
                 do_constant_folding=True,
                 input_names=['voxel_features', 'point_coords'],
                 output_names=['pred_logits', 'pred_masks', 'sem_logits'],
@@ -193,10 +193,12 @@ def main():
     # Import the simplified model
     try:
         # Try to import from the artifact we just created
-        exec(open('maskpls_simplified_onnx.py').read())
+        from mask_pls.models.onnx.simplified_model import create_onnx_model, export_model_to_onnx
     except:
         # Define inline if needed
-        from maskpls_simplified_onnx import create_onnx_model
+        print("Error: Could not import simplified model")
+        print("Make sure simplified_model.py is in mask_pls/models/onnx/")
+        return
     
     # Configuration
     cfg = edict({
@@ -242,13 +244,18 @@ def main():
     else:
         print("   Using KITTI configuration")
     
+    # ONNX opset version choice
+    opset_choice = input("\n2. ONNX opset version (11=wider compatibility, 14=better quality) [default=14]: ").strip()
+    opset_version = 11 if opset_choice == "11" else 14
+    print(f"   Using opset version {opset_version}")
+    
     # Create model
-    print("\n2. Creating simplified model...")
-    model = create_onnx_model(cfg)
+    print(f"\n3. Creating simplified model...")
+    model = create_onnx_model(cfg, opset_version=opset_version)
     print(f"   Model created with {sum(p.numel() for p in model.parameters()):,} parameters")
     
     # Optional: Load weights
-    checkpoint_path = input("\n3. Checkpoint path (press Enter to skip): ").strip()
+    checkpoint_path = input("\n4. Checkpoint path (press Enter to skip): ").strip()
     if checkpoint_path and os.path.exists(checkpoint_path):
         load_original_weights(model, checkpoint_path)
     else:
@@ -259,7 +266,7 @@ def main():
         print("\n⚠ Model test failed, but continuing anyway...")
     
     # Export settings
-    output_path = input("\n4. Output path [default: maskpls_simplified.onnx]: ").strip()
+    output_path = input("\n5. Output path [default: maskpls_simplified.onnx]: ").strip()
     if not output_path:
         output_path = "maskpls_simplified.onnx"
     
@@ -270,7 +277,7 @@ def main():
     num_points = int(num_points) if num_points else 10000
     
     # Export to ONNX
-    if export_to_onnx(model, output_path, batch_size, num_points):
+    if export_to_onnx(model, output_path, batch_size, num_points, opset_version):
         # Test ONNX inference
         test_onnx_inference(output_path, batch_size, num_points)
     
