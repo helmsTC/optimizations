@@ -1,6 +1,7 @@
 """
 Fixed MaskPLS ONNX model that actually works
 This version simplifies the architecture for ONNX compatibility
+Location: mask/MaskPLS/mask_pls/models/onnx/simplified_model.py
 """
 
 import torch
@@ -16,7 +17,7 @@ class SimpleVoxelEncoder(nn.Module):
     Simplified voxel-based encoder that's ONNX-friendly
     Pre-computes voxel grid outside the model
     """
-    def __init__(self, cfg, opset_version=14):
+    def __init__(self, cfg):
         super().__init__()
         
         input_dim = cfg.INPUT_DIM
@@ -68,7 +69,8 @@ class SimpleVoxelEncoder(nn.Module):
 
 class SimplePointDecoderV11(nn.Module):
     """
-    Decoder compatible with ONNX opset 11 (no grid_sample)
+    Decoder compatible with ONNX (no grid_sample)
+    Uses nearest neighbor sampling which is fully supported
     """
     def __init__(self, in_channels, out_channels):
         super().__init__()
@@ -92,8 +94,13 @@ class SimplePointDecoderV11(nn.Module):
         voxel_flat = voxel_features.view(B, C_out, -1)
         
         # Convert coordinates to indices
-        voxel_coords = point_coords * torch.tensor([D, H, W], device=point_coords.device)
-        voxel_coords = torch.clamp(voxel_coords, 0, torch.tensor([D-1, H-1, W-1], device=point_coords.device))
+        voxel_coords = point_coords * torch.tensor([D, H, W], device=point_coords.device, dtype=point_coords.dtype)
+        
+        # Clamp each dimension separately for ONNX compatibility
+        voxel_coords[..., 0] = torch.clamp(voxel_coords[..., 0], 0, D-1)
+        voxel_coords[..., 1] = torch.clamp(voxel_coords[..., 1], 0, H-1)
+        voxel_coords[..., 2] = torch.clamp(voxel_coords[..., 2], 0, W-1)
+        
         voxel_coords = voxel_coords.long()
         
         # Flat indices
@@ -108,62 +115,6 @@ class SimplePointDecoderV11(nn.Module):
         
         # MLP
         point_features = self.mlp(point_features)
-        return point_features
-
-
-class SimplePointDecoder(nn.Module):
-    """
-    Simplified decoder that maps voxel features to point features
-    Uses trilinear interpolation instead of KNN
-    """
-    def __init__(self, in_channels, out_channels):
-        super().__init__()
-        
-        # Simple MLP to process interpolated features
-        self.mlp = nn.Sequential(
-            nn.Linear(in_channels, 256),
-            nn.ReLU(inplace=True),
-            nn.Linear(256, 256),
-            nn.ReLU(inplace=True),
-            nn.Linear(256, out_channels)
-        )
-        
-    def forward(self, voxel_features, point_coords):
-        """
-        Args:
-            voxel_features: [B, C, D, H, W] voxel features
-            point_coords: [B, N, 3] normalized point coordinates in [0, 1]
-        Returns:
-            point_features: [B, N, C_out] features for each point
-        """
-        B, C, D, H, W = voxel_features.shape
-        B, N, _ = point_coords.shape
-        
-        # Convert normalized coords to voxel indices
-        # point_coords are in [0, 1], need to map to [-1, 1] for grid_sample
-        grid_coords = point_coords * 2.0 - 1.0  # [B, N, 3]
-        
-        # Reshape for grid_sample (needs 5D: [B, 1, N, 1, 3])
-        grid_coords = grid_coords.unsqueeze(1).unsqueeze(3)  # [B, 1, N, 1, 3]
-        
-        # Reorder coordinates for grid_sample (expects x,y,z order)
-        grid_coords = grid_coords[..., [2, 1, 0]]  # DHW -> WHD for grid_sample
-        
-        # Sample features using trilinear interpolation
-        sampled_features = F.grid_sample(
-            voxel_features,
-            grid_coords,
-            mode='bilinear',
-            padding_mode='zeros',
-            align_corners=True
-        )  # [B, C, 1, N, 1]
-        
-        # Reshape to [B, N, C]
-        sampled_features = sampled_features.squeeze(2).squeeze(3).transpose(1, 2)
-        
-        # Process with MLP
-        point_features = self.mlp(sampled_features)
-        
         return point_features
 
 
@@ -269,19 +220,11 @@ class MaskPLSSimplifiedONNX(nn.Module):
         # Encoder
         self.encoder = SimpleVoxelEncoder(cfg.BACKBONE)
         
-        # Point decoder (choose based on ONNX opset version)
-        if opset_version < 14:
-            print(f"Using opset {opset_version} compatible decoder (nearest neighbor)")
-            self.point_decoder = SimplePointDecoderV11(
-                self.encoder.feat_dim,
-                cfg.DECODER.HIDDEN_DIM
-            )
-        else:
-            print(f"Using opset {opset_version} decoder (trilinear interpolation)")
-            self.point_decoder = SimplePointDecoder(
-                self.encoder.feat_dim,
-                cfg.DECODER.HIDDEN_DIM
-            )
+        # Point decoder - ONLY use the ONNX-compatible version
+        self.point_decoder = SimplePointDecoderV11(
+            self.encoder.feat_dim,
+            cfg.DECODER.HIDDEN_DIM
+        )
         
         # Mask decoder
         self.mask_decoder = SimplifiedMaskDecoder(
@@ -352,12 +295,12 @@ class MaskPLSSimplifiedONNX(nn.Module):
         return pred_logits, pred_masks, sem_logits
 
 
-def create_onnx_model(cfg, opset_version=14):
+def create_onnx_model(cfg):
     """Create the simplified ONNX model"""
-    return MaskPLSSimplifiedONNX(cfg, opset_version)
+    return MaskPLSSimplifiedONNX(cfg)
 
 
-def export_model_to_onnx(model, output_path, batch_size=1, num_points=10000, opset_version=14):
+def export_model_to_onnx(model, output_path, batch_size=1, num_points=10000):
     """
     Export the model to ONNX format
     """
@@ -380,7 +323,7 @@ def export_model_to_onnx(model, output_path, batch_size=1, num_points=10000, ops
             (dummy_voxels, dummy_coords),
             output_path,
             export_params=True,
-            opset_version=opset_version,  # Use provided opset version
+            opset_version=16,  # Use 16 or higher
             do_constant_folding=True,
             input_names=['voxel_features', 'point_coords'],
             output_names=['pred_logits', 'pred_masks', 'sem_logits'],
@@ -423,10 +366,5 @@ if __name__ == "__main__":
     })
     
     # Create and export model
-    # Option 1: Use opset 14 (better quality with trilinear interpolation)
-    model = create_onnx_model(cfg, opset_version=14)
-    export_model_to_onnx(model, "maskpls_simplified.onnx", opset_version=14)
-    
-    # Option 2: Use opset 11 (wider compatibility, nearest neighbor)
-    # model = create_onnx_model(cfg, opset_version=11)
-    # export_model_to_onnx(model, "maskpls_simplified_v11.onnx", opset_version=11)
+    model = create_onnx_model(cfg)
+    export_model_to_onnx(model, "maskpls_simplified.onnx")
