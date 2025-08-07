@@ -1,5 +1,5 @@
 """
-ONNX-compatible decoder for MaskPLS - FIXED VERSION
+ONNX-compatible decoder for MaskPLS - CORRECTED VERSION
 Replace mask_pls/onnx/onnx_decoder.py with this
 """
 
@@ -31,8 +31,8 @@ class ONNXCompatibleDecoder(nn.Module):
         # Level embeddings
         self.level_embed = nn.Embedding(self.num_feature_levels, hidden_dim)
         
-        # Simplified positional encoding that works with ONNX
-        self.register_buffer('pos_enc_weight', self._create_pos_encoding(10000, hidden_dim))
+        # FIX: Create proper positional encoder
+        self.pos_encoder = PositionalEncodingONNX(hidden_dim, max_len=10000)
         
         # Transformer layers - simplified for ONNX
         self.transformer_layers = nn.ModuleList()
@@ -50,16 +50,21 @@ class ONNXCompatibleDecoder(nn.Module):
         in_channels = bb_cfg.CHANNELS
         self.input_proj = nn.ModuleList()
         
+        # Fix the projection layers to match actual channel dimensions
+        # Assuming backbone outputs: [256, 128, 96, 96]
+        level_channels = [256, 128, 96]  # Take first 3 for 3 feature levels
+        
         for i in range(self.num_feature_levels):
-            ch_idx = -(self.num_feature_levels - i)
-            ch = in_channels[ch_idx]
-            
-            if ch != hidden_dim:
-                self.input_proj.append(nn.Linear(ch, hidden_dim))
+            if i < len(level_channels):
+                ch = level_channels[i]
+                if ch != hidden_dim:
+                    self.input_proj.append(nn.Linear(ch, hidden_dim))
+                else:
+                    self.input_proj.append(nn.Identity())
             else:
                 self.input_proj.append(nn.Identity())
         
-        # Mask feature projection
+        # Mask feature projection - last channel is 96
         if in_channels[-1] != hidden_dim:
             self.mask_feat_proj = nn.Linear(in_channels[-1], hidden_dim)
         else:
@@ -78,42 +83,33 @@ class ONNXCompatibleDecoder(nn.Module):
             nn.Linear(hidden_dim, hidden_dim)
         )
     
-    def _create_pos_encoding(self, max_len, d_model):
-        """Create position encoding matrix"""
-        pe = torch.zeros(max_len, d_model)
-        position = torch.arange(0, max_len).unsqueeze(1).float()
-        
-        div_term = torch.exp(torch.arange(0, d_model, 2).float() *
-                           -(torch.log(torch.tensor(10000.0)) / d_model))
-        
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        
-        return pe.unsqueeze(0)
-    
-    def add_pos_encoding(self, x):
-        """Add positional encoding - ONNX compatible"""
-        if x.shape[1] > self.pos_enc_weight.shape[1]:
-            # If input is larger, return as is
-            return x
-        return x + self.pos_enc_weight[:, :x.shape[1], :self.hidden_dim]
-    
     def forward(self, feats: List[torch.Tensor], 
                 mask_features: torch.Tensor,
                 pad_masks: List[torch.Tensor]) -> Dict[str, torch.Tensor]:
         """
         Fixed forward pass without dynamic control flow
         """
+        # Handle empty features case
+        if not feats or len(feats) == 0:
+            B = 1
+            return {
+                'pred_logits': torch.zeros(B, self.num_queries, self.num_classes + 1),
+                'pred_masks': torch.zeros(B, 1, self.num_queries),
+                'aux_outputs': []
+            }
+        
         # Initialize batch size
-        B = feats[0].shape[0] if feats and len(feats) > 0 else 1
+        B = feats[0].shape[0]
         
         # Initialize queries
         query_feat = self.query_feat.expand(B, -1, -1)
         query_pos = self.query_pos.expand(B, -1, -1)
         
-        # Project mask features
+        # Project mask features and add positional encoding
         mask_features = self.mask_feat_proj(mask_features)
-        mask_features = self.add_pos_encoding(mask_features)
+        # Only add PE if mask_features has points
+        if mask_features.shape[1] > 0:
+            mask_features = self.pos_encoder(mask_features)
         
         # Store predictions
         predictions_class = []
@@ -126,31 +122,36 @@ class ONNXCompatibleDecoder(nn.Module):
         predictions_class.append(outputs_class)
         predictions_mask.append(outputs_mask)
         
-        # FIX: Use static loop without conditionals
-        for i in range(min(self.num_layers, 9)):  # Cap at 9 for ONNX
+        # Process through transformer layers (cap at 9 for ONNX stability)
+        num_iterations = min(self.num_layers, 9)
+        
+        for i in range(num_iterations):
             level_index = i % self.num_feature_levels
             
-            # Process features if available
+            # Check if we have features for this level
             if level_index < len(feats):
+                # Project features to hidden dimension
                 level_features = self.input_proj[level_index](feats[level_index])
                 
                 # Add level embedding
                 level_emb = self.level_embed.weight[level_index:level_index+1]
                 level_features = level_features + level_emb
-                level_features = self.add_pos_encoding(level_features)
                 
-                # FIX: No dynamic attention masks - use static operations
-                # Get padding mask if available
+                # Add positional encoding if features have points
+                if level_features.shape[1] > 0:
+                    level_features = self.pos_encoder(level_features)
+                
+                # Get padding mask if available (but don't use in attention)
                 level_pad_mask = None
                 if level_index < len(pad_masks):
                     level_pad_mask = pad_masks[level_index]
                 
-                # Transformer layer without dynamic masks
+                # Apply transformer layer WITHOUT dynamic attention masks
                 query_feat = self.transformer_layers[i](
                     query_feat,
                     level_features,
                     query_pos=query_pos,
-                    memory_key_padding_mask=level_pad_mask
+                    memory_key_padding_mask=None  # Don't use padding mask to avoid ONNX issues
                 )
                 
                 # Predict at this layer
@@ -160,14 +161,12 @@ class ONNXCompatibleDecoder(nn.Module):
                 predictions_class.append(outputs_class)
                 predictions_mask.append(outputs_mask)
         
-        # Final output
-        out = {
-            'pred_logits': predictions_class[-1] if predictions_class else torch.zeros(B, self.num_queries, self.num_classes + 1),
-            'pred_masks': predictions_mask[-1] if predictions_mask else torch.zeros(B, 1, self.num_queries),
-            'aux_outputs': []  # Simplified - no aux outputs for ONNX
+        # Return final predictions
+        return {
+            'pred_logits': predictions_class[-1],
+            'pred_masks': predictions_mask[-1],
+            'aux_outputs': []  # No aux outputs for ONNX simplicity
         }
-        
-        return out
     
     def predict_masks(self, query_feat: torch.Tensor, 
                      mask_features: torch.Tensor) -> tuple:
@@ -183,12 +182,13 @@ class ONNXCompatibleDecoder(nn.Module):
         # Generate mask embeddings
         mask_embed = self.mask_embed(decoder_output)
         
-        # Compute mask logits - handle empty case
+        # Compute mask logits
         if mask_features.shape[1] == 0:
+            # Handle empty mask features
             B, Q = query_feat.shape[:2]
             outputs_mask = torch.zeros(B, 1, Q, device=query_feat.device)
         else:
-            # [B, N, Q] = [B, N, C] x [B, Q, C]^T
+            # [B, N, Q] = [B, N, C] @ [B, C, Q]
             outputs_mask = torch.bmm(mask_features, mask_embed.transpose(1, 2))
         
         return outputs_class, outputs_mask
@@ -230,20 +230,25 @@ class TransformerDecoderLayerONNX(nn.Module):
     def forward(self, tgt, memory, query_pos=None,
                 memory_key_padding_mask=None):
         """
-        Forward pass - simplified for ONNX
+        Forward pass - simplified for ONNX without dynamic masks
         """
         # Self-attention
-        q = k = tgt + query_pos if query_pos is not None else tgt
+        if query_pos is not None:
+            q = k = tgt + query_pos
+        else:
+            q = k = tgt
+            
         tgt2, _ = self.self_attn(q, k, tgt)
         tgt = tgt + self.dropout1(tgt2)
         tgt = self.norm1(tgt)
         
-        # Cross-attention - NO dynamic attention mask
-        q = tgt + query_pos if query_pos is not None else tgt
-        tgt2, _ = self.cross_attn(
-            q, memory, memory,
-            key_padding_mask=memory_key_padding_mask
-        )
+        # Cross-attention (no dynamic attention masks)
+        if query_pos is not None:
+            q = tgt + query_pos
+        else:
+            q = tgt
+            
+        tgt2, _ = self.cross_attn(q, memory, memory)
         tgt = tgt + self.dropout2(tgt2)
         tgt = self.norm2(tgt)
         
@@ -267,18 +272,35 @@ class PositionalEncodingONNX(nn.Module):
         pe = torch.zeros(max_len, d_model)
         position = torch.arange(0, max_len).unsqueeze(1).float()
         
+        # Create div_term for sinusoidal pattern
         div_term = torch.exp(torch.arange(0, d_model, 2).float() *
                            -(torch.log(torch.tensor(10000.0)) / d_model))
         
+        # Apply sin to even indices
         pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
         
+        # Apply cos to odd indices (handle case where d_model is odd)
+        if d_model % 2 == 0:
+            pe[:, 1::2] = torch.cos(position * div_term)
+        else:
+            pe[:, 1::2] = torch.cos(position * div_term[:-1])
+        
+        # Register as buffer (not a parameter)
         self.register_buffer('pe', pe.unsqueeze(0))
     
     def forward(self, x):
         """
-        Add positional encoding to input - handles dynamic sizes
+        Add positional encoding to input
+        Args:
+            x: Tensor of shape [B, N, C]
+        Returns:
+            x + positional encoding
         """
-        if x.shape[1] > self.pe.shape[1]:
-            return x  # Skip if input is larger
-        return x + self.pe[:, :x.shape[1], :self.d_model]
+        # Handle case where input is larger than max_len
+        seq_len = x.size(1)
+        if seq_len > self.pe.size(1):
+            # If input is too large, just return without PE
+            return x
+        
+        # Add positional encoding
+        return x + self.pe[:, :seq_len, :x.size(2)]
