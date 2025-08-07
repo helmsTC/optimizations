@@ -1,5 +1,7 @@
 """
 Complete ONNX-compatible MaskPLS model
+This integrates the fixed decoder with the backbone
+Replace mask_pls/onnx/onnx_model.py with this
 """
 
 import torch
@@ -26,13 +28,21 @@ class MaskPLSONNX(nn.Module):
         self.data_cfg = cfg[dataset]
         self.num_classes = self.data_cfg.NUM_CLASSES
         
+        # Ensure DECODER config has POS_ENC
+        if not hasattr(cfg.DECODER, 'POS_ENC'):
+            cfg.DECODER.POS_ENC = type('obj', (object,), {
+                'MAX_FREQ': 10000,
+                'DIMENSIONALITY': 3,
+                'BASE': 2
+            })()
+        
         # Initialize backbone
         self.backbone = DenseConv3DBackbone(
             cfg.BACKBONE, 
             self.data_cfg
         )
         
-        # Initialize decoder
+        # Initialize decoder with fixed version
         self.decoder = ONNXCompatibleDecoder(
             cfg.DECODER,
             cfg.BACKBONE,
@@ -41,7 +51,7 @@ class MaskPLSONNX(nn.Module):
         
         # Store configuration
         self.voxel_size = cfg.BACKBONE.RESOLUTION
-        self.spatial_shape = getattr(cfg, 'SPATIAL_SHAPE', (96, 96, 8))
+        self.spatial_shape = getattr(self.backbone, 'spatial_shape', (96, 96, 8))
         self.coordinate_bounds = self.data_cfg.SPACE
         
         # Things/stuff IDs for panoptic segmentation
@@ -66,11 +76,7 @@ class MaskPLSONNX(nn.Module):
                 - Tensor of points [B, N, 3]
             features: Tensor of features [B, N, C] (if points_or_dict is tensor)
         Returns:
-            Dict with:
-                - pred_logits: [B, Q, num_classes+1] class predictions
-                - pred_masks: [B, N, Q] mask predictions
-                - aux_outputs: List of intermediate predictions
-                - sem_logits: [B, N, num_classes] semantic segmentation
+            Dict with predictions and semantic logits
         """
         # Handle different input formats
         if isinstance(points_or_dict, dict):
@@ -107,21 +113,25 @@ class MaskPLSONNX(nn.Module):
         
         # Process through decoder
         if feats and len(feats) > 0:
-            # Use last feature level as mask features
-            mask_features = feats[-1]
+            # Make copies of lists to avoid modifying originals
+            feats_copy = [f.clone() if isinstance(f, torch.Tensor) else f for f in feats]
+            coors_copy = [c.clone() if isinstance(c, torch.Tensor) else c for c in coors]
+            masks_copy = [m.clone() if isinstance(m, torch.Tensor) else m for m in pad_masks]
             
             # Decoder forward pass
-            outputs = self.decoder(feats, mask_features, pad_masks)
+            outputs, padding = self.decoder(feats_copy, coors_copy, masks_copy)
             
             # Add semantic logits to output
             outputs['sem_logits'] = sem_logits
+            outputs['padding'] = padding
         else:
             # Empty output
             outputs = {
                 'pred_logits': torch.zeros(1, 100, self.num_classes + 1),
                 'pred_masks': torch.zeros(1, 1, 100),
                 'aux_outputs': [],
-                'sem_logits': torch.zeros(1, 1, self.num_classes)
+                'sem_logits': torch.zeros(1, 1, self.num_classes),
+                'padding': torch.zeros(1, 1, dtype=torch.bool)
             }
         
         return outputs
@@ -249,7 +259,7 @@ class MaskPLSExportWrapper(nn.Module):
         return (
             outputs['pred_logits'],
             outputs['pred_masks'],
-            outputs.get('sem_logits', torch.zeros(1, 1, self.model.num_classes))
+            outputs.get('sem_logits', torch.zeros(points.shape[0], points.shape[1], self.model.num_classes))
         )
 
 
@@ -257,6 +267,14 @@ def create_onnx_model(cfg) -> MaskPLSONNX:
     """
     Factory function to create ONNX-compatible model
     """
+    # Ensure POS_ENC config exists
+    if not hasattr(cfg.DECODER, 'POS_ENC'):
+        cfg.DECODER.POS_ENC = type('obj', (object,), {
+            'MAX_FREQ': 10000,
+            'DIMENSIONALITY': 3,
+            'BASE': 2
+        })()
+    
     model = MaskPLSONNX(cfg)
     
     # Initialize weights properly
@@ -286,20 +304,6 @@ def load_checkpoint_weights(model: MaskPLSONNX, checkpoint_path: str, strict: bo
     checkpoint = torch.load(checkpoint_path, map_location='cpu')
     state_dict = checkpoint['state_dict'] if 'state_dict' in checkpoint else checkpoint
     
-    # Create mapping from old names to new names
-    name_mapping = {
-        # Backbone mappings
-        'backbone.stem': 'backbone.stem',
-        'backbone.stage': 'backbone.stage',
-        'backbone.up': 'backbone.up',
-        
-        # Decoder mappings
-        'decoder.query_feat': 'decoder.query_feat',
-        'decoder.query_embed': 'decoder.query_pos',
-        'decoder.class_embed': 'decoder.class_embed',
-        'decoder.mask_embed': 'decoder.mask_embed',
-    }
-    
     # Filter and map weights
     new_state_dict = {}
     model_state = model.state_dict()
@@ -316,14 +320,6 @@ def load_checkpoint_weights(model: MaskPLSONNX, checkpoint_path: str, strict: bo
         if old_name in model_state:
             if param.shape == model_state[old_name].shape:
                 new_state_dict[old_name] = param
-        else:
-            # Try mapped names
-            for old_pattern, new_pattern in name_mapping.items():
-                if old_pattern in old_name:
-                    new_name = old_name.replace(old_pattern, new_pattern)
-                    if new_name in model_state and param.shape == model_state[new_name].shape:
-                        new_state_dict[new_name] = param
-                        break
     
     # Load weights
     model.load_state_dict(new_state_dict, strict=strict)
