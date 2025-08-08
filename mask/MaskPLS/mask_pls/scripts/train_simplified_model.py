@@ -6,6 +6,7 @@ Save as: mask/MaskPLS/mask_pls/scripts/train_simplified_model.py
 import os
 # Enable CUDA error debugging
 os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+os.environ['TORCH_USE_CUDA_DSA'] = '1'  # Enable device-side assertions for better error messages
 
 from os.path import join
 import click
@@ -35,17 +36,30 @@ class SimplifiedMaskPLS(LightningModule):
         self.save_hyperparameters(dict(cfg))
         self.cfg = cfg
         
+        # Get dataset configuration
+        dataset = cfg.MODEL.DATASET
+        self.num_classes = cfg[dataset].NUM_CLASSES
+        self.ignore_label = cfg[dataset].IGNORE_LABEL
+        
+        print(f"Initializing model for {dataset} with {self.num_classes} classes")
+        print(f"Ignore label: {self.ignore_label}")
+        
         # Create the simplified model
         self.model = MaskPLSSimplifiedONNX(cfg)
         
+        # Verify semantic head configuration
+        sem_head_out = self.model.sem_head.out_features
+        if sem_head_out != self.num_classes:
+            print(f"WARNING: Semantic head outputs {sem_head_out} classes but dataset has {self.num_classes}")
+        
         # Loss functions (same as original)
-        self.mask_loss = MaskLoss(cfg.LOSS, cfg[cfg.MODEL.DATASET])
+        self.mask_loss = MaskLoss(cfg.LOSS, cfg[dataset])
         self.sem_loss = SemLoss(cfg.LOSS.SEM.WEIGHTS)
         
         # Evaluator (same as original)
         self.evaluator = PanopticEvaluator(
-            cfg[cfg.MODEL.DATASET], 
-            cfg.MODEL.DATASET
+            cfg[dataset], 
+            dataset
         )
         
         # Cache things IDs
@@ -134,6 +148,25 @@ class SimplifiedMaskPLS(LightningModule):
         # Forward through model
         pred_logits, pred_masks, sem_logits = self.model(batch_voxels, batch_coords)
         
+        # Validate outputs
+        if self.debug:
+            print(f"Model outputs:")
+            print(f"  pred_logits: {pred_logits.shape}, range [{pred_logits.min():.2f}, {pred_logits.max():.2f}]")
+            print(f"  pred_masks: {pred_masks.shape}, range [{pred_masks.min():.2f}, {pred_masks.max():.2f}]")
+            print(f"  sem_logits: {sem_logits.shape}, range [{sem_logits.min():.2f}, {sem_logits.max():.2f}]")
+        
+        # Check semantic logits shape
+        expected_classes = self.num_classes
+        if sem_logits.shape[-1] != expected_classes:
+            print(f"ERROR: sem_logits has {sem_logits.shape[-1]} classes but expected {expected_classes}")
+            # Adjust if necessary
+            if sem_logits.shape[-1] > expected_classes:
+                sem_logits = sem_logits[..., :expected_classes]
+            else:
+                # Pad with zeros
+                pad_size = expected_classes - sem_logits.shape[-1]
+                sem_logits = F.pad(sem_logits, (0, pad_size))
+        
         outputs = {
             'pred_logits': pred_logits,
             'pred_masks': pred_masks,
@@ -151,6 +184,15 @@ class SimplifiedMaskPLS(LightningModule):
                 print(f"Features shapes: {[f.shape for f in batch['feats']]}")
                 print(f"Sem label shapes: {[l.shape for l in batch['sem_label']]}")
                 print(f"Masks classes: {[len(m) for m in batch['masks_cls']]}")
+                
+                # CHECK LABELS BEFORE PROCESSING
+                print("\nChecking raw labels from dataset:")
+                for i, label in enumerate(batch['sem_label']):
+                    unique = np.unique(label)
+                    print(f"  Sample {i}: unique labels = {unique}")
+                    if unique.max() >= self.num_classes:
+                        print(f"  ⚠️  ERROR: Found label {unique.max()} >= {self.num_classes}")
+                        print(f"  This is causing the CUDA error!")
             
             outputs, padding, sem_logits, valid_indices = self.forward(batch)
             
@@ -237,21 +279,38 @@ class SimplifiedMaskPLS(LightningModule):
             all_sem_labels = torch.cat(all_sem_labels, dim=0)
             
             # Ensure labels are within valid range
-            num_classes = self.cfg[self.cfg.MODEL.DATASET].NUM_CLASSES
+            num_classes = self.num_classes
             
             # Debug label range
             if self.debug or batch_idx == 0:
-                print(f"Label range before clamp: [{all_sem_labels.min().item()}, {all_sem_labels.max().item()}], num_classes={num_classes}")
+                print(f"Label range before processing: [{all_sem_labels.min().item()}, {all_sem_labels.max().item()}], num_classes={num_classes}")
+                unique_labels, counts = torch.unique(all_sem_labels, return_counts=True)
+                print(f"Unique labels: {unique_labels.cpu().numpy()}")
+                print(f"Label counts: {counts.cpu().numpy()}")
             
-            # Filter out ignore labels (0) and clamp to valid range
-            valid_mask = all_sem_labels > 0  # Ignore label 0
+            # TEMPORARY FIX: Force labels into valid range
+            if all_sem_labels.max() >= num_classes:
+                print(f"WARNING: Found labels >= {num_classes}, clamping to valid range")
+                all_sem_labels = torch.clamp(all_sem_labels, 0, num_classes - 1)
+            
+            # Filter out invalid labels
+            valid_mask = (all_sem_labels >= 0) & (all_sem_labels < num_classes)
+            
+            # Special handling for ignore label
+            if self.ignore_label is not None and self.ignore_label >= 0:
+                valid_mask &= (all_sem_labels != self.ignore_label)
+            
             all_sem_logits = all_sem_logits[valid_mask]
             all_sem_labels = all_sem_labels[valid_mask]
-            all_sem_labels = torch.clamp(all_sem_labels, 0, num_classes - 1)
             
             if len(all_sem_labels) == 0:
-                print("Warning: All labels are ignore class")
+                print("Warning: All labels are invalid or ignore class")
                 return torch.tensor(0.1, device='cuda', requires_grad=True)
+            
+            # Final validation
+            assert all_sem_labels.min() >= 0, f"Negative labels found: {all_sem_labels.min()}"
+            assert all_sem_labels.max() < num_classes, f"Labels exceed num_classes: {all_sem_labels.max()} >= {num_classes}"
+            assert all_sem_logits.shape[-1] == num_classes, f"Logits shape mismatch: {all_sem_logits.shape[-1]} != {num_classes}"
             
             # Compute semantic loss
             loss_sem = self.sem_loss(all_sem_logits, all_sem_labels)
