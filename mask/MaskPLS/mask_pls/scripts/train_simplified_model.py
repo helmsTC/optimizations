@@ -80,24 +80,45 @@ class SimplifiedMaskPLS(LightningModule):
                 break
                 
             print(f"\nChecking batch {i}:")
+            
+            # Check semantic labels
             for j, label in enumerate(batch['sem_label']):
                 unique = np.unique(label)
-                print(f"  Sample {j}: labels range [{unique.min()}, {unique.max()}]")
+                print(f"  Sample {j}: sem_labels range [{unique.min()}, {unique.max()}]")
                 
                 if unique.max() >= self.num_classes:
                     print(f"  ERROR: Found invalid labels: {unique[unique >= self.num_classes]}")
-                    
-            # Also check mask classes
-            for j, mask_cls in enumerate(batch['masks_cls']):
-                if len(mask_cls) > 0:
-                    mask_cls_array = torch.stack(mask_cls).numpy() if isinstance(mask_cls[0], torch.Tensor) else np.array(mask_cls)
-                    print(f"  Sample {j}: mask classes: {np.unique(mask_cls_array)}")
-                    
-                    if mask_cls_array.max() >= self.num_classes:
-                        print(f"  ERROR: Invalid mask class: {mask_cls_array.max()}")
+            
+            # Check mask classes more carefully
+            for j, mask_cls_list in enumerate(batch['masks_cls']):
+                if len(mask_cls_list) > 0:
+                    try:
+                        # Each element in mask_cls_list is a tensor with a class label
+                        # We need to extract the values
+                        class_values = []
+                        for cls in mask_cls_list:
+                            if isinstance(cls, torch.Tensor):
+                                # Handle both scalar tensors and arrays
+                                if cls.numel() == 1:
+                                    class_values.append(cls.item())
+                                else:
+                                    class_values.extend(cls.cpu().numpy().flatten())
+                            else:
+                                class_values.append(cls)
+                        
+                        unique_classes = np.unique(class_values)
+                        print(f"  Sample {j}: {len(mask_cls_list)} masks, unique classes: {unique_classes}")
+                        
+                        if len(unique_classes) > 0 and unique_classes.max() >= self.num_classes:
+                            print(f"  ERROR: Invalid mask class: {unique_classes.max()} >= {self.num_classes}")
+                            
+                    except Exception as e:
+                        print(f"  Sample {j}: Could not process mask classes - {type(e).__name__}: {e}")
+                else:
+                    print(f"  Sample {j}: No masks in this sample")
         
         print("\nValidation complete. Starting training...\n")
-        
+            
     def forward(self, batch):
         """Forward pass with pre-voxelization"""
         # Extract data from batch
