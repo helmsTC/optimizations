@@ -241,7 +241,14 @@ class SimplifiedMaskPLS(LightningModule):
             step_size=self.cfg.TRAIN.STEP, 
             gamma=self.cfg.TRAIN.DECAY
         )
-        return [optimizer], [scheduler]
+        return {
+            'optimizer': optimizer,
+            'lr_scheduler': {
+                'scheduler': scheduler,
+                'interval': 'epoch',
+                'frequency': 1
+            }
+        }
     
     def panoptic_inference(self, outputs, padding):
         """Panoptic segmentation inference (adapted from original)"""
