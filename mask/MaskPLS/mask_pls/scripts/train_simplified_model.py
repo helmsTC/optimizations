@@ -28,6 +28,51 @@ import torch.nn.functional as F
 from pytorch_lightning.core.lightning import LightningModule
 
 
+def prepare_targets_for_loss(batch, device='cuda'):
+    """Convert batch targets to the format expected by the loss functions"""
+    fixed_targets = {
+        'classes': [],
+        'masks': []
+    }
+    
+    for i in range(len(batch['masks_cls'])):
+        if len(batch['masks_cls'][i]) > 0:
+            # Convert list of scalar tensors to single tensor
+            classes = []
+            for c in batch['masks_cls'][i]:
+                if isinstance(c, torch.Tensor):
+                    classes.append(c.item() if c.numel() == 1 else int(c))
+                else:
+                    classes.append(int(c))
+            
+            # Create tensor and move to device
+            classes_tensor = torch.tensor(classes, dtype=torch.long, device=device)
+            fixed_targets['classes'].append(classes_tensor)
+            
+            # Stack masks and move to device
+            masks_list = []
+            for m in batch['masks'][i]:
+                if isinstance(m, torch.Tensor):
+                    masks_list.append(m.float())
+                else:
+                    masks_list.append(torch.tensor(m, dtype=torch.float32))
+            
+            if len(masks_list) > 0:
+                masks_tensor = torch.stack(masks_list).to(device)
+                fixed_targets['masks'].append(masks_tensor)
+            else:
+                # Empty masks
+                num_points = len(batch['pt_coord'][i])
+                fixed_targets['masks'].append(torch.empty(0, num_points, device=device))
+        else:
+            # No masks in this sample
+            num_points = len(batch['pt_coord'][i])
+            fixed_targets['classes'].append(torch.empty(0, dtype=torch.long, device=device))
+            fixed_targets['masks'].append(torch.empty(0, num_points, device=device))
+    
+    return fixed_targets
+
+
 class SimplifiedMaskPLS(LightningModule):
     """
     Lightning module for training the simplified MaskPLS model
@@ -182,17 +227,12 @@ class SimplifiedMaskPLS(LightningModule):
     
     def training_step(self, batch, batch_idx):
         try:
-            # Skip data validation callback that was causing issues
-            
             outputs, padding, sem_logits, valid_indices = self.forward(batch)
             
-            # Prepare targets for mask loss
-            targets = {
-                'classes': batch['masks_cls'],
-                'masks': batch['masks']
-            }
+            # Prepare targets for mask loss - THIS IS THE KEY FIX
+            targets = prepare_targets_for_loss(batch, device='cuda')
             
-            # Mask loss with error handling
+            # Mask loss
             try:
                 loss_mask = self.mask_loss(outputs, targets, batch['masks_ids'], batch['pt_coord'])
             except Exception as e:
@@ -315,8 +355,10 @@ class SimplifiedMaskPLS(LightningModule):
         try:
             outputs, padding, sem_logits, valid_indices = self.forward(batch)
             
-            # Calculate losses (similar to training)
-            targets = {'classes': batch['masks_cls'], 'masks': batch['masks']}
+            # Prepare targets for mask loss - ADD THIS FIX
+            targets = prepare_targets_for_loss(batch, device='cuda')
+            
+            # Calculate losses
             loss_mask = self.mask_loss(outputs, targets, batch['masks_ids'], batch['pt_coord'])
             
             # Semantic loss
