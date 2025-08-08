@@ -1,6 +1,6 @@
 """
-Test the actual training pipeline to find where CUDA error occurs
-Save as: mask_pls/scripts/test_training_pipeline.py
+Debug the mask loss computation in detail
+Save as: mask_pls/scripts/debug_mask_loss.py
 """
 import os
 os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
@@ -12,15 +12,15 @@ import numpy as np
 from easydict import EasyDict as edict
 from os.path import join, dirname, abspath
 
-# Import actual components
 from mask_pls.models.onnx.simplified_model import MaskPLSSimplifiedONNX
 from mask_pls.datasets.semantic_dataset import SemanticDatasetModule
-from mask_pls.models.loss import MaskLoss, SemLoss
+from mask_pls.models.loss import MaskLoss
+from mask_pls.models.matcher import HungarianMatcher
 
 
-def test_actual_pipeline():
-    """Test the actual training pipeline step by step"""
-    print("Testing Actual Training Pipeline")
+def debug_mask_loss_detailed():
+    """Debug mask loss computation step by step"""
+    print("Debugging Mask Loss in Detail")
     print("=" * 60)
     
     # Load configs
@@ -30,53 +30,25 @@ def test_actual_pipeline():
     decoder_cfg = edict(yaml.safe_load(open(join(base_dir, "config/decoder.yaml"))))
     cfg = edict({**model_cfg, **backbone_cfg, **decoder_cfg})
     
-    # Settings
     cfg.TRAIN.BATCH_SIZE = 1
     cfg.TRAIN.NUM_WORKERS = 0
     dataset = cfg.MODEL.DATASET
     num_classes = cfg[dataset].NUM_CLASSES
     
-    print(f"Configuration:")
-    print(f"  Dataset: {dataset}")
-    print(f"  Num classes: {num_classes}")
-    print(f"  Ignore label: {cfg[dataset].IGNORE_LABEL}")
-    
-    # Create model and data
-    print("\n1. Creating model...")
-    model = MaskPLSSimplifiedONNX(cfg).cuda()
-    model.eval()
-    
-    print("\n2. Creating dataset...")
+    # Get real data
+    print("1. Loading real data...")
     data = SemanticDatasetModule(cfg)
     data.setup()
     train_loader = data.train_dataloader()
-    
-    # Get one batch
-    print("\n3. Getting batch...")
     batch = next(iter(train_loader))
     
-    print(f"\nBatch info:")
-    print(f"  Batch size: {len(batch['pt_coord'])}")
-    for i in range(len(batch['pt_coord'])):
-        print(f"  Sample {i}:")
-        print(f"    Points: {batch['pt_coord'][i].shape}")
-        print(f"    Sem labels: {batch['sem_label'][i].shape}, range [{batch['sem_label'][i].min()}, {batch['sem_label'][i].max()}]")
-        print(f"    Masks: {len(batch['masks_cls'][i])}")
-        if len(batch['masks_cls'][i]) > 0:
-            # Fixed: Handle mask classes properly
-            cls_values = []
-            for c in batch['masks_cls'][i]:
-                if isinstance(c, torch.Tensor):
-                    cls_values.append(c.item() if c.numel() == 1 else c.cpu().numpy())
-                else:
-                    cls_values.append(c)
-            print(f"    Mask classes: {cls_values}")
-    
-    # Process through model (similar to forward in training)
-    print("\n4. Processing through model...")
+    # Process through model
+    print("\n2. Processing through model...")
+    model = MaskPLSSimplifiedONNX(cfg).cuda()
+    model.eval()
     
     with torch.no_grad():
-        # Pre-voxelize the batch (from training script)
+        # Simplified preprocessing (just get the outputs)
         batch_voxels = []
         batch_coords = []
         valid_indices = []
@@ -85,7 +57,6 @@ def test_actual_pipeline():
             pts = torch.from_numpy(batch['pt_coord'][i]).float().cuda()
             feat = torch.from_numpy(batch['feats'][i]).float().cuda()
             
-            # Filter by bounds
             bounds = cfg[dataset].SPACE
             valid_mask = torch.ones(pts.shape[0], dtype=torch.bool, device=pts.device)
             for dim in range(3):
@@ -95,26 +66,17 @@ def test_actual_pipeline():
             valid_pts = pts[valid_mask]
             valid_feat = feat[valid_mask]
             
-            print(f"\n  Sample {i} preprocessing:")
-            print(f"    Original points: {pts.shape[0]}")
-            print(f"    Valid points: {valid_pts.shape[0]}")
-            print(f"    Valid indices: {valid_idx.shape[0]}")
-            
-            # Subsample if needed
             max_pts = cfg[dataset].SUB_NUM_POINTS
             if len(valid_pts) > max_pts:
                 perm = torch.randperm(len(valid_pts))[:max_pts]
                 valid_pts = valid_pts[perm]
                 valid_feat = valid_feat[perm]
                 valid_idx = valid_idx[perm]
-                print(f"    After subsampling: {valid_pts.shape[0]}")
             
-            # Normalize coordinates
             norm_coords = torch.zeros_like(valid_pts)
             for dim in range(3):
                 norm_coords[:, dim] = (valid_pts[:, dim] - bounds[dim][0]) / (bounds[dim][1] - bounds[dim][0])
             
-            # Voxelize
             voxel_grid = model.voxelize_points(valid_pts.unsqueeze(0), valid_feat.unsqueeze(0))[0]
             
             batch_voxels.append(voxel_grid)
@@ -138,167 +100,169 @@ def test_actual_pipeline():
         
         batch_voxels = torch.stack(batch_voxels)
         batch_coords = torch.stack(padded_coords)
-        padding_masks = torch.stack(padding_masks)
         
-        print(f"\n  Batched tensors:")
-        print(f"    Voxels: {batch_voxels.shape}")
-        print(f"    Coords: {batch_coords.shape}")
-        print(f"    Padding: {[p.sum().item() for p in padding_masks]}")
-        
-        # Forward through model
-        print("\n5. Forward pass...")
+        # Forward
         pred_logits, pred_masks, sem_logits = model(batch_voxels, batch_coords)
         
-        print(f"\n  Model outputs:")
-        print(f"    pred_logits: {pred_logits.shape}, range [{pred_logits.min():.2f}, {pred_logits.max():.2f}]")
-        print(f"    pred_masks: {pred_masks.shape}, range [{pred_masks.min():.2f}, {pred_masks.max():.2f}]")
-        print(f"    sem_logits: {sem_logits.shape}, range [{sem_logits.min():.2f}, {sem_logits.max():.2f}]")
+        print(f"Model outputs:")
+        print(f"  pred_logits: {pred_logits.shape}")
+        print(f"  pred_masks: {pred_masks.shape}")
+        print(f"  padding mask sum: {padding_masks[0].sum()}")
+    
+    # Prepare loss inputs
+    outputs = {
+        'pred_logits': pred_logits,
+        'pred_masks': pred_masks,
+        'aux_outputs': []
+    }
+    
+    targets = {
+        'classes': batch['masks_cls'],
+        'masks': batch['masks']
+    }
+    
+    print(f"\n3. Target information:")
+    for i, (cls_list, mask_list) in enumerate(zip(targets['classes'], targets['masks'])):
+        print(f"  Sample {i}:")
+        print(f"    Number of masks: {len(cls_list)}")
+        if len(cls_list) > 0:
+            # Extract class values
+            cls_values = []
+            for c in cls_list:
+                if isinstance(c, torch.Tensor):
+                    cls_values.append(c.item() if c.numel() == 1 else c)
+                else:
+                    cls_values.append(c)
+            print(f"    Classes: {cls_values}")
+            print(f"    Mask shapes: {[m.shape for m in mask_list]}")
+    
+    # Create mask loss
+    print("\n4. Creating mask loss...")
+    mask_loss = MaskLoss(cfg.LOSS, cfg[dataset])
+    
+    # Debug the matcher first
+    print("\n5. Testing matcher...")
+    matcher = mask_loss.matcher
+    
+    try:
+        indices = matcher(outputs, targets)
+        print("  Matcher success!")
+        for i, (src_idx, tgt_idx) in enumerate(indices):
+            print(f"    Batch {i}: matched {len(src_idx)} queries to {len(tgt_idx)} targets")
+            if len(src_idx) > 0:
+                print(f"      Query indices: {src_idx[:5]}... (showing first 5)")
+                print(f"      Target indices: {tgt_idx[:5]}... (showing first 5)")
+    except Exception as e:
+        print(f"  Matcher failed: {e}")
+        return
+    
+    # Now debug loss_classes
+    print("\n6. Testing loss_classes...")
+    
+    # Get the permutation indices
+    batch_idx = torch.cat([torch.full_like(src, i) for i, (src, _) in enumerate(indices)])
+    src_idx = torch.cat([src for (src, _) in indices])
+    
+    print(f"  Permutation indices:")
+    print(f"    batch_idx shape: {batch_idx.shape}, values: {batch_idx[:10] if len(batch_idx) > 0 else 'empty'}")
+    print(f"    src_idx shape: {src_idx.shape}, values: {src_idx[:10] if len(src_idx) > 0 else 'empty'}")
+    
+    # Get matched target classes
+    target_classes_list = []
+    for i, (t_list, (_, J)) in enumerate(zip(targets["classes"], indices)):
+        print(f"\n  Processing batch {i}:")
+        print(f"    Target indices J: {J}")
+        print(f"    Number of targets: {len(t_list)}")
         
-        # Check dimensions
-        assert pred_logits.shape[-1] == num_classes + 1, f"Wrong pred_logits classes: {pred_logits.shape[-1]} vs {num_classes + 1}"
-        assert sem_logits.shape[-1] == num_classes, f"Wrong sem_logits classes: {sem_logits.shape[-1]} vs {num_classes}"
-        
-        # Prepare for loss
-        outputs = {
-            'pred_logits': pred_logits,
-            'pred_masks': pred_masks,
-            'aux_outputs': []
-        }
-        
-        targets = {
-            'classes': batch['masks_cls'],
-            'masks': batch['masks']
-        }
-        
-        print("\n6. Testing mask loss...")
-        mask_loss = MaskLoss(cfg.LOSS, cfg[dataset])
-        
-        # Check target classes
-        print("\n  Checking target classes:")
-        for i, cls_list in enumerate(targets['classes']):
-            if len(cls_list) > 0:
-                # Fixed: Extract values from each tensor in the list
-                cls_values = []
-                for c in cls_list:
-                    if isinstance(c, torch.Tensor):
-                        cls_values.append(c.item() if c.numel() == 1 else c.cpu().numpy())
+        if len(J) > 0:
+            for j in J:
+                if j < len(t_list):
+                    cls = t_list[j]
+                    if isinstance(cls, torch.Tensor):
+                        cls_val = cls.item() if cls.numel() == 1 else cls
                     else:
-                        cls_values.append(c)
-                print(f"    Sample {i}: {len(cls_list)} masks, classes: {cls_values}")
-                max_cls = max(cls_values)
-                if max_cls >= num_classes:
-                    print(f"    ERROR: Class {max_cls} >= {num_classes}!")
+                        cls_val = cls
+                    target_classes_list.append(cls_val)
+                    print(f"      Target {j}: class {cls_val}")
+                else:
+                    print(f"      ERROR: Target index {j} >= number of targets {len(t_list)}")
+    
+    if len(target_classes_list) > 0:
+        target_classes_o = torch.tensor(target_classes_list, device=pred_logits.device)
+        print(f"\n  Matched target classes: {target_classes_o}")
+        print(f"  Max class: {target_classes_o.max()}")
+        print(f"  Min class: {target_classes_o.min()}")
+    else:
+        print("\n  No matched targets!")
+        target_classes_o = torch.tensor([], device=pred_logits.device, dtype=torch.int64)
+    
+    # Create target tensor
+    print(f"\n7. Creating target tensor for cross_entropy...")
+    target_classes = torch.full(
+        outputs['pred_logits'].shape[:2],
+        num_classes,  # no-object class
+        dtype=torch.int64,
+        device=outputs['pred_logits'].device,
+    )
+    print(f"  Initialized target_classes shape: {target_classes.shape}")
+    print(f"  Initialized with no-object class: {num_classes}")
+    
+    # Assign matched classes
+    if len(batch_idx) > 0:
+        print(f"\n  Assigning {len(batch_idx)} matched targets...")
+        print(f"  batch_idx max: {batch_idx.max()}, min: {batch_idx.min()}")
+        print(f"  src_idx max: {src_idx.max()}, min: {src_idx.min()}")
+        print(f"  target_classes_o: {target_classes_o}")
+        
+        # Check if indices are valid
+        if batch_idx.max() >= target_classes.shape[0]:
+            print(f"  ERROR: batch_idx max {batch_idx.max()} >= batch size {target_classes.shape[0]}")
+        if src_idx.max() >= target_classes.shape[1]:
+            print(f"  ERROR: src_idx max {src_idx.max()} >= num queries {target_classes.shape[1]}")
         
         try:
-            losses = mask_loss(outputs, targets, batch['masks_ids'], batch['pt_coord'])
-            print("\n  Mask loss SUCCESS!")
-            for k, v in losses.items():
-                print(f"    {k}: {v.item():.4f}")
+            target_classes[batch_idx, src_idx] = target_classes_o
+            print("  Assignment successful!")
         except Exception as e:
-            print(f"\n  Mask loss FAILED: {e}")
-            import traceback
-            traceback.print_exc()
-            
-            # Debug the exact failure point
-            print("\n7. Debugging mask loss internals...")
-            
-            # Check if it's the matcher
-            try:
-                indices = mask_loss.matcher(outputs, targets)
-                print("  Matcher OK, indices:", indices)
-            except Exception as e2:
-                print(f"  Matcher failed: {e2}")
-                return
-            
-            # Check if it's loss_classes
-            try:
-                class_losses = mask_loss.loss_classes(outputs, targets, indices)
-                print("  loss_classes OK")
-            except Exception as e3:
-                print(f"  loss_classes failed: {e3}")
-                
-                # Manual debug
-                print("\n  Manual check of loss_classes:")
-                # Get matched target classes
-                if len(indices) > 0 and len(indices[0]) > 0:
-                    target_classes_list = []
-                    for t, (_, J) in zip(targets["classes"], indices):
-                        if len(J) > 0:
-                            # Extract values from tensors
-                            matched_classes = []
-                            for j in J:
-                                cls = t[j]
-                                if isinstance(cls, torch.Tensor):
-                                    matched_classes.append(cls.item() if cls.numel() == 1 else cls)
-                                else:
-                                    matched_classes.append(cls)
-                            target_classes_list.extend(matched_classes)
-                    
-                    if len(target_classes_list) > 0:
-                        print(f"    Matched target classes: {target_classes_list}")
-                        print(f"    Max target class: {max(target_classes_list)}")
-                else:
-                    print("    No matched targets")
-                
-                # Check the pred_logits shape
-                print(f"    pred_logits shape: {outputs['pred_logits'].shape}")
-                print(f"    Expected: [batch_size, num_queries, {num_classes + 1}]")
-                
-        # Also test semantic loss
-        print("\n8. Testing semantic loss...")
-        sem_loss = SemLoss(cfg.LOSS.SEM.WEIGHTS)
+            print(f"  Assignment failed: {e}")
+            return
+    
+    print(f"\n  Final target_classes:")
+    print(f"    Shape: {target_classes.shape}")
+    print(f"    Min: {target_classes.min()}, Max: {target_classes.max()}")
+    print(f"    Unique values: {torch.unique(target_classes).cpu().numpy()}")
+    
+    # Test cross_entropy
+    print("\n8. Testing cross_entropy...")
+    print(f"  pred_logits shape: {outputs['pred_logits'].shape}")
+    print(f"  target_classes shape: {target_classes.shape}")
+    
+    try:
+        # Get weights
+        weights = mask_loss.weights.to(outputs['pred_logits'].device)
+        print(f"  Weights shape: {weights.shape}")
+        print(f"  Weights: {weights}")
         
-        # Prepare semantic labels (simplified version)
-        all_sem_labels = []
-        all_sem_logits = []
+        # Compute loss
+        loss_ce = torch.nn.functional.cross_entropy(
+            outputs['pred_logits'].transpose(1, 2),
+            target_classes,
+            weights,
+            ignore_index=mask_loss.ignore
+        )
+        print(f"  Cross entropy SUCCESS! Loss: {loss_ce.item():.4f}")
+    except Exception as e:
+        print(f"  Cross entropy FAILED: {e}")
+        import traceback
+        traceback.print_exc()
         
-        for i, (label, idx, pad) in enumerate(zip(batch['sem_label'], valid_indices, padding_masks)):
-            valid_mask = ~pad
-            num_valid = valid_mask.sum().item()
-            
-            if num_valid > 0:
-                sem_logits_i = sem_logits[i][valid_mask]
-                
-                # Get labels for valid points
-                idx_cpu = idx.cpu().numpy()
-                num_logits = sem_logits_i.shape[0]
-                idx_to_use = idx_cpu[:num_logits]
-                
-                label_array = label.flatten()
-                # Make sure indices are valid
-                idx_to_use = idx_to_use[idx_to_use < len(label_array)]
-                
-                if len(idx_to_use) > 0:
-                    valid_labels = label_array[idx_to_use]
-                    valid_labels_tensor = torch.from_numpy(valid_labels).long().cuda()
-                    
-                    # Clamp to valid range
-                    valid_labels_tensor = torch.clamp(valid_labels_tensor, 0, num_classes - 1)
-                    
-                    # Match dimensions
-                    min_len = min(len(valid_labels_tensor), len(sem_logits_i))
-                    if min_len > 0:
-                        all_sem_logits.append(sem_logits_i[:min_len])
-                        all_sem_labels.append(valid_labels_tensor[:min_len])
-        
-        if len(all_sem_logits) > 0:
-            all_sem_logits = torch.cat(all_sem_logits, dim=0)
-            all_sem_labels = torch.cat(all_sem_labels, dim=0)
-            
-            print(f"  Semantic loss inputs:")
-            print(f"    Logits shape: {all_sem_logits.shape}")
-            print(f"    Labels shape: {all_sem_labels.shape}")
-            print(f"    Labels range: [{all_sem_labels.min()}, {all_sem_labels.max()}]")
-            
-            try:
-                sem_losses = sem_loss(all_sem_logits, all_sem_labels)
-                print("  Semantic loss SUCCESS!")
-                for k, v in sem_losses.items():
-                    print(f"    {k}: {v.item():.4f}")
-            except Exception as e:
-                print(f"  Semantic loss FAILED: {e}")
-                traceback.print_exc()
+        # Additional debugging
+        print("\n  Additional debugging:")
+        print(f"  ignore_index: {mask_loss.ignore}")
+        print(f"  num_classes from config: {mask_loss.num_classes}")
+        print(f"  pred_logits last dim: {outputs['pred_logits'].shape[-1]}")
+        print(f"  Expected: {mask_loss.num_classes + 1}")
 
 
 if __name__ == "__main__":
-    test_actual_pipeline()
+    debug_mask_loss_detailed()
