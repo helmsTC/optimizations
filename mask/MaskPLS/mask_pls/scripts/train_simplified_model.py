@@ -148,7 +148,10 @@ class SimplifiedMaskPLS(LightningModule):
         # Semantic loss (on valid points)
         sem_labels = []
         for i, (label, idx) in enumerate(zip(batch['sem_label'], valid_indices)):
-            valid_label = torch.from_numpy(label[idx]).long().cuda()
+            # FIX: Convert torch tensor indices to CPU numpy for indexing
+            idx_np = idx.cpu().numpy()
+            valid_label = torch.from_numpy(label[idx_np]).long().cuda()
+            
             # Pad if needed
             if len(valid_label) < sem_logits.shape[1]:
                 valid_label = F.pad(valid_label, (0, sem_logits.shape[1] - len(valid_label)))
@@ -182,7 +185,10 @@ class SimplifiedMaskPLS(LightningModule):
         # Semantic loss
         sem_labels = []
         for i, (label, idx) in enumerate(zip(batch['sem_label'], valid_indices)):
-            valid_label = torch.from_numpy(label[idx]).long().cuda()
+            # FIX: Convert torch tensor indices to CPU numpy for indexing
+            idx_np = idx.cpu().numpy()
+            valid_label = torch.from_numpy(label[idx_np]).long().cuda()
+            
             if len(valid_label) < sem_logits.shape[1]:
                 valid_label = F.pad(valid_label, (0, sem_logits.shape[1] - len(valid_label)))
             sem_labels.append(valid_label[:sem_logits.shape[1]])
@@ -213,11 +219,13 @@ class SimplifiedMaskPLS(LightningModule):
             full_sem = torch.zeros(len(batch['sem_label'][i]), dtype=torch.long)
             full_ins = torch.zeros(len(batch['ins_label'][i]), dtype=torch.long)
             
-            # Fill valid predictions
-            valid_len = min(len(idx), len(pred_sem))
+            # FIX: Convert indices to CPU for indexing
+            idx_cpu = idx.cpu()
+            valid_len = min(len(idx_cpu), len(pred_sem))
+            
             if valid_len > 0:
-                full_sem[idx[:valid_len].cpu()] = torch.from_numpy(pred_sem[:valid_len])
-                full_ins[idx[:valid_len].cpu()] = torch.from_numpy(pred_ins[:valid_len])
+                full_sem[idx_cpu[:valid_len]] = torch.from_numpy(pred_sem[:valid_len])
+                full_ins[idx_cpu[:valid_len]] = torch.from_numpy(pred_ins[:valid_len])
             
             full_sem_pred.append(full_sem.numpy())
             full_ins_pred.append(full_ins.numpy())
@@ -310,7 +318,8 @@ def getDir(obj):
 @click.option("--epochs", type=int, default=100, help="Number of epochs")
 @click.option("--batch_size", type=int, default=1, help="Batch size")
 @click.option("--lr", type=float, default=0.0001, help="Learning rate")
-def main(checkpoint, nuscenes, epochs, batch_size, lr):
+@click.option("--gpus", type=int, default=1, help="Number of GPUs")
+def main(checkpoint, nuscenes, epochs, batch_size, lr, gpus):
     # Load configurations
     model_cfg = edict(
         yaml.safe_load(open(join(getDir(__file__), "../config/model.yaml")))
@@ -327,6 +336,7 @@ def main(checkpoint, nuscenes, epochs, batch_size, lr):
     cfg.TRAIN.MAX_EPOCH = epochs
     cfg.TRAIN.BATCH_SIZE = batch_size
     cfg.TRAIN.LR = lr
+    cfg.TRAIN.N_GPUS = gpus
     
     if nuscenes:
         cfg.MODEL.DATASET = "NUSCENES"
@@ -339,6 +349,7 @@ def main(checkpoint, nuscenes, epochs, batch_size, lr):
     print(f"Epochs: {epochs}")
     print(f"Batch size: {batch_size}")
     print(f"Learning rate: {lr}")
+    print(f"GPUs: {gpus}")
     
     # Create data module
     data = SemanticDatasetModule(cfg)
