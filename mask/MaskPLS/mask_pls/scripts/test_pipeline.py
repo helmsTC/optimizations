@@ -63,7 +63,13 @@ def test_actual_pipeline():
         print(f"    Sem labels: {batch['sem_label'][i].shape}, range [{batch['sem_label'][i].min()}, {batch['sem_label'][i].max()}]")
         print(f"    Masks: {len(batch['masks_cls'][i])}")
         if len(batch['masks_cls'][i]) > 0:
-            cls_values = [c.item() if hasattr(c, 'item') else c for c in batch['masks_cls'][i]]
+            # Fixed: Handle mask classes properly
+            cls_values = []
+            for c in batch['masks_cls'][i]:
+                if isinstance(c, torch.Tensor):
+                    cls_values.append(c.item() if c.numel() == 1 else c.cpu().numpy())
+                else:
+                    cls_values.append(c)
             print(f"    Mask classes: {cls_values}")
     
     # Process through model (similar to forward in training)
@@ -171,10 +177,17 @@ def test_actual_pipeline():
         print("\n  Checking target classes:")
         for i, cls_list in enumerate(targets['classes']):
             if len(cls_list) > 0:
-                cls_tensor = torch.stack(cls_list) if isinstance(cls_list[0], torch.Tensor) else torch.tensor(cls_list)
-                print(f"    Sample {i}: {len(cls_list)} masks, classes: {cls_tensor}")
-                if cls_tensor.max() >= num_classes:
-                    print(f"    ERROR: Class {cls_tensor.max().item()} >= {num_classes}!")
+                # Fixed: Extract values from each tensor in the list
+                cls_values = []
+                for c in cls_list:
+                    if isinstance(c, torch.Tensor):
+                        cls_values.append(c.item() if c.numel() == 1 else c.cpu().numpy())
+                    else:
+                        cls_values.append(c)
+                print(f"    Sample {i}: {len(cls_list)} masks, classes: {cls_values}")
+                max_cls = max(cls_values)
+                if max_cls >= num_classes:
+                    print(f"    ERROR: Class {max_cls} >= {num_classes}!")
         
         try:
             losses = mask_loss(outputs, targets, batch['masks_ids'], batch['pt_coord'])
@@ -207,13 +220,84 @@ def test_actual_pipeline():
                 # Manual debug
                 print("\n  Manual check of loss_classes:")
                 # Get matched target classes
-                target_classes_o = torch.cat([t[J] for t, (_, J) in zip(targets["classes"], indices)])
-                print(f"    Matched target classes: {target_classes_o}")
-                print(f"    Max target class: {target_classes_o.max() if len(target_classes_o) > 0 else 'N/A'}")
+                if len(indices) > 0 and len(indices[0]) > 0:
+                    target_classes_list = []
+                    for t, (_, J) in zip(targets["classes"], indices):
+                        if len(J) > 0:
+                            # Extract values from tensors
+                            matched_classes = []
+                            for j in J:
+                                cls = t[j]
+                                if isinstance(cls, torch.Tensor):
+                                    matched_classes.append(cls.item() if cls.numel() == 1 else cls)
+                                else:
+                                    matched_classes.append(cls)
+                            target_classes_list.extend(matched_classes)
+                    
+                    if len(target_classes_list) > 0:
+                        print(f"    Matched target classes: {target_classes_list}")
+                        print(f"    Max target class: {max(target_classes_list)}")
+                else:
+                    print("    No matched targets")
                 
                 # Check the pred_logits shape
                 print(f"    pred_logits shape: {outputs['pred_logits'].shape}")
                 print(f"    Expected: [batch_size, num_queries, {num_classes + 1}]")
+                
+        # Also test semantic loss
+        print("\n8. Testing semantic loss...")
+        sem_loss = SemLoss(cfg.LOSS.SEM.WEIGHTS)
+        
+        # Prepare semantic labels (simplified version)
+        all_sem_labels = []
+        all_sem_logits = []
+        
+        for i, (label, idx, pad) in enumerate(zip(batch['sem_label'], valid_indices, padding_masks)):
+            valid_mask = ~pad
+            num_valid = valid_mask.sum().item()
+            
+            if num_valid > 0:
+                sem_logits_i = sem_logits[i][valid_mask]
+                
+                # Get labels for valid points
+                idx_cpu = idx.cpu().numpy()
+                num_logits = sem_logits_i.shape[0]
+                idx_to_use = idx_cpu[:num_logits]
+                
+                label_array = label.flatten()
+                # Make sure indices are valid
+                idx_to_use = idx_to_use[idx_to_use < len(label_array)]
+                
+                if len(idx_to_use) > 0:
+                    valid_labels = label_array[idx_to_use]
+                    valid_labels_tensor = torch.from_numpy(valid_labels).long().cuda()
+                    
+                    # Clamp to valid range
+                    valid_labels_tensor = torch.clamp(valid_labels_tensor, 0, num_classes - 1)
+                    
+                    # Match dimensions
+                    min_len = min(len(valid_labels_tensor), len(sem_logits_i))
+                    if min_len > 0:
+                        all_sem_logits.append(sem_logits_i[:min_len])
+                        all_sem_labels.append(valid_labels_tensor[:min_len])
+        
+        if len(all_sem_logits) > 0:
+            all_sem_logits = torch.cat(all_sem_logits, dim=0)
+            all_sem_labels = torch.cat(all_sem_labels, dim=0)
+            
+            print(f"  Semantic loss inputs:")
+            print(f"    Logits shape: {all_sem_logits.shape}")
+            print(f"    Labels shape: {all_sem_labels.shape}")
+            print(f"    Labels range: [{all_sem_labels.min()}, {all_sem_labels.max()}]")
+            
+            try:
+                sem_losses = sem_loss(all_sem_logits, all_sem_labels)
+                print("  Semantic loss SUCCESS!")
+                for k, v in sem_losses.items():
+                    print(f"    {k}: {v.item():.4f}")
+            except Exception as e:
+                print(f"  Semantic loss FAILED: {e}")
+                traceback.print_exc()
 
 
 if __name__ == "__main__":
