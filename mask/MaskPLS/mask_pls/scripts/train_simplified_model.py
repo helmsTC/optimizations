@@ -6,12 +6,13 @@ Save as: mask/MaskPLS/mask_pls/scripts/train_simplified_model.py
 import os
 # Enable CUDA error debugging
 os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
-os.environ['TORCH_USE_CUDA_DSA'] = '1'  # Enable device-side assertions for better error messages
+os.environ['TORCH_USE_CUDA_DSA'] = '1'
 
 from os.path import join
 import click
 import torch
 import yaml
+import numpy as np
 from easydict import EasyDict as edict
 from pytorch_lightning import Trainer
 from pytorch_lightning import loggers as pl_loggers
@@ -57,10 +58,7 @@ class SimplifiedMaskPLS(LightningModule):
         self.sem_loss = SemLoss(cfg.LOSS.SEM.WEIGHTS)
         
         # Evaluator (same as original)
-        self.evaluator = PanopticEvaluator(
-            cfg[dataset], 
-            dataset
-        )
+        self.evaluator = PanopticEvaluator(cfg[dataset], dataset)
         
         # Cache things IDs
         data = SemanticDatasetModule(cfg)
@@ -93,10 +91,10 @@ class SimplifiedMaskPLS(LightningModule):
             for dim in range(3):
                 valid_mask &= (pts[:, dim] >= bounds[dim][0]) & (pts[:, dim] < bounds[dim][1])
             
-            valid_pts = pts[valid_mask]
-            valid_feat = feat[valid_mask]
             # Get indices of valid points in original array
             valid_idx = torch.where(valid_mask)[0]
+            valid_pts = pts[valid_mask]
+            valid_feat = feat[valid_mask]
             
             # Subsample if needed
             max_pts = self.cfg[self.cfg.MODEL.DATASET].SUB_NUM_POINTS
@@ -105,7 +103,7 @@ class SimplifiedMaskPLS(LightningModule):
                 perm = torch.randperm(len(valid_pts))[:max_pts]
                 valid_pts = valid_pts[perm]
                 valid_feat = valid_feat[perm]
-                # IMPORTANT: Map the indices correctly
+                # IMPORTANT: Update the indices to reflect subsampling
                 valid_idx = valid_idx[perm]
             
             # Normalize coordinates
@@ -178,30 +176,15 @@ class SimplifiedMaskPLS(LightningModule):
     def training_step(self, batch, batch_idx):
         try:
             # Debug info
-            if self.debug or batch_idx == 0:
+            if self.debug and batch_idx < 5:
                 print(f"\n=== Batch {batch_idx} Debug Info ===")
-                print(f"Points shapes: {[p.shape for p in batch['pt_coord']]}")
-                print(f"Features shapes: {[f.shape for f in batch['feats']]}")
-                print(f"Sem label shapes: {[l.shape for l in batch['sem_label']]}")
-                print(f"Masks classes: {[len(m) for m in batch['masks_cls']]}")
-                
-                # CHECK LABELS BEFORE PROCESSING
-                print("\nChecking raw labels from dataset:")
                 for i, label in enumerate(batch['sem_label']):
                     unique = np.unique(label)
                     print(f"  Sample {i}: unique labels = {unique}")
                     if unique.max() >= self.num_classes:
-                        print(f"  ⚠️  ERROR: Found label {unique.max()} >= {self.num_classes}")
-                        print(f"  This is causing the CUDA error!")
+                        print(f"  ⚠️  WARNING: Found label {unique.max()} >= {self.num_classes}")
             
             outputs, padding, sem_logits, valid_indices = self.forward(batch)
-            
-            # Debug valid indices
-            if self.debug or batch_idx == 0:
-                print(f"Valid indices lengths: {[len(idx) for idx in valid_indices]}")
-                for i, idx in enumerate(valid_indices):
-                    if len(idx) > 0:
-                        print(f"  Sample {i}: min={idx.min().item()}, max={idx.max().item()}, label_size={len(batch['sem_label'][i])}")
             
             # Prepare targets for mask loss
             targets = {
@@ -222,101 +205,70 @@ class SimplifiedMaskPLS(LightningModule):
                 num_valid = valid_mask.sum().item()
                 
                 if num_valid == 0:
-                    continue  # Skip if no valid points
+                    continue
                 
                 # Get semantic logits for valid points
                 sem_logits_i = sem_logits[i][valid_mask]  # [num_valid, num_classes]
                 
-                # Get semantic labels for valid points
-                idx_cpu = idx.cpu()
+                # Get semantic labels for the points we actually kept
+                # valid_indices[i] contains the indices in the original point cloud
+                idx_cpu = idx.cpu().numpy()
                 
-                # Debug indices
-                if self.debug and len(idx_cpu) > 0:
-                    print(f"Sample {i}: idx range [{idx_cpu.min()}, {idx_cpu.max()}], label shape {label.shape}")
-                
-                # Ensure indices are within bounds
-                label_size = len(label)
-                valid_indices_mask = idx_cpu < label_size
-                
-                if not valid_indices_mask.any():
-                    print(f"Warning: No valid indices for sample {i}")
+                # Make sure we don't exceed the number of valid points
+                num_to_use = min(num_valid, len(idx_cpu))
+                if num_to_use == 0:
                     continue
                 
-                idx_cpu = idx_cpu[valid_indices_mask]
+                # Get the corresponding labels
+                # Note: label is already from the dataset, so it should be properly mapped
+                label_flat = label.flatten()
                 
-                # Further limit by num_valid
-                idx_cpu = idx_cpu[:min(num_valid, len(idx_cpu))]
+                # Ensure indices are within bounds of the label array
+                max_idx = len(label_flat) - 1
+                idx_cpu = idx_cpu[idx_cpu <= max_idx]
+                
+                # Take only as many indices as we have valid points
+                idx_cpu = idx_cpu[:num_to_use]
                 
                 if len(idx_cpu) == 0:
                     continue
                 
-                # Get labels - handle both (N,) and (N,1) shapes
-                idx_np = idx_cpu.numpy()
-                label_subset = label[idx_np]
-                if label_subset.ndim > 1:
-                    label_subset = label_subset.squeeze(-1)
-                valid_label = torch.from_numpy(label_subset).long().cuda()
+                # Get labels for these indices
+                valid_labels = label_flat[idx_cpu]
+                valid_labels_tensor = torch.from_numpy(valid_labels).long().cuda()
                 
-                # Debug label values
-                if self.debug:
-                    unique_labels = torch.unique(valid_label)
-                    print(f"Sample {i}: unique labels {unique_labels.cpu().numpy()}")
+                # Double-check the labels are in valid range
+                # This should not be necessary if the dataset is correct, but let's be safe
+                if valid_labels_tensor.max() >= self.num_classes:
+                    print(f"WARNING: Sample {i} has labels up to {valid_labels_tensor.max().item()}, clamping to {self.num_classes - 1}")
+                    valid_labels_tensor = torch.clamp(valid_labels_tensor, 0, self.num_classes - 1)
                 
-                # Make sure dimensions match
-                min_len = min(len(valid_label), len(sem_logits_i))
+                # Make sure we have matching dimensions
+                min_len = min(len(valid_labels_tensor), len(sem_logits_i))
                 if min_len > 0:
                     all_sem_logits.append(sem_logits_i[:min_len])
-                    all_sem_labels.append(valid_label[:min_len])
+                    all_sem_labels.append(valid_labels_tensor[:min_len])
             
-            # Check if we have any valid data
-            if len(all_sem_logits) == 0:
-                print("Warning: No valid semantic data in batch")
-                # Return a small loss to continue training
-                return torch.tensor(0.1, device='cuda', requires_grad=True)
-            
-            # Concatenate all valid points across batch
-            all_sem_logits = torch.cat(all_sem_logits, dim=0)
-            all_sem_labels = torch.cat(all_sem_labels, dim=0)
-            
-            # Ensure labels are within valid range
-            num_classes = self.num_classes
-            
-            # Debug label range
-            if self.debug or batch_idx == 0:
-                print(f"Label range before processing: [{all_sem_labels.min().item()}, {all_sem_labels.max().item()}], num_classes={num_classes}")
-                unique_labels, counts = torch.unique(all_sem_labels, return_counts=True)
-                print(f"Unique labels: {unique_labels.cpu().numpy()}")
-                print(f"Label counts: {counts.cpu().numpy()}")
-            
-            # TEMPORARY FIX: Force labels into valid range
-            if all_sem_labels.max() >= num_classes:
-                print(f"WARNING: Found labels >= {num_classes}, clamping to valid range")
-                all_sem_labels = torch.clamp(all_sem_labels, 0, num_classes - 1)
-            
-            # Filter out invalid labels
-            valid_mask = (all_sem_labels >= 0) & (all_sem_labels < num_classes)
-            
-            # Special handling for ignore label
-            if self.ignore_label is not None and self.ignore_label >= 0:
-                valid_mask &= (all_sem_labels != self.ignore_label)
-            
-            all_sem_logits = all_sem_logits[valid_mask]
-            all_sem_labels = all_sem_labels[valid_mask]
-            
-            if len(all_sem_labels) == 0:
-                print("Warning: All labels are invalid or ignore class")
-                return torch.tensor(0.1, device='cuda', requires_grad=True)
-            
-            # Final validation
-            assert all_sem_labels.min() >= 0, f"Negative labels found: {all_sem_labels.min()}"
-            assert all_sem_labels.max() < num_classes, f"Labels exceed num_classes: {all_sem_labels.max()} >= {num_classes}"
-            assert all_sem_logits.shape[-1] == num_classes, f"Logits shape mismatch: {all_sem_logits.shape[-1]} != {num_classes}"
-            
-            # Compute semantic loss
-            loss_sem = self.sem_loss(all_sem_logits, all_sem_labels)
-            
-            # Combine losses
-            loss_mask.update(loss_sem)
+            # Compute semantic loss if we have valid data
+            if len(all_sem_logits) > 0:
+                # Concatenate all valid points across batch
+                all_sem_logits = torch.cat(all_sem_logits, dim=0)
+                all_sem_labels = torch.cat(all_sem_labels, dim=0)
+                
+                # Final validation
+                assert all_sem_labels.min() >= 0, f"Negative labels found: {all_sem_labels.min()}"
+                assert all_sem_labels.max() < self.num_classes, f"Labels exceed num_classes: {all_sem_labels.max()} >= {self.num_classes}"
+                assert all_sem_logits.shape[-1] == self.num_classes, f"Logits shape mismatch: {all_sem_logits.shape[-1]} != {self.num_classes}"
+                
+                # Compute semantic loss
+                loss_sem = self.sem_loss(all_sem_logits, all_sem_labels)
+                loss_mask.update(loss_sem)
+            else:
+                # No valid semantic data in this batch
+                print(f"Warning: No valid semantic data in batch {batch_idx}")
+                loss_sem = {'sem_ce': torch.tensor(0.0, device='cuda'), 
+                           'sem_lov': torch.tensor(0.0, device='cuda')}
+                loss_mask.update(loss_sem)
             
             # Log losses
             for k, v in loss_mask.items():
@@ -346,7 +298,7 @@ class SimplifiedMaskPLS(LightningModule):
         try:
             outputs, padding, sem_logits, valid_indices = self.forward(batch)
             
-            # Calculate losses (same as training)
+            # Calculate losses (similar to training)
             targets = {'classes': batch['masks_cls'], 'masks': batch['masks']}
             loss_mask = self.mask_loss(outputs, targets, batch['masks_ids'], batch['pt_coord'])
             
@@ -363,43 +315,39 @@ class SimplifiedMaskPLS(LightningModule):
                     continue
                 
                 # Get semantic logits for valid points
-                sem_logits_i = sem_logits[i][valid_mask]  # [num_valid, num_classes]
+                sem_logits_i = sem_logits[i][valid_mask]
                 
-                # Get semantic labels for valid points
-                idx_cpu = idx.cpu()
+                # Get semantic labels for the points we actually kept
+                idx_cpu = idx.cpu().numpy()
+                num_to_use = min(num_valid, len(idx_cpu))
                 
-                # Ensure indices are within bounds
-                max_label_idx = len(label) - 1
-                valid_indices_mask = idx_cpu < max_label_idx
-                idx_cpu = idx_cpu[valid_indices_mask]
+                if num_to_use == 0:
+                    continue
                 
-                # Further limit by num_valid
-                idx_cpu = idx_cpu[:min(num_valid, len(idx_cpu))]
+                # Get the corresponding labels
+                label_flat = label.flatten()
+                max_idx = len(label_flat) - 1
+                idx_cpu = idx_cpu[idx_cpu <= max_idx][:num_to_use]
                 
                 if len(idx_cpu) == 0:
                     continue
                 
-                # Get labels
-                idx_np = idx_cpu.numpy()
-                valid_label = torch.from_numpy(label[idx_np].squeeze(-1)).long().cuda()
+                valid_labels = label_flat[idx_cpu]
+                valid_labels_tensor = torch.from_numpy(valid_labels).long().cuda()
                 
-                # Make sure dimensions match
-                min_len = min(len(valid_label), len(sem_logits_i))
+                # Safety clamp
+                if valid_labels_tensor.max() >= self.num_classes:
+                    valid_labels_tensor = torch.clamp(valid_labels_tensor, 0, self.num_classes - 1)
+                
+                min_len = min(len(valid_labels_tensor), len(sem_logits_i))
                 if min_len > 0:
                     all_sem_logits.append(sem_logits_i[:min_len])
-                    all_sem_labels.append(valid_label[:min_len])
+                    all_sem_labels.append(valid_labels_tensor[:min_len])
             
-            # Check if we have any valid data
+            # Compute semantic loss if we have valid data
             if len(all_sem_logits) > 0:
-                # Concatenate all valid points across batch
                 all_sem_logits = torch.cat(all_sem_logits, dim=0)
                 all_sem_labels = torch.cat(all_sem_labels, dim=0)
-                
-                # Ensure labels are within valid range
-                num_classes = self.cfg[self.cfg.MODEL.DATASET].NUM_CLASSES
-                all_sem_labels = torch.clamp(all_sem_labels, 0, num_classes - 1)
-                
-                # Compute semantic loss
                 loss_sem = self.sem_loss(all_sem_logits, all_sem_labels)
                 loss_mask.update(loss_sem)
             
@@ -420,12 +368,12 @@ class SimplifiedMaskPLS(LightningModule):
             full_ins_pred = []
             
             for i, (pred_sem, pred_ins, idx) in enumerate(zip(sem_pred, ins_pred, valid_indices)):
-                # Create full predictions
+                # Create full predictions initialized with ignore label
                 full_sem = torch.zeros(len(batch['sem_label'][i]), dtype=torch.long)
                 full_ins = torch.zeros(len(batch['ins_label'][i]), dtype=torch.long)
                 
-                # Convert indices to CPU for indexing
-                idx_cpu = idx.cpu()
+                # Map back to original indices
+                idx_cpu = idx.cpu().numpy()
                 
                 # Ensure indices are within bounds
                 max_idx = len(full_sem) - 1
@@ -534,10 +482,10 @@ def getDir(obj):
 @click.option("--nuscenes", is_flag=True, help="Use NuScenes dataset")
 @click.option("--epochs", type=int, default=100, help="Number of epochs")
 @click.option("--batch_size", type=int, default=1, help="Batch size")
-@click.option("--lr", type=float, default=0.00001, help="Learning rate (default: 1e-5)")
+@click.option("--lr", type=float, default=0.0001, help="Learning rate")
 @click.option("--gpus", type=int, default=1, help="Number of GPUs")
 @click.option("--debug", is_flag=True, help="Enable debug mode")
-@click.option("--num_workers", type=int, default=0, help="Number of data loader workers (default: 0)")
+@click.option("--num_workers", type=int, default=4, help="Number of data loader workers")
 def main(checkpoint, nuscenes, epochs, batch_size, lr, gpus, debug, num_workers):
     # Load configurations
     model_cfg = edict(
@@ -556,7 +504,7 @@ def main(checkpoint, nuscenes, epochs, batch_size, lr, gpus, debug, num_workers)
     cfg.TRAIN.BATCH_SIZE = batch_size
     cfg.TRAIN.LR = lr
     cfg.TRAIN.N_GPUS = gpus
-    cfg.TRAIN.NUM_WORKERS = num_workers  # Override config
+    cfg.TRAIN.NUM_WORKERS = num_workers
     
     if nuscenes:
         cfg.MODEL.DATASET = "NUSCENES"
@@ -589,9 +537,9 @@ def main(checkpoint, nuscenes, epochs, batch_size, lr, gpus, debug, num_workers)
         print(f"Loading checkpoint from {checkpoint}")
         ckpt = torch.load(checkpoint, map_location='cpu')
         if 'state_dict' in ckpt:
-            model.load_state_dict(ckpt['state_dict'])
+            model.load_state_dict(ckpt['state_dict'], strict=False)
         else:
-            model.model.load_state_dict(ckpt)
+            model.model.load_state_dict(ckpt, strict=False)
     
     # Setup logger
     tb_logger = pl_loggers.TensorBoardLogger(
@@ -629,7 +577,7 @@ def main(checkpoint, nuscenes, epochs, batch_size, lr, gpus, debug, num_workers)
         gradient_clip_val=0.5,
         accumulate_grad_batches=cfg.TRAIN.BATCH_ACC,
         resume_from_checkpoint=checkpoint if checkpoint and os.path.exists(checkpoint) else None,
-        num_sanity_val_steps=0 if debug else 2,  # Skip validation sanity check in debug mode
+        num_sanity_val_steps=0 if debug else 2,
     )
     
     # Train
