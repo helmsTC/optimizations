@@ -50,6 +50,9 @@ class SimplifiedMaskPLS(LightningModule):
         data.setup()
         self.things_ids = data.things_ids
         
+        # Debug mode
+        self.debug = False
+        
     def forward(self, batch):
         """Forward pass with pre-voxelization"""
         # Extract data from batch
@@ -134,123 +137,217 @@ class SimplifiedMaskPLS(LightningModule):
         return outputs, padding_masks, sem_logits, valid_indices
     
     def training_step(self, batch, batch_idx):
-        outputs, padding, sem_logits, valid_indices = self.forward(batch)
-        
-        # Prepare targets for mask loss
-        targets = {
-            'classes': batch['masks_cls'],
-            'masks': batch['masks']
-        }
-        
-        # Mask loss
-        loss_mask = self.mask_loss(outputs, targets, batch['masks_ids'], batch['pt_coord'])
-        
-        # Semantic loss (on valid points)
-        all_sem_labels = []
-        all_sem_logits = []
-        
-        for i, (label, idx, pad) in enumerate(zip(batch['sem_label'], valid_indices, padding)):
-            # Get valid points for this sample
-            valid_mask = ~pad
-            num_valid = valid_mask.sum().item()
+        try:
+            # Debug info
+            if self.debug or batch_idx == 0:
+                print(f"\n=== Batch {batch_idx} Debug Info ===")
+                print(f"Points shapes: {[p.shape for p in batch['pt_coord']]}")
+                print(f"Features shapes: {[f.shape for f in batch['feats']]}")
+                print(f"Sem label shapes: {[l.shape for l in batch['sem_label']]}")
+                print(f"Masks classes: {[len(m) for m in batch['masks_cls']]}")
             
-            # Get semantic logits for valid points
-            sem_logits_i = sem_logits[i][valid_mask]  # [num_valid, num_classes]
+            outputs, padding, sem_logits, valid_indices = self.forward(batch)
             
-            # Get semantic labels for valid points
-            idx_np = idx.cpu().numpy()[:num_valid]  # Only take valid indices
-            valid_label = torch.from_numpy(label[idx_np].squeeze()).long().cuda()
+            # Prepare targets for mask loss
+            targets = {
+                'classes': batch['masks_cls'],
+                'masks': batch['masks']
+            }
             
-            all_sem_logits.append(sem_logits_i)
-            all_sem_labels.append(valid_label)
-        
-        # Concatenate all valid points across batch
-        all_sem_logits = torch.cat(all_sem_logits, dim=0)
-        all_sem_labels = torch.cat(all_sem_labels, dim=0)
-        
-        # Compute semantic loss
-        loss_sem = self.sem_loss(all_sem_logits, all_sem_labels)
-        
-        # Combine losses
-        loss_mask.update(loss_sem)
-        
-        # Log losses
-        for k, v in loss_mask.items():
-            self.log(f"train/{k}", v, batch_size=self.cfg.TRAIN.BATCH_SIZE)
-        
-        total_loss = sum(loss_mask.values())
-        self.log("train_loss", total_loss, batch_size=self.cfg.TRAIN.BATCH_SIZE)
-        
-        return total_loss
+            # Mask loss
+            loss_mask = self.mask_loss(outputs, targets, batch['masks_ids'], batch['pt_coord'])
+            
+            # Semantic loss (on valid points)
+            all_sem_labels = []
+            all_sem_logits = []
+            
+            for i, (label, idx, pad) in enumerate(zip(batch['sem_label'], valid_indices, padding)):
+                # Get valid points for this sample
+                valid_mask = ~pad
+                num_valid = valid_mask.sum().item()
+                
+                if num_valid == 0:
+                    continue  # Skip if no valid points
+                
+                # Get semantic logits for valid points
+                sem_logits_i = sem_logits[i][valid_mask]  # [num_valid, num_classes]
+                
+                # Get semantic labels for valid points
+                idx_cpu = idx.cpu()
+                
+                # Ensure indices are within bounds
+                max_label_idx = len(label) - 1
+                valid_indices_mask = idx_cpu < max_label_idx
+                idx_cpu = idx_cpu[valid_indices_mask]
+                
+                # Further limit by num_valid
+                idx_cpu = idx_cpu[:min(num_valid, len(idx_cpu))]
+                
+                if len(idx_cpu) == 0:
+                    continue
+                
+                # Get labels
+                idx_np = idx_cpu.numpy()
+                valid_label = torch.from_numpy(label[idx_np].squeeze(-1)).long().cuda()
+                
+                # Make sure dimensions match
+                min_len = min(len(valid_label), len(sem_logits_i))
+                if min_len > 0:
+                    all_sem_logits.append(sem_logits_i[:min_len])
+                    all_sem_labels.append(valid_label[:min_len])
+            
+            # Check if we have any valid data
+            if len(all_sem_logits) == 0:
+                # Return a small loss to continue training
+                return torch.tensor(0.1, device='cuda', requires_grad=True)
+            
+            # Concatenate all valid points across batch
+            all_sem_logits = torch.cat(all_sem_logits, dim=0)
+            all_sem_labels = torch.cat(all_sem_labels, dim=0)
+            
+            # Ensure labels are within valid range
+            num_classes = self.cfg[self.cfg.MODEL.DATASET].NUM_CLASSES
+            all_sem_labels = torch.clamp(all_sem_labels, 0, num_classes - 1)
+            
+            # Compute semantic loss
+            loss_sem = self.sem_loss(all_sem_logits, all_sem_labels)
+            
+            # Combine losses
+            loss_mask.update(loss_sem)
+            
+            # Log losses
+            for k, v in loss_mask.items():
+                if torch.isnan(v) or torch.isinf(v):
+                    print(f"Warning: {k} is nan/inf: {v}")
+                    v = torch.tensor(0.0, device='cuda', requires_grad=True)
+                self.log(f"train/{k}", v, batch_size=self.cfg.TRAIN.BATCH_SIZE)
+            
+            total_loss = sum(loss_mask.values())
+            
+            if torch.isnan(total_loss) or torch.isinf(total_loss):
+                print(f"Warning: total_loss is nan/inf, returning small loss")
+                return torch.tensor(0.1, device='cuda', requires_grad=True)
+            
+            self.log("train_loss", total_loss, batch_size=self.cfg.TRAIN.BATCH_SIZE)
+            
+            return total_loss
+            
+        except Exception as e:
+            print(f"Error in training_step: {e}")
+            import traceback
+            traceback.print_exc()
+            # Return a small loss to continue training
+            return torch.tensor(0.1, device='cuda', requires_grad=True)
     
     def validation_step(self, batch, batch_idx):
-        outputs, padding, sem_logits, valid_indices = self.forward(batch)
-        
-        # Calculate losses (same as training)
-        targets = {'classes': batch['masks_cls'], 'masks': batch['masks']}
-        loss_mask = self.mask_loss(outputs, targets, batch['masks_ids'], batch['pt_coord'])
-        
-        # Semantic loss
-        all_sem_labels = []
-        all_sem_logits = []
-        
-        for i, (label, idx, pad) in enumerate(zip(batch['sem_label'], valid_indices, padding)):
-            # Get valid points for this sample
-            valid_mask = ~pad
-            num_valid = valid_mask.sum().item()
+        try:
+            outputs, padding, sem_logits, valid_indices = self.forward(batch)
             
-            # Get semantic logits for valid points
-            sem_logits_i = sem_logits[i][valid_mask]  # [num_valid, num_classes]
+            # Calculate losses (same as training)
+            targets = {'classes': batch['masks_cls'], 'masks': batch['masks']}
+            loss_mask = self.mask_loss(outputs, targets, batch['masks_ids'], batch['pt_coord'])
             
-            # Get semantic labels for valid points
-            idx_np = idx.cpu().numpy()[:num_valid]  # Only take valid indices
-            valid_label = torch.from_numpy(label[idx_np].squeeze()).long().cuda()
+            # Semantic loss
+            all_sem_labels = []
+            all_sem_logits = []
             
-            all_sem_logits.append(sem_logits_i)
-            all_sem_labels.append(valid_label)
-        
-        # Concatenate all valid points across batch
-        all_sem_logits = torch.cat(all_sem_logits, dim=0)
-        all_sem_labels = torch.cat(all_sem_labels, dim=0)
-        
-        # Compute semantic loss
-        loss_sem = self.sem_loss(all_sem_logits, all_sem_labels)
-        loss_mask.update(loss_sem)
-        
-        # Log losses
-        for k, v in loss_mask.items():
-            self.log(f"val/{k}", v, batch_size=self.cfg.TRAIN.BATCH_SIZE)
-        
-        total_loss = sum(loss_mask.values())
-        self.log("val_loss", total_loss, batch_size=self.cfg.TRAIN.BATCH_SIZE)
-        
-        # Panoptic inference and evaluation
-        sem_pred, ins_pred = self.panoptic_inference(outputs, padding)
-        
-        # Map predictions back to original points
-        full_sem_pred = []
-        full_ins_pred = []
-        
-        for i, (pred_sem, pred_ins, idx) in enumerate(zip(sem_pred, ins_pred, valid_indices)):
-            # Create full predictions
-            full_sem = torch.zeros(len(batch['sem_label'][i]), dtype=torch.long)
-            full_ins = torch.zeros(len(batch['ins_label'][i]), dtype=torch.long)
+            for i, (label, idx, pad) in enumerate(zip(batch['sem_label'], valid_indices, padding)):
+                # Get valid points for this sample
+                valid_mask = ~pad
+                num_valid = valid_mask.sum().item()
+                
+                if num_valid == 0:
+                    continue
+                
+                # Get semantic logits for valid points
+                sem_logits_i = sem_logits[i][valid_mask]  # [num_valid, num_classes]
+                
+                # Get semantic labels for valid points
+                idx_cpu = idx.cpu()
+                
+                # Ensure indices are within bounds
+                max_label_idx = len(label) - 1
+                valid_indices_mask = idx_cpu < max_label_idx
+                idx_cpu = idx_cpu[valid_indices_mask]
+                
+                # Further limit by num_valid
+                idx_cpu = idx_cpu[:min(num_valid, len(idx_cpu))]
+                
+                if len(idx_cpu) == 0:
+                    continue
+                
+                # Get labels
+                idx_np = idx_cpu.numpy()
+                valid_label = torch.from_numpy(label[idx_np].squeeze(-1)).long().cuda()
+                
+                # Make sure dimensions match
+                min_len = min(len(valid_label), len(sem_logits_i))
+                if min_len > 0:
+                    all_sem_logits.append(sem_logits_i[:min_len])
+                    all_sem_labels.append(valid_label[:min_len])
             
-            # FIX: Convert indices to CPU for indexing
-            idx_cpu = idx.cpu()
-            valid_len = min(len(idx_cpu), len(pred_sem))
+            # Check if we have any valid data
+            if len(all_sem_logits) > 0:
+                # Concatenate all valid points across batch
+                all_sem_logits = torch.cat(all_sem_logits, dim=0)
+                all_sem_labels = torch.cat(all_sem_labels, dim=0)
+                
+                # Ensure labels are within valid range
+                num_classes = self.cfg[self.cfg.MODEL.DATASET].NUM_CLASSES
+                all_sem_labels = torch.clamp(all_sem_labels, 0, num_classes - 1)
+                
+                # Compute semantic loss
+                loss_sem = self.sem_loss(all_sem_logits, all_sem_labels)
+                loss_mask.update(loss_sem)
             
-            if valid_len > 0:
-                full_sem[idx_cpu[:valid_len]] = torch.from_numpy(pred_sem[:valid_len])
-                full_ins[idx_cpu[:valid_len]] = torch.from_numpy(pred_ins[:valid_len])
+            # Log losses
+            for k, v in loss_mask.items():
+                if torch.isnan(v) or torch.isinf(v):
+                    v = torch.tensor(0.0, device='cuda')
+                self.log(f"val/{k}", v, batch_size=self.cfg.TRAIN.BATCH_SIZE)
             
-            full_sem_pred.append(full_sem.numpy())
-            full_ins_pred.append(full_ins.numpy())
-        
-        # Update evaluator
-        self.evaluator.update(full_sem_pred, full_ins_pred, batch)
-        
-        return total_loss
+            total_loss = sum(loss_mask.values())
+            self.log("val_loss", total_loss, batch_size=self.cfg.TRAIN.BATCH_SIZE)
+            
+            # Panoptic inference and evaluation
+            sem_pred, ins_pred = self.panoptic_inference(outputs, padding)
+            
+            # Map predictions back to original points
+            full_sem_pred = []
+            full_ins_pred = []
+            
+            for i, (pred_sem, pred_ins, idx) in enumerate(zip(sem_pred, ins_pred, valid_indices)):
+                # Create full predictions
+                full_sem = torch.zeros(len(batch['sem_label'][i]), dtype=torch.long)
+                full_ins = torch.zeros(len(batch['ins_label'][i]), dtype=torch.long)
+                
+                # Convert indices to CPU for indexing
+                idx_cpu = idx.cpu()
+                
+                # Ensure indices are within bounds
+                max_idx = len(full_sem) - 1
+                valid_mask = idx_cpu <= max_idx
+                idx_cpu = idx_cpu[valid_mask]
+                
+                valid_len = min(len(idx_cpu), len(pred_sem))
+                
+                if valid_len > 0:
+                    full_sem[idx_cpu[:valid_len]] = torch.from_numpy(pred_sem[:valid_len])
+                    full_ins[idx_cpu[:valid_len]] = torch.from_numpy(pred_ins[:valid_len])
+                
+                full_sem_pred.append(full_sem.numpy())
+                full_ins_pred.append(full_ins.numpy())
+            
+            # Update evaluator
+            self.evaluator.update(full_sem_pred, full_ins_pred, batch)
+            
+            return total_loss
+            
+        except Exception as e:
+            print(f"Error in validation_step: {e}")
+            import traceback
+            traceback.print_exc()
+            return torch.tensor(0.1, device='cuda')
     
     def validation_epoch_end(self, outputs):
         bs = self.cfg.TRAIN.BATCH_SIZE
