@@ -1,6 +1,6 @@
 """
-Debug the mask loss computation in detail
-Save as: mask_pls/scripts/debug_mask_loss.py
+Debug the Hungarian Matcher specifically
+Save as: mask_pls/scripts/debug_matcher.py
 """
 import os
 os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
@@ -14,13 +14,12 @@ from os.path import join, dirname, abspath
 
 from mask_pls.models.onnx.simplified_model import MaskPLSSimplifiedONNX
 from mask_pls.datasets.semantic_dataset import SemanticDatasetModule
-from mask_pls.models.loss import MaskLoss
 from mask_pls.models.matcher import HungarianMatcher
 
 
-def debug_mask_loss_detailed():
-    """Debug mask loss computation step by step"""
-    print("Debugging Mask Loss in Detail")
+def debug_matcher():
+    """Debug the Hungarian Matcher"""
+    print("Debugging Hungarian Matcher")
     print("=" * 60)
     
     # Load configs
@@ -35,234 +34,198 @@ def debug_mask_loss_detailed():
     dataset = cfg.MODEL.DATASET
     num_classes = cfg[dataset].NUM_CLASSES
     
+    # First, let's test with simple dummy data
+    print("1. Testing with simple dummy data...")
+    
+    # Create matcher
+    matcher = HungarianMatcher(cfg.LOSS.WEIGHTS, cfg.LOSS.P_RATIO)
+    print(f"  Matcher weights: {cfg.LOSS.WEIGHTS}")
+    print(f"  P_ratio: {cfg.LOSS.P_RATIO}")
+    
+    # Simple test
+    batch_size = 1
+    num_queries = 100
+    num_points = 1000
+    num_targets = 3
+    
+    outputs = {
+        'pred_logits': torch.randn(batch_size, num_queries, num_classes + 1).cuda(),
+        'pred_masks': torch.randn(batch_size, num_points, num_queries).cuda(),
+    }
+    
+    # Create targets - note the structure!
+    targets = {
+        'classes': [torch.tensor([1, 5, 10]).cuda()],  # List of tensors
+        'masks': [torch.rand(num_targets, num_points).cuda() > 0.5],  # List of mask tensors
+    }
+    
+    print(f"\n  Dummy data shapes:")
+    print(f"    pred_logits: {outputs['pred_logits'].shape}")
+    print(f"    pred_masks: {outputs['pred_masks'].shape}")
+    print(f"    target classes: {[t.shape for t in targets['classes']]}")
+    print(f"    target masks: {[t.shape for t in targets['masks']]}")
+    
+    try:
+        indices = matcher(outputs, targets)
+        print("  Dummy data SUCCESS!")
+        print(f"  Indices: {indices}")
+    except Exception as e:
+        print(f"  Dummy data FAILED: {e}")
+        import traceback
+        traceback.print_exc()
+    
+    # Now test with real data
+    print("\n2. Testing with real data...")
+    
     # Get real data
-    print("1. Loading real data...")
     data = SemanticDatasetModule(cfg)
     data.setup()
     train_loader = data.train_dataloader()
     batch = next(iter(train_loader))
     
-    # Process through model
-    print("\n2. Processing through model...")
+    # Check the format of real targets
+    print("\n  Real data format:")
+    print(f"    Batch size: {len(batch['masks_cls'])}")
+    
+    for i in range(len(batch['masks_cls'])):
+        print(f"\n    Sample {i}:")
+        print(f"      masks_cls type: {type(batch['masks_cls'][i])}")
+        print(f"      masks_cls length: {len(batch['masks_cls'][i])}")
+        if len(batch['masks_cls'][i]) > 0:
+            print(f"      First class type: {type(batch['masks_cls'][i][0])}")
+            if isinstance(batch['masks_cls'][i][0], torch.Tensor):
+                print(f"      First class shape: {batch['masks_cls'][i][0].shape}")
+                print(f"      First class value: {batch['masks_cls'][i][0]}")
+        
+        print(f"      masks type: {type(batch['masks'][i])}")
+        print(f"      masks length: {len(batch['masks'][i])}")
+        if len(batch['masks'][i]) > 0:
+            print(f"      First mask type: {type(batch['masks'][i][0])}")
+            print(f"      First mask shape: {batch['masks'][i][0].shape}")
+            print(f"      Mask dtype: {batch['masks'][i][0].dtype}")
+            print(f"      Mask device: {batch['masks'][i][0].device}")
+    
+    # Process through model to get predictions
+    print("\n3. Getting model predictions...")
     model = MaskPLSSimplifiedONNX(cfg).cuda()
     model.eval()
     
     with torch.no_grad():
-        # Simplified preprocessing (just get the outputs)
-        batch_voxels = []
-        batch_coords = []
-        valid_indices = []
+        # Quick processing (simplified)
+        pts = torch.from_numpy(batch['pt_coord'][0]).float().cuda()
+        feat = torch.from_numpy(batch['feats'][0]).float().cuda()
         
-        for i in range(len(batch['pt_coord'])):
-            pts = torch.from_numpy(batch['pt_coord'][i]).float().cuda()
-            feat = torch.from_numpy(batch['feats'][i]).float().cuda()
-            
-            bounds = cfg[dataset].SPACE
-            valid_mask = torch.ones(pts.shape[0], dtype=torch.bool, device=pts.device)
-            for dim in range(3):
-                valid_mask &= (pts[:, dim] >= bounds[dim][0]) & (pts[:, dim] < bounds[dim][1])
-            
-            valid_idx = torch.where(valid_mask)[0]
-            valid_pts = pts[valid_mask]
-            valid_feat = feat[valid_mask]
-            
-            max_pts = cfg[dataset].SUB_NUM_POINTS
-            if len(valid_pts) > max_pts:
-                perm = torch.randperm(len(valid_pts))[:max_pts]
-                valid_pts = valid_pts[perm]
-                valid_feat = valid_feat[perm]
-                valid_idx = valid_idx[perm]
-            
-            norm_coords = torch.zeros_like(valid_pts)
-            for dim in range(3):
-                norm_coords[:, dim] = (valid_pts[:, dim] - bounds[dim][0]) / (bounds[dim][1] - bounds[dim][0])
-            
-            voxel_grid = model.voxelize_points(valid_pts.unsqueeze(0), valid_feat.unsqueeze(0))[0]
-            
-            batch_voxels.append(voxel_grid)
-            batch_coords.append(norm_coords)
-            valid_indices.append(valid_idx)
+        # Take a subset for speed
+        if len(pts) > 10000:
+            pts = pts[:10000]
+            feat = feat[:10000]
         
-        # Pad and stack
-        max_pts = max(c.shape[0] for c in batch_coords)
-        padded_coords = []
-        padding_masks = []
+        # Simple normalization
+        pts_norm = (pts - pts.min(0)[0]) / (pts.max(0)[0] - pts.min(0)[0])
         
-        for coords in batch_coords:
-            n_pts = coords.shape[0]
-            if n_pts < max_pts:
-                coords = torch.nn.functional.pad(coords, (0, 0, 0, max_pts - n_pts))
-            padded_coords.append(coords)
-            
-            mask = torch.zeros(max_pts, dtype=torch.bool, device=coords.device)
-            mask[n_pts:] = True
-            padding_masks.append(mask)
+        # Create dummy voxel grid
+        voxel_grid = torch.randn(1, 4, 32, 32, 16).cuda()
+        coords = pts_norm.unsqueeze(0)
         
-        batch_voxels = torch.stack(batch_voxels)
-        batch_coords = torch.stack(padded_coords)
+        # Pad coordinates
+        max_pts = 10000
+        if coords.shape[1] < max_pts:
+            coords = torch.nn.functional.pad(coords, (0, 0, 0, max_pts - coords.shape[1]))
         
-        # Forward
-        pred_logits, pred_masks, sem_logits = model(batch_voxels, batch_coords)
+        pred_logits, pred_masks, _ = model(voxel_grid, coords)
         
-        print(f"Model outputs:")
-        print(f"  pred_logits: {pred_logits.shape}")
-        print(f"  pred_masks: {pred_masks.shape}")
-        print(f"  padding mask sum: {padding_masks[0].sum()}")
+        # Adjust pred_masks to match number of points
+        num_points = len(batch['pt_coord'][0])
+        if pred_masks.shape[1] != num_points:
+            print(f"  Adjusting pred_masks from {pred_masks.shape[1]} to {num_points} points")
+            pred_masks = torch.nn.functional.interpolate(
+                pred_masks.transpose(1, 2).unsqueeze(2),
+                size=(1, num_points),
+                mode='nearest'
+            ).squeeze(2).transpose(1, 2)
     
-    # Prepare loss inputs
+    # Prepare for matcher
     outputs = {
         'pred_logits': pred_logits,
         'pred_masks': pred_masks,
-        'aux_outputs': []
     }
     
-    targets = {
-        'classes': batch['masks_cls'],
-        'masks': batch['masks']
+    # Fix the targets format
+    print("\n4. Preparing targets for matcher...")
+    
+    # The issue might be that masks_cls contains individual tensors
+    # Let's convert them to the right format
+    fixed_targets = {
+        'classes': [],
+        'masks': []
     }
     
-    print(f"\n3. Target information:")
-    for i, (cls_list, mask_list) in enumerate(zip(targets['classes'], targets['masks'])):
-        print(f"  Sample {i}:")
-        print(f"    Number of masks: {len(cls_list)}")
-        if len(cls_list) > 0:
-            # Extract class values
-            cls_values = []
-            for c in cls_list:
+    for i in range(len(batch['masks_cls'])):
+        if len(batch['masks_cls'][i]) > 0:
+            # Convert list of scalar tensors to single tensor
+            classes = []
+            for c in batch['masks_cls'][i]:
                 if isinstance(c, torch.Tensor):
-                    cls_values.append(c.item() if c.numel() == 1 else c)
+                    classes.append(c.item() if c.numel() == 1 else c.cpu().numpy())
                 else:
-                    cls_values.append(c)
-            print(f"    Classes: {cls_values}")
-            print(f"    Mask shapes: {[m.shape for m in mask_list]}")
-    
-    # Create mask loss
-    print("\n4. Creating mask loss...")
-    mask_loss = MaskLoss(cfg.LOSS, cfg[dataset])
-    
-    # Debug the matcher first
-    print("\n5. Testing matcher...")
-    matcher = mask_loss.matcher
-    
-    try:
-        indices = matcher(outputs, targets)
-        print("  Matcher success!")
-        for i, (src_idx, tgt_idx) in enumerate(indices):
-            print(f"    Batch {i}: matched {len(src_idx)} queries to {len(tgt_idx)} targets")
-            if len(src_idx) > 0:
-                print(f"      Query indices: {src_idx[:5]}... (showing first 5)")
-                print(f"      Target indices: {tgt_idx[:5]}... (showing first 5)")
-    except Exception as e:
-        print(f"  Matcher failed: {e}")
-        return
-    
-    # Now debug loss_classes
-    print("\n6. Testing loss_classes...")
-    
-    # Get the permutation indices
-    batch_idx = torch.cat([torch.full_like(src, i) for i, (src, _) in enumerate(indices)])
-    src_idx = torch.cat([src for (src, _) in indices])
-    
-    print(f"  Permutation indices:")
-    print(f"    batch_idx shape: {batch_idx.shape}, values: {batch_idx[:10] if len(batch_idx) > 0 else 'empty'}")
-    print(f"    src_idx shape: {src_idx.shape}, values: {src_idx[:10] if len(src_idx) > 0 else 'empty'}")
-    
-    # Get matched target classes
-    target_classes_list = []
-    for i, (t_list, (_, J)) in enumerate(zip(targets["classes"], indices)):
-        print(f"\n  Processing batch {i}:")
-        print(f"    Target indices J: {J}")
-        print(f"    Number of targets: {len(t_list)}")
-        
-        if len(J) > 0:
-            for j in J:
-                if j < len(t_list):
-                    cls = t_list[j]
-                    if isinstance(cls, torch.Tensor):
-                        cls_val = cls.item() if cls.numel() == 1 else cls
-                    else:
-                        cls_val = cls
-                    target_classes_list.append(cls_val)
-                    print(f"      Target {j}: class {cls_val}")
+                    classes.append(c)
+            
+            # Create tensor and move to GPU
+            classes_tensor = torch.tensor(classes, dtype=torch.long).cuda()
+            fixed_targets['classes'].append(classes_tensor)
+            
+            # Stack masks and move to GPU
+            masks_list = []
+            for m in batch['masks'][i]:
+                if isinstance(m, torch.Tensor):
+                    masks_list.append(m.float())
                 else:
-                    print(f"      ERROR: Target index {j} >= number of targets {len(t_list)}")
+                    masks_list.append(torch.tensor(m, dtype=torch.float32))
+            
+            if len(masks_list) > 0:
+                masks_tensor = torch.stack(masks_list).cuda()
+                fixed_targets['masks'].append(masks_tensor)
+            else:
+                fixed_targets['masks'].append(torch.empty(0, num_points).cuda())
+        else:
+            # Empty sample
+            fixed_targets['classes'].append(torch.empty(0, dtype=torch.long).cuda())
+            fixed_targets['masks'].append(torch.empty(0, num_points).cuda())
     
-    if len(target_classes_list) > 0:
-        target_classes_o = torch.tensor(target_classes_list, device=pred_logits.device)
-        print(f"\n  Matched target classes: {target_classes_o}")
-        print(f"  Max class: {target_classes_o.max()}")
-        print(f"  Min class: {target_classes_o.min()}")
-    else:
-        print("\n  No matched targets!")
-        target_classes_o = torch.tensor([], device=pred_logits.device, dtype=torch.int64)
+    print(f"  Fixed targets:")
+    print(f"    classes: {[t.shape for t in fixed_targets['classes']]}")
+    print(f"    masks: {[t.shape for t in fixed_targets['masks']]}")
     
-    # Create target tensor
-    print(f"\n7. Creating target tensor for cross_entropy...")
-    target_classes = torch.full(
-        outputs['pred_logits'].shape[:2],
-        num_classes,  # no-object class
-        dtype=torch.int64,
-        device=outputs['pred_logits'].device,
-    )
-    print(f"  Initialized target_classes shape: {target_classes.shape}")
-    print(f"  Initialized with no-object class: {num_classes}")
-    
-    # Assign matched classes
-    if len(batch_idx) > 0:
-        print(f"\n  Assigning {len(batch_idx)} matched targets...")
-        print(f"  batch_idx max: {batch_idx.max()}, min: {batch_idx.min()}")
-        print(f"  src_idx max: {src_idx.max()}, min: {src_idx.min()}")
-        print(f"  target_classes_o: {target_classes_o}")
-        
-        # Check if indices are valid
-        if batch_idx.max() >= target_classes.shape[0]:
-            print(f"  ERROR: batch_idx max {batch_idx.max()} >= batch size {target_classes.shape[0]}")
-        if src_idx.max() >= target_classes.shape[1]:
-            print(f"  ERROR: src_idx max {src_idx.max()} >= num queries {target_classes.shape[1]}")
-        
-        try:
-            target_classes[batch_idx, src_idx] = target_classes_o
-            print("  Assignment successful!")
-        except Exception as e:
-            print(f"  Assignment failed: {e}")
-            return
-    
-    print(f"\n  Final target_classes:")
-    print(f"    Shape: {target_classes.shape}")
-    print(f"    Min: {target_classes.min()}, Max: {target_classes.max()}")
-    print(f"    Unique values: {torch.unique(target_classes).cpu().numpy()}")
-    
-    # Test cross_entropy
-    print("\n8. Testing cross_entropy...")
-    print(f"  pred_logits shape: {outputs['pred_logits'].shape}")
-    print(f"  target_classes shape: {target_classes.shape}")
-    
+    # Test matcher with fixed targets
+    print("\n5. Testing matcher with fixed targets...")
     try:
-        # Get weights
-        weights = mask_loss.weights.to(outputs['pred_logits'].device)
-        print(f"  Weights shape: {weights.shape}")
-        print(f"  Weights: {weights}")
-        
-        # Compute loss
-        loss_ce = torch.nn.functional.cross_entropy(
-            outputs['pred_logits'].transpose(1, 2),
-            target_classes,
-            weights,
-            ignore_index=mask_loss.ignore
-        )
-        print(f"  Cross entropy SUCCESS! Loss: {loss_ce.item():.4f}")
+        indices = matcher(outputs, fixed_targets)
+        print("  SUCCESS!")
+        for i, (src, tgt) in enumerate(indices):
+            print(f"    Batch {i}: matched {len(src)} queries to {len(tgt)} targets")
     except Exception as e:
-        print(f"  Cross entropy FAILED: {e}")
+        print(f"  FAILED: {e}")
         import traceback
         traceback.print_exc()
         
-        # Additional debugging
-        print("\n  Additional debugging:")
-        print(f"  ignore_index: {mask_loss.ignore}")
-        print(f"  num_classes from config: {mask_loss.num_classes}")
-        print(f"  pred_logits last dim: {outputs['pred_logits'].shape[-1]}")
-        print(f"  Expected: {mask_loss.num_classes + 1}")
+        # Try to debug inside matcher
+        print("\n6. Debugging inside matcher...")
+        
+        # Check the cost computation
+        print("  Testing cost computation...")
+        out_prob = outputs["pred_logits"][0].softmax(-1)
+        tgt_ids = fixed_targets["classes"][0]
+        
+        print(f"    out_prob shape: {out_prob.shape}")
+        print(f"    tgt_ids: {tgt_ids}")
+        
+        if len(tgt_ids) > 0:
+            try:
+                cost_class = -out_prob[:, tgt_ids]
+                print(f"    cost_class shape: {cost_class.shape}")
+            except Exception as e2:
+                print(f"    cost_class computation failed: {e2}")
 
 
 if __name__ == "__main__":
-    debug_mask_loss_detailed()
+    debug_matcher()
