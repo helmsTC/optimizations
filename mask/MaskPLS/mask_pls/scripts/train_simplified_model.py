@@ -146,22 +146,30 @@ class SimplifiedMaskPLS(LightningModule):
         loss_mask = self.mask_loss(outputs, targets, batch['masks_ids'], batch['pt_coord'])
         
         # Semantic loss (on valid points)
-        sem_labels = []
-        for i, (label, idx) in enumerate(zip(batch['sem_label'], valid_indices)):
-            # FIX: Convert torch tensor indices to CPU numpy for indexing
-            idx_np = idx.cpu().numpy()
-            valid_label = torch.from_numpy(label[idx_np]).long().cuda()
+        all_sem_labels = []
+        all_sem_logits = []
+        
+        for i, (label, idx, pad) in enumerate(zip(batch['sem_label'], valid_indices, padding)):
+            # Get valid points for this sample
+            valid_mask = ~pad
+            num_valid = valid_mask.sum().item()
             
-            # Pad if needed
-            if len(valid_label) < sem_logits.shape[1]:
-                valid_label = F.pad(valid_label, (0, sem_logits.shape[1] - len(valid_label)))
-            sem_labels.append(valid_label[:sem_logits.shape[1]])
+            # Get semantic logits for valid points
+            sem_logits_i = sem_logits[i][valid_mask]  # [num_valid, num_classes]
+            
+            # Get semantic labels for valid points
+            idx_np = idx.cpu().numpy()[:num_valid]  # Only take valid indices
+            valid_label = torch.from_numpy(label[idx_np].squeeze()).long().cuda()
+            
+            all_sem_logits.append(sem_logits_i)
+            all_sem_labels.append(valid_label)
         
-        sem_labels = torch.stack(sem_labels)
-        sem_labels = sem_labels[~padding].squeeze(1)
-        sem_logits_valid = sem_logits[~padding]
+        # Concatenate all valid points across batch
+        all_sem_logits = torch.cat(all_sem_logits, dim=0)
+        all_sem_labels = torch.cat(all_sem_labels, dim=0)
         
-        loss_sem = self.sem_loss(sem_logits_valid, sem_labels)
+        # Compute semantic loss
+        loss_sem = self.sem_loss(all_sem_logits, all_sem_labels)
         
         # Combine losses
         loss_mask.update(loss_sem)
@@ -183,21 +191,30 @@ class SimplifiedMaskPLS(LightningModule):
         loss_mask = self.mask_loss(outputs, targets, batch['masks_ids'], batch['pt_coord'])
         
         # Semantic loss
-        sem_labels = []
-        for i, (label, idx) in enumerate(zip(batch['sem_label'], valid_indices)):
-            # FIX: Convert torch tensor indices to CPU numpy for indexing
-            idx_np = idx.cpu().numpy()
-            valid_label = torch.from_numpy(label[idx_np]).long().cuda()
+        all_sem_labels = []
+        all_sem_logits = []
+        
+        for i, (label, idx, pad) in enumerate(zip(batch['sem_label'], valid_indices, padding)):
+            # Get valid points for this sample
+            valid_mask = ~pad
+            num_valid = valid_mask.sum().item()
             
-            if len(valid_label) < sem_logits.shape[1]:
-                valid_label = F.pad(valid_label, (0, sem_logits.shape[1] - len(valid_label)))
-            sem_labels.append(valid_label[:sem_logits.shape[1]])
+            # Get semantic logits for valid points
+            sem_logits_i = sem_logits[i][valid_mask]  # [num_valid, num_classes]
+            
+            # Get semantic labels for valid points
+            idx_np = idx.cpu().numpy()[:num_valid]  # Only take valid indices
+            valid_label = torch.from_numpy(label[idx_np].squeeze()).long().cuda()
+            
+            all_sem_logits.append(sem_logits_i)
+            all_sem_labels.append(valid_label)
         
-        sem_labels = torch.stack(sem_labels)
-        sem_labels = sem_labels[~padding].squeeze(1)
-        sem_logits_valid = sem_logits[~padding]
+        # Concatenate all valid points across batch
+        all_sem_logits = torch.cat(all_sem_logits, dim=0)
+        all_sem_labels = torch.cat(all_sem_labels, dim=0)
         
-        loss_sem = self.sem_loss(sem_logits_valid, sem_labels)
+        # Compute semantic loss
+        loss_sem = self.sem_loss(all_sem_logits, all_sem_labels)
         loss_mask.update(loss_sem)
         
         # Log losses
