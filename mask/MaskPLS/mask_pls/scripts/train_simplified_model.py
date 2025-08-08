@@ -4,6 +4,9 @@ Save as: mask/MaskPLS/mask_pls/scripts/train_simplified_model.py
 """
 
 import os
+# Enable CUDA error debugging
+os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
+
 from os.path import join
 import click
 import torch
@@ -78,14 +81,17 @@ class SimplifiedMaskPLS(LightningModule):
             
             valid_pts = pts[valid_mask]
             valid_feat = feat[valid_mask]
+            # Get indices of valid points in original array
             valid_idx = torch.where(valid_mask)[0]
             
             # Subsample if needed
             max_pts = self.cfg[self.cfg.MODEL.DATASET].SUB_NUM_POINTS
             if len(valid_pts) > max_pts and self.training:
+                # Create permutation for subsampling
                 perm = torch.randperm(len(valid_pts))[:max_pts]
                 valid_pts = valid_pts[perm]
                 valid_feat = valid_feat[perm]
+                # IMPORTANT: Map the indices correctly
                 valid_idx = valid_idx[perm]
             
             # Normalize coordinates
@@ -148,6 +154,13 @@ class SimplifiedMaskPLS(LightningModule):
             
             outputs, padding, sem_logits, valid_indices = self.forward(batch)
             
+            # Debug valid indices
+            if self.debug or batch_idx == 0:
+                print(f"Valid indices lengths: {[len(idx) for idx in valid_indices]}")
+                for i, idx in enumerate(valid_indices):
+                    if len(idx) > 0:
+                        print(f"  Sample {i}: min={idx.min().item()}, max={idx.max().item()}, label_size={len(batch['sem_label'][i])}")
+            
             # Prepare targets for mask loss
             targets = {
                 'classes': batch['masks_cls'],
@@ -175,9 +188,18 @@ class SimplifiedMaskPLS(LightningModule):
                 # Get semantic labels for valid points
                 idx_cpu = idx.cpu()
                 
+                # Debug indices
+                if self.debug and len(idx_cpu) > 0:
+                    print(f"Sample {i}: idx range [{idx_cpu.min()}, {idx_cpu.max()}], label shape {label.shape}")
+                
                 # Ensure indices are within bounds
-                max_label_idx = len(label) - 1
-                valid_indices_mask = idx_cpu < max_label_idx
+                label_size = len(label)
+                valid_indices_mask = idx_cpu < label_size
+                
+                if not valid_indices_mask.any():
+                    print(f"Warning: No valid indices for sample {i}")
+                    continue
+                
                 idx_cpu = idx_cpu[valid_indices_mask]
                 
                 # Further limit by num_valid
@@ -186,9 +208,17 @@ class SimplifiedMaskPLS(LightningModule):
                 if len(idx_cpu) == 0:
                     continue
                 
-                # Get labels
+                # Get labels - handle both (N,) and (N,1) shapes
                 idx_np = idx_cpu.numpy()
-                valid_label = torch.from_numpy(label[idx_np].squeeze(-1)).long().cuda()
+                label_subset = label[idx_np]
+                if label_subset.ndim > 1:
+                    label_subset = label_subset.squeeze(-1)
+                valid_label = torch.from_numpy(label_subset).long().cuda()
+                
+                # Debug label values
+                if self.debug:
+                    unique_labels = torch.unique(valid_label)
+                    print(f"Sample {i}: unique labels {unique_labels.cpu().numpy()}")
                 
                 # Make sure dimensions match
                 min_len = min(len(valid_label), len(sem_logits_i))
@@ -198,6 +228,7 @@ class SimplifiedMaskPLS(LightningModule):
             
             # Check if we have any valid data
             if len(all_sem_logits) == 0:
+                print("Warning: No valid semantic data in batch")
                 # Return a small loss to continue training
                 return torch.tensor(0.1, device='cuda', requires_grad=True)
             
@@ -207,7 +238,20 @@ class SimplifiedMaskPLS(LightningModule):
             
             # Ensure labels are within valid range
             num_classes = self.cfg[self.cfg.MODEL.DATASET].NUM_CLASSES
+            
+            # Debug label range
+            if self.debug or batch_idx == 0:
+                print(f"Label range before clamp: [{all_sem_labels.min().item()}, {all_sem_labels.max().item()}], num_classes={num_classes}")
+            
+            # Filter out ignore labels (0) and clamp to valid range
+            valid_mask = all_sem_labels > 0  # Ignore label 0
+            all_sem_logits = all_sem_logits[valid_mask]
+            all_sem_labels = all_sem_labels[valid_mask]
             all_sem_labels = torch.clamp(all_sem_labels, 0, num_classes - 1)
+            
+            if len(all_sem_labels) == 0:
+                print("Warning: All labels are ignore class")
+                return torch.tensor(0.1, device='cuda', requires_grad=True)
             
             # Compute semantic loss
             loss_sem = self.sem_loss(all_sem_logits, all_sem_labels)
@@ -233,7 +277,7 @@ class SimplifiedMaskPLS(LightningModule):
             return total_loss
             
         except Exception as e:
-            print(f"Error in training_step: {e}")
+            print(f"Error in training_step batch {batch_idx}: {e}")
             import traceback
             traceback.print_exc()
             # Return a small loss to continue training
@@ -431,9 +475,11 @@ def getDir(obj):
 @click.option("--nuscenes", is_flag=True, help="Use NuScenes dataset")
 @click.option("--epochs", type=int, default=100, help="Number of epochs")
 @click.option("--batch_size", type=int, default=1, help="Batch size")
-@click.option("--lr", type=float, default=0.0001, help="Learning rate")
+@click.option("--lr", type=float, default=0.00001, help="Learning rate (default: 1e-5)")
 @click.option("--gpus", type=int, default=1, help="Number of GPUs")
-def main(checkpoint, nuscenes, epochs, batch_size, lr, gpus):
+@click.option("--debug", is_flag=True, help="Enable debug mode")
+@click.option("--num_workers", type=int, default=0, help="Number of data loader workers (default: 0)")
+def main(checkpoint, nuscenes, epochs, batch_size, lr, gpus, debug, num_workers):
     # Load configurations
     model_cfg = edict(
         yaml.safe_load(open(join(getDir(__file__), "../config/model.yaml")))
@@ -451,6 +497,7 @@ def main(checkpoint, nuscenes, epochs, batch_size, lr, gpus):
     cfg.TRAIN.BATCH_SIZE = batch_size
     cfg.TRAIN.LR = lr
     cfg.TRAIN.N_GPUS = gpus
+    cfg.TRAIN.NUM_WORKERS = num_workers  # Override config
     
     if nuscenes:
         cfg.MODEL.DATASET = "NUSCENES"
@@ -464,12 +511,19 @@ def main(checkpoint, nuscenes, epochs, batch_size, lr, gpus):
     print(f"Batch size: {batch_size}")
     print(f"Learning rate: {lr}")
     print(f"GPUs: {gpus}")
+    print(f"Workers: {num_workers}")
+    print(f"Debug mode: {debug}")
     
     # Create data module
     data = SemanticDatasetModule(cfg)
     
     # Create model
     model = SimplifiedMaskPLS(cfg)
+    
+    # Enable debug mode if requested
+    if debug:
+        model.debug = True
+        print("Debug mode enabled - will print detailed information")
     
     # Load checkpoint if provided
     if checkpoint:
@@ -516,6 +570,7 @@ def main(checkpoint, nuscenes, epochs, batch_size, lr, gpus):
         gradient_clip_val=0.5,
         accumulate_grad_batches=cfg.TRAIN.BATCH_ACC,
         resume_from_checkpoint=checkpoint if checkpoint and os.path.exists(checkpoint) else None,
+        num_sanity_val_steps=0 if debug else 2,  # Skip validation sanity check in debug mode
     )
     
     # Train
