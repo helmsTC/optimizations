@@ -143,6 +143,15 @@ class MaskLoss(nn.Module):
 
         masks = [t for t in targets["masks"]]
         n_masks = [m.shape[0] for m in masks]
+        
+        # Handle empty masks case
+        if sum(n_masks) == 0:
+            device = outputs["pred_masks"].device
+            return {
+                "loss_mask": torch.tensor(0.0, device=device, requires_grad=True),
+                "loss_dice": torch.tensor(0.0, device=device, requires_grad=True)
+            }
+        
         target_masks = pad_stack(masks)
 
         pred_idx = self._get_pred_permutation_idx(indices)
@@ -187,15 +196,34 @@ class MaskLoss(nn.Module):
             [torch.full_like(tgt, i) for i, (_, tgt) in enumerate(indices)]
         )
         tgt_idx = torch.cat([tgt for (_, tgt) in indices])
+        
+        # Handle empty case
+        if len(batch_idx) == 0:
+            return []
+        
         # From [B,id] to [id] of stacked masks
         cont_id = torch.cat([torch.arange(n) for n in n_masks])
         b_id = torch.stack((batch_idx, cont_id), axis=1)
-        map_m = torch.zeros((torch.max(batch_idx) + 1, max(n_masks)))
+        
+        # Ensure we don't exceed bounds
+        max_batch = torch.max(batch_idx).item() if len(batch_idx) > 0 else 0
+        max_masks = max(n_masks) if n_masks else 1
+        
+        map_m = torch.zeros((max_batch + 1, max_masks))
         for i in range(len(b_id)):
             map_m[b_id[i, 0], b_id[i, 1]] = i
-        stack_ids = [
-            int(map_m[batch_idx[i], tgt_idx[i]]) for i in range(len(batch_idx))
-        ]
+        
+        stack_ids = []
+        for i in range(len(batch_idx)):
+            b_i = batch_idx[i].item()
+            t_i = tgt_idx[i].item()
+            # Bounds check before accessing map_m
+            if b_i < map_m.shape[0] and t_i < map_m.shape[1]:
+                stack_ids.append(int(map_m[b_i, t_i]))
+            else:
+                # Skip invalid indices
+                continue
+        
         return stack_ids
 
 

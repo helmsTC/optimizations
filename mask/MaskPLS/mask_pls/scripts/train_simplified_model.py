@@ -268,7 +268,7 @@ class SimplifiedMaskPLS(LightningModule):
                     
                     # CRITICAL: Ensure indices are valid
                     label_size = len(label_array)
-                    valid_idx_mask = idx_to_use < label_size  # Use < instead of <=
+                    valid_idx_mask = idx_to_use < label_size
                     idx_to_use = idx_to_use[valid_idx_mask]
                     
                     # Adjust logits if needed
@@ -383,8 +383,8 @@ class SimplifiedMaskPLS(LightningModule):
                 
                 # Get labels
                 label_array = label.flatten() if label.ndim > 1 else label
-                max_label_idx = len(label_array) - 1
-                valid_idx_mask = idx_to_use <= max_label_idx
+                label_size = len(label_array)
+                valid_idx_mask = idx_to_use < label_size
                 idx_to_use = idx_to_use[valid_idx_mask]
                 
                 if len(idx_to_use) != num_logits:
@@ -437,8 +437,8 @@ class SimplifiedMaskPLS(LightningModule):
                 idx_cpu = idx.cpu().numpy()
                 
                 # Ensure indices are within bounds
-                max_idx = len(full_sem) - 1
-                valid_mask = idx_cpu <= max_idx
+                max_size = len(full_sem)
+                valid_mask = idx_cpu < max_size
                 idx_cpu = idx_cpu[valid_mask]
                 
                 valid_len = min(len(idx_cpu), len(pred_sem))

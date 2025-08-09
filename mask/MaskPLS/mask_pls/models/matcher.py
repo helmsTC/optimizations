@@ -68,6 +68,11 @@ class HungarianMatcher(nn.Module):
         for b in range(bs):
             out_prob = outputs["pred_logits"][b].softmax(-1)
             tgt_ids = targets["classes"][b].type(torch.int64)
+            
+            # Handle empty targets
+            if len(tgt_ids) == 0:
+                indices.append((torch.tensor([], dtype=torch.int64), torch.tensor([], dtype=torch.int64)))
+                continue
 
             cost_class = -out_prob[:, tgt_ids]
 
@@ -76,8 +81,10 @@ class HungarianMatcher(nn.Module):
             n_pts_scan = tgt_mask.shape[1]
 
             # all masks share the same set of points for efficient matching!
+            # Ensure we have at least 1 point to sample
+            n_sample_pts = max(1, int(self.p_ratio * n_pts_scan))
             pt_idx = torch.randint(
-                0, n_pts_scan, (int(self.p_ratio * n_pts_scan), 1)
+                0, n_pts_scan, (n_sample_pts, 1)
             ).squeeze(1)
 
             # get gt labels
