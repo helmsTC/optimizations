@@ -261,18 +261,20 @@ class SimplifiedMaskPLS(LightningModule):
                     
                     # Ensure we don't exceed the number of valid logits
                     num_logits = sem_logits_i.shape[0]
-                    idx_to_use = idx_cpu[:num_logits]
                     
                     # Get labels
                     label_array = label.flatten() if label.ndim > 1 else label
-                    
-                    # CRITICAL: Ensure indices are valid
                     label_size = len(label_array)
-                    valid_idx_mask = idx_to_use < label_size
-                    idx_to_use = idx_to_use[valid_idx_mask]
+                    
+                    # CRITICAL: Ensure indices are valid for both bounds
+                    valid_idx_mask = (idx_cpu < label_size) & (idx_cpu >= 0)
+                    idx_to_use = idx_cpu[valid_idx_mask]
+                    
+                    # Ensure we don't use more indices than we have logits
+                    idx_to_use = idx_to_use[:num_logits]
                     
                     # Adjust logits if needed
-                    if len(idx_to_use) != num_logits:
+                    if len(idx_to_use) < num_logits:
                         sem_logits_i = sem_logits_i[:len(idx_to_use)]
                     
                     if len(idx_to_use) == 0:
@@ -379,15 +381,20 @@ class SimplifiedMaskPLS(LightningModule):
                 # Get semantic labels for the points we actually kept
                 idx_cpu = idx.cpu().numpy()
                 num_logits = sem_logits_i.shape[0]
-                idx_to_use = idx_cpu[:num_logits]
                 
                 # Get labels
                 label_array = label.flatten() if label.ndim > 1 else label
                 label_size = len(label_array)
-                valid_idx_mask = idx_to_use < label_size
-                idx_to_use = idx_to_use[valid_idx_mask]
                 
-                if len(idx_to_use) != num_logits:
+                # Ensure indices are within bounds of both logits and labels
+                valid_idx_mask = (idx_cpu < label_size) & (idx_cpu >= 0)
+                idx_to_use = idx_cpu[valid_idx_mask]
+                
+                # Ensure we don't use more indices than we have logits
+                idx_to_use = idx_to_use[:num_logits]
+                
+                # Adjust sem_logits to match the number of valid indices
+                if len(idx_to_use) < num_logits:
                     sem_logits_i = sem_logits_i[:len(idx_to_use)]
                     
                 if len(idx_to_use) == 0:

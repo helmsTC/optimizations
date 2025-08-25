@@ -78,11 +78,21 @@ class HungarianMatcher(nn.Module):
 
             out_mask = outputs["pred_masks"][b].permute(1, 0)  # [num_queries, num_pts]
             tgt_mask = targets["masks"][b].to(out_mask)
-            n_pts_scan = tgt_mask.shape[1]
+            
+            # Ensure both masks have the same number of points
+            out_pts = out_mask.shape[1]
+            tgt_pts = tgt_mask.shape[1]
+            n_pts_scan = min(out_pts, tgt_pts)
+            
+            # Handle case where masks have different sizes
+            if out_pts != tgt_pts:
+                # Truncate to the smaller size
+                out_mask = out_mask[:, :n_pts_scan]
+                tgt_mask = tgt_mask[:, :n_pts_scan]
 
             # all masks share the same set of points for efficient matching!
             # Ensure we have at least 1 point to sample
-            n_sample_pts = max(1, int(self.p_ratio * n_pts_scan))
+            n_sample_pts = max(1, min(int(self.p_ratio * n_pts_scan), n_pts_scan))
             pt_idx = torch.randint(
                 0, n_pts_scan, (n_sample_pts, 1)
             ).squeeze(1)
