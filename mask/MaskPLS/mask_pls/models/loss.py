@@ -165,12 +165,48 @@ class MaskLoss(nn.Module):
             idx = sample_points(masks, masks_ids, self.n_mask_pts, self.num_points)
             n_masks.insert(0, 0)
             nm = torch.cumsum(torch.tensor(n_masks), 0)
-            point_labels = torch.cat(
-                [target_masks[nm[i] : nm[i + 1]][:, p] for i, p in enumerate(idx)]
-            )
-        point_logits = torch.cat(
-            [pred_masks[nm[i] : nm[i + 1]][:, p] for i, p in enumerate(idx)]
-        )
+            
+            # Safer indexing with bounds checking
+            point_labels_list = []
+            for i, p in enumerate(idx):
+                if len(p) > 0:
+                    mask_slice = target_masks[nm[i] : nm[i + 1]]
+                    if mask_slice.shape[0] > 0 and mask_slice.shape[1] > 0:
+                        # Ensure indices are within bounds
+                        valid_p = p[p < mask_slice.shape[1]]
+                        if len(valid_p) > 0:
+                            point_labels_list.append(mask_slice[:, valid_p])
+            
+            if point_labels_list:
+                point_labels = torch.cat(point_labels_list)
+            else:
+                # Return zero loss if no valid points
+                device = outputs["pred_masks"].device
+                return {
+                    "loss_mask": torch.tensor(0.0, device=device, requires_grad=True),
+                    "loss_dice": torch.tensor(0.0, device=device, requires_grad=True)
+                }
+        
+        # Apply same safer indexing for point_logits
+        point_logits_list = []
+        for i, p in enumerate(idx):
+            if len(p) > 0:
+                mask_slice = pred_masks[nm[i] : nm[i + 1]]
+                if mask_slice.shape[0] > 0 and mask_slice.shape[1] > 0:
+                    # Ensure indices are within bounds
+                    valid_p = p[p < mask_slice.shape[1]]
+                    if len(valid_p) > 0:
+                        point_logits_list.append(mask_slice[:, valid_p])
+        
+        if point_logits_list:
+            point_logits = torch.cat(point_logits_list)
+        else:
+            # Return zero loss if no valid points
+            device = outputs["pred_masks"].device
+            return {
+                "loss_mask": torch.tensor(0.0, device=device, requires_grad=True),
+                "loss_dice": torch.tensor(0.0, device=device, requires_grad=True)
+            }
 
         del pred_masks
         del target_masks

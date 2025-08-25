@@ -43,39 +43,44 @@ def sample_points(masks, masks_ids, n_pts, n_samples):
     for ids, mm in zip(masks_ids, masks):
         # Collect mask indices
         m_idx_list = []
+        max_points = mm.shape[1] if mm.shape[1] > 0 else 0
+        
         for id in ids:
-            if id.shape[0] > 0:  # Only process non-empty ids
-                if id.shape[0] > n_pts:
-                    # Ensure indices are within bounds
-                    perm_size = min(id.shape[0], n_pts)
-                    perm = torch.randperm(id.shape[0])[:perm_size]
-                    m_idx_list.append(id[perm])
-                else:
-                    m_idx_list.append(id)
+            if id.shape[0] > 0 and max_points > 0:  # Only process non-empty ids with valid masks
+                # Filter indices to be within bounds FIRST
+                valid_id = id[id < max_points]
+                if valid_id.shape[0] > 0:
+                    if valid_id.shape[0] > n_pts:
+                        # Sample from valid indices only
+                        perm_size = min(valid_id.shape[0], n_pts)
+                        perm = torch.randperm(valid_id.shape[0])[:perm_size]
+                        m_idx_list.append(valid_id[perm])
+                    else:
+                        m_idx_list.append(valid_id)
         
         # Concatenate mask indices if we have any
         if m_idx_list:
             m_idx = torch.cat(m_idx_list)
+            # Extra safety check
+            m_idx = m_idx[m_idx < max_points] if max_points > 0 else m_idx
         else:
             m_idx = torch.tensor([], dtype=torch.long)
         
-        # Ensure m_idx doesn't exceed the mask dimensions
-        if mm.shape[1] > 0:
-            # Filter out indices that exceed mask dimensions
-            valid_mask = m_idx < mm.shape[1]
-            m_idx = m_idx[valid_mask]
-        
         # Generate random indices to fill up to n_samples
         remaining = n_samples - m_idx.shape[0]
-        if remaining > 0 and mm.shape[1] > 0:
-            r_idx = torch.randint(mm.shape[1], [remaining]).to(m_idx)
-            idx = torch.cat((m_idx, r_idx))
+        if remaining > 0 and max_points > 0:
+            # Ensure we don't sample out of bounds
+            r_idx = torch.randint(0, max_points, [remaining]).to(m_idx.device if len(m_idx) > 0 else 'cpu')
+            if len(m_idx) > 0:
+                idx = torch.cat((m_idx, r_idx))
+            else:
+                idx = r_idx
         else:
-            idx = m_idx
+            idx = m_idx[:n_samples] if len(m_idx) > n_samples else m_idx
         
-        # Final bounds check
-        if mm.shape[1] > 0:
-            idx = idx[idx < mm.shape[1]]
+        # Final safety check - ensure all indices are within bounds
+        if max_points > 0 and len(idx) > 0:
+            idx = idx[(idx >= 0) & (idx < max_points)]
         
         sampled.append(idx)
     return sampled
