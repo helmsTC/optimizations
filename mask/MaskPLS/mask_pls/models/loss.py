@@ -169,13 +169,16 @@ class MaskLoss(nn.Module):
             # Safer indexing with bounds checking
             point_labels_list = []
             for i, p in enumerate(idx):
-                if len(p) > 0:
-                    mask_slice = target_masks[nm[i] : nm[i + 1]]
-                    if mask_slice.shape[0] > 0 and mask_slice.shape[1] > 0:
-                        # Ensure indices are within bounds
-                        valid_p = p[p < mask_slice.shape[1]]
-                        if len(valid_p) > 0:
-                            point_labels_list.append(mask_slice[:, valid_p])
+                if len(p) > 0 and i < len(masks):
+                    # Get the target mask for this batch element
+                    if nm[i] < len(target_masks) and nm[i + 1] <= len(target_masks):
+                        mask_slice = target_masks[nm[i] : nm[i + 1]]
+                        if mask_slice.shape[0] > 0:
+                            # Make sure indices don't exceed the actual point cloud size
+                            max_idx = masks[i].shape[1] if i < len(masks) else mask_slice.shape[1]
+                            valid_p = p[p < max_idx]
+                            if len(valid_p) > 0 and valid_p.max() < mask_slice.shape[1]:
+                                point_labels_list.append(mask_slice[:, valid_p])
             
             if point_labels_list:
                 point_labels = torch.cat(point_labels_list)
@@ -190,13 +193,16 @@ class MaskLoss(nn.Module):
         # Apply same safer indexing for point_logits
         point_logits_list = []
         for i, p in enumerate(idx):
-            if len(p) > 0:
-                mask_slice = pred_masks[nm[i] : nm[i + 1]]
-                if mask_slice.shape[0] > 0 and mask_slice.shape[1] > 0:
-                    # Ensure indices are within bounds
-                    valid_p = p[p < mask_slice.shape[1]]
-                    if len(valid_p) > 0:
-                        point_logits_list.append(mask_slice[:, valid_p])
+            if len(p) > 0 and i < len(masks):
+                # Get the prediction mask for this batch element  
+                if nm[i] < len(pred_masks) and nm[i + 1] <= len(pred_masks):
+                    mask_slice = pred_masks[nm[i] : nm[i + 1]]
+                    if mask_slice.shape[0] > 0:
+                        # Make sure indices don't exceed the actual point cloud size
+                        max_idx = masks[i].shape[1] if i < len(masks) else mask_slice.shape[1]
+                        valid_p = p[p < max_idx]
+                        if len(valid_p) > 0 and valid_p.max() < mask_slice.shape[1]:
+                            point_logits_list.append(mask_slice[:, valid_p])
         
         if point_logits_list:
             point_logits = torch.cat(point_logits_list)
@@ -210,6 +216,15 @@ class MaskLoss(nn.Module):
 
         del pred_masks
         del target_masks
+
+        # Ensure that point_logits and point_labels have the same shape
+        # This handles varying point cloud sizes properly
+        if point_logits.shape != point_labels.shape:
+            # If shapes don't match, we need to ensure they're compatible
+            # The mismatch typically occurs in the last dimension (number of points sampled)
+            min_points = min(point_logits.shape[-1], point_labels.shape[-1])
+            point_logits = point_logits[..., :min_points]
+            point_labels = point_labels[..., :min_points]
 
         losses = {
             "loss_mask": sigmoid_ce_loss_jit(point_logits, point_labels, num_masks),
