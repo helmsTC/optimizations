@@ -13,10 +13,14 @@ import click
 import torch
 import yaml
 import numpy as np
+import time
 from easydict import EasyDict as edict
 from pytorch_lightning import Trainer
 from pytorch_lightning import loggers as pl_loggers
-from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
+from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint, Callback
+from torch.profiler import profile, record_function, ProfilerActivity
+import torch.onnx
+from pathlib import Path
 
 # Import the simplified model components
 from mask_pls.models.onnx.simplified_model import MaskPLSSimplifiedONNX
@@ -26,6 +30,137 @@ from mask_pls.utils.evaluate_panoptic import PanopticEvaluator
 
 import torch.nn.functional as F
 from pytorch_lightning.core.lightning import LightningModule
+
+
+class ONNXExportCallback(Callback):
+    """Callback to export model to ONNX format every N epochs"""
+    def __init__(self, export_interval=5, output_dir="onnx_checkpoints"):
+        self.export_interval = export_interval
+        self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        
+    def on_epoch_end(self, trainer, pl_module):
+        """Export model to ONNX at the end of specified epochs"""
+        current_epoch = trainer.current_epoch + 1
+        
+        if current_epoch % self.export_interval == 0:
+            try:
+                print(f"\n[ONNX Export] Exporting model at epoch {current_epoch}...")
+                
+                # Set model to eval mode
+                pl_module.eval()
+                
+                # Get the underlying model
+                model = pl_module.model
+                
+                # Create dummy input (adjust sizes as needed)
+                batch_size = 1
+                num_points = 10000
+                dummy_voxels = torch.randn(batch_size, 4, 64, 64, 64).cuda()
+                dummy_coords = torch.randn(batch_size, num_points, 3).cuda()
+                
+                # Export path
+                export_path = self.output_dir / f"model_epoch_{current_epoch:03d}.onnx"
+                
+                # Export to ONNX
+                with torch.no_grad():
+                    torch.onnx.export(
+                        model,
+                        (dummy_voxels, dummy_coords),
+                        str(export_path),
+                        export_params=True,
+                        opset_version=11,
+                        do_constant_folding=True,
+                        input_names=['voxel_features', 'point_coords'],
+                        output_names=['pred_logits', 'pred_masks', 'sem_logits'],
+                        dynamic_axes={
+                            'voxel_features': {0: 'batch_size'},
+                            'point_coords': {0: 'batch_size', 1: 'num_points'},
+                            'pred_logits': {0: 'batch_size'},
+                            'pred_masks': {0: 'batch_size', 1: 'num_points'},
+                            'sem_logits': {0: 'batch_size', 1: 'num_points'}
+                        },
+                        verbose=False
+                    )
+                
+                file_size_mb = export_path.stat().st_size / (1024 * 1024)
+                print(f"[ONNX Export] ✓ Saved to {export_path} ({file_size_mb:.2f} MB)")
+                
+                # Back to train mode
+                pl_module.train()
+                
+            except Exception as e:
+                print(f"[ONNX Export] ✗ Failed to export at epoch {current_epoch}: {e}")
+                # Continue training even if export fails
+                pl_module.train()
+
+
+class ProfilingCallback(Callback):
+    """Callback for profiling training performance"""
+    def __init__(self, profile_interval=10, warmup_steps=5):
+        self.profile_interval = profile_interval
+        self.warmup_steps = warmup_steps
+        self.step_count = 0
+        self.profiling_enabled = False
+        self.profiler = None
+        
+        # Timing metrics
+        self.data_load_times = []
+        self.forward_times = []
+        self.loss_times = []
+        self.backward_times = []
+        self.optimizer_times = []
+        
+    def on_train_batch_start(self, trainer, pl_module, batch, batch_idx):
+        """Start profiling if conditions are met"""
+        self.step_count += 1
+        
+        # Start profiler after warmup
+        if self.step_count == self.warmup_steps:
+            print(f"\n[Profiler] Starting performance profiling...")
+            self.profiler = profile(
+                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                record_shapes=True,
+                profile_memory=True,
+                with_stack=True
+            )
+            self.profiler.__enter__()
+            self.profiling_enabled = True
+            
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        """Stop profiling and report if interval reached"""
+        if self.profiling_enabled and self.step_count >= self.warmup_steps + self.profile_interval:
+            self.profiler.__exit__(None, None, None)
+            
+            # Print profiler results
+            print("\n" + "="*80)
+            print("[Profiler] Performance Analysis Report")
+            print("="*80)
+            
+            # Sort by CUDA time
+            print("\nTop operations by CUDA time:")
+            print(self.profiler.key_averages().table(
+                sort_by="cuda_time_total", row_limit=10
+            ))
+            
+            # Sort by CPU time
+            print("\nTop operations by CPU time:")
+            print(self.profiler.key_averages().table(
+                sort_by="cpu_time_total", row_limit=10
+            ))
+            
+            # Memory usage
+            print("\nTop operations by memory usage:")
+            print(self.profiler.key_averages().table(
+                sort_by="self_cuda_memory_usage", row_limit=10
+            ))
+            
+            print("="*80 + "\n")
+            
+            # Reset for next profiling interval
+            self.profiling_enabled = False
+            self.profiler = None
+            self.step_count = 0
 
 
 def prepare_targets_for_loss(batch, device='cuda'):
@@ -82,6 +217,17 @@ class SimplifiedMaskPLS(LightningModule):
         self.save_hyperparameters(dict(cfg))
         self.cfg = cfg
         
+        # Timing tracking
+        self.timing_enabled = False
+        self.component_times = {
+            'data_prep': [],
+            'voxelization': [],
+            'backbone': [],
+            'decoder': [],
+            'loss_computation': [],
+            'total_forward': []
+        }
+        
         # Get dataset configuration
         dataset = cfg.MODEL.DATASET
         self.num_classes = cfg[dataset].NUM_CLASSES
@@ -121,15 +267,24 @@ class SimplifiedMaskPLS(LightningModule):
         print("-" * 60)
             
     def forward(self, batch):
-        """Forward pass with pre-voxelization"""
+        """Forward pass with pre-voxelization and timing"""
+        if self.timing_enabled:
+            total_start = time.time()
+            
         # Extract data from batch
         points = batch['pt_coord']
         features = batch['feats']
+        
+        if self.timing_enabled:
+            data_prep_start = time.time()
         
         # Pre-voxelize the batch
         batch_voxels = []
         batch_coords = []
         valid_indices = []
+        
+        if self.timing_enabled:
+            voxel_start = time.time()
         
         for i in range(len(points)):
             # Get points and features
@@ -173,6 +328,9 @@ class SimplifiedMaskPLS(LightningModule):
             batch_coords.append(norm_coords)
             valid_indices.append(valid_idx)
         
+        if self.timing_enabled:
+            self.component_times['voxelization'].append(time.time() - voxel_start)
+            
         # Stack batch
         max_pts = max(c.shape[0] for c in batch_coords)
         
@@ -195,8 +353,17 @@ class SimplifiedMaskPLS(LightningModule):
         batch_coords = torch.stack(padded_coords)
         padding_masks = torch.stack(padding_masks)
         
-        # Forward through model
-        pred_logits, pred_masks, sem_logits = self.model(batch_voxels, batch_coords)
+        if self.timing_enabled:
+            self.component_times['data_prep'].append(time.time() - data_prep_start)
+            model_start = time.time()
+        
+        # Forward through model with component timing
+        if self.timing_enabled:
+            with record_function("model_forward"):
+                pred_logits, pred_masks, sem_logits = self.model(batch_voxels, batch_coords)
+            self.component_times['backbone'].append(time.time() - model_start)
+        else:
+            pred_logits, pred_masks, sem_logits = self.model(batch_voxels, batch_coords)
         
         # Validate outputs
         if self.debug:
@@ -223,10 +390,47 @@ class SimplifiedMaskPLS(LightningModule):
             'aux_outputs': []  # Simplified model doesn't have aux outputs
         }
         
+        if self.timing_enabled:
+            self.component_times['total_forward'].append(time.time() - total_start)
+            
+            # Print timing stats every 50 steps
+            if len(self.component_times['total_forward']) % 50 == 0:
+                self._print_timing_stats()
+        
         return outputs, padding_masks, sem_logits, valid_indices
+    
+    def _print_timing_stats(self):
+        """Print timing statistics for performance analysis"""
+        print("\n" + "="*60)
+        print("[Timing Stats] Component Performance (ms)")
+        print("="*60)
+        
+        for component, times in self.component_times.items():
+            if times:
+                avg_time = np.mean(times) * 1000  # Convert to ms
+                std_time = np.std(times) * 1000
+                print(f"{component:20s}: {avg_time:7.2f} ± {std_time:5.2f} ms")
+        
+        # Calculate percentages
+        if self.component_times['total_forward']:
+            total_avg = np.mean(self.component_times['total_forward'])
+            print("\nComponent percentages:")
+            for component, times in self.component_times.items():
+                if times and component != 'total_forward':
+                    pct = (np.mean(times) / total_avg) * 100
+                    print(f"{component:20s}: {pct:5.1f}%")
+        
+        print("="*60 + "\n")
+        
+        # Clear after printing
+        for k in self.component_times:
+            self.component_times[k] = []
     
     def training_step(self, batch, batch_idx):
         try:
+            if self.timing_enabled:
+                loss_start = time.time()
+                
             outputs, padding, sem_logits, valid_indices = self.forward(batch)
             
             # Prepare targets for mask loss - THIS IS THE KEY FIX
@@ -342,6 +546,9 @@ class SimplifiedMaskPLS(LightningModule):
                 total_loss = torch.tensor(0.1, device='cuda', requires_grad=True)
             
             self.log("train_loss", total_loss, batch_size=self.cfg.TRAIN.BATCH_SIZE, on_step=True, on_epoch=True)
+            
+            if self.timing_enabled:
+                self.component_times['loss_computation'].append(time.time() - loss_start)
             
             return total_loss
             
@@ -554,7 +761,11 @@ def getDir(obj):
 @click.option("--gpus", type=int, default=1, help="Number of GPUs")
 @click.option("--debug", is_flag=True, help="Enable debug mode")
 @click.option("--num_workers", type=int, default=4, help="Number of data loader workers")
-def main(checkpoint, nuscenes, epochs, batch_size, lr, gpus, debug, num_workers):
+@click.option("--profile", is_flag=True, help="Enable performance profiling")
+@click.option("--timing", is_flag=True, help="Enable component timing analysis")
+@click.option("--export_onnx", is_flag=True, help="Export ONNX models every 5 epochs")
+@click.option("--onnx_interval", type=int, default=5, help="Interval for ONNX export")
+def main(checkpoint, nuscenes, epochs, batch_size, lr, gpus, debug, num_workers, profile, timing, export_onnx, onnx_interval):
     # Load configurations
     model_cfg = edict(
         yaml.safe_load(open(join(getDir(__file__), "../config/model.yaml")))
@@ -588,6 +799,9 @@ def main(checkpoint, nuscenes, epochs, batch_size, lr, gpus, debug, num_workers)
     print(f"GPUs: {gpus}")
     print(f"Workers: {num_workers}")
     print(f"Debug mode: {debug}")
+    print(f"Profiling: {profile}")
+    print(f"Timing analysis: {timing}")
+    print(f"ONNX export: {export_onnx} (every {onnx_interval} epochs)" if export_onnx else "")
     
     # Create data module
     data = SemanticDatasetModule(cfg)
@@ -599,6 +813,11 @@ def main(checkpoint, nuscenes, epochs, batch_size, lr, gpus, debug, num_workers)
     if debug:
         model.debug = True
         print("Debug mode enabled - will print detailed information")
+    
+    # Enable timing if requested
+    if timing:
+        model.timing_enabled = True
+        print("Timing analysis enabled - will print component timing stats")
     
     # Load checkpoint if provided
     if checkpoint:
@@ -616,7 +835,10 @@ def main(checkpoint, nuscenes, epochs, batch_size, lr, gpus, debug, num_workers)
     )
     
     # Callbacks
+    callbacks = []
+    
     lr_monitor = LearningRateMonitor(logging_interval="step")
+    callbacks.append(lr_monitor)
     
     iou_ckpt = ModelCheckpoint(
         monitor="metrics/iou",
@@ -633,6 +855,20 @@ def main(checkpoint, nuscenes, epochs, batch_size, lr, gpus, debug, num_workers)
         mode="max",
         save_last=True,
     )
+    callbacks.extend([pq_ckpt, iou_ckpt])
+    
+    # Add profiling callback if requested
+    if profile:
+        profiling_cb = ProfilingCallback(profile_interval=50, warmup_steps=10)
+        callbacks.append(profiling_cb)
+        print("Added profiling callback")
+    
+    # Add ONNX export callback if requested
+    if export_onnx:
+        onnx_dir = f"experiments/{cfg.EXPERIMENT.ID}/onnx_checkpoints"
+        onnx_cb = ONNXExportCallback(export_interval=onnx_interval, output_dir=onnx_dir)
+        callbacks.append(onnx_cb)
+        print(f"Added ONNX export callback - models will be saved to {onnx_dir}")
     
     # Create trainer
     trainer = Trainer(
@@ -640,7 +876,7 @@ def main(checkpoint, nuscenes, epochs, batch_size, lr, gpus, debug, num_workers)
         accelerator="ddp" if cfg.TRAIN.N_GPUS > 1 else None,
         logger=tb_logger,
         max_epochs=cfg.TRAIN.MAX_EPOCH,
-        callbacks=[lr_monitor, pq_ckpt, iou_ckpt],
+        callbacks=callbacks,
         log_every_n_steps=1,
         gradient_clip_val=0.5,
         accumulate_grad_batches=cfg.TRAIN.BATCH_ACC,
