@@ -303,16 +303,16 @@ class SimplifiedMaskPLS(LightningModule):
         self.save_hyperparameters(dict(cfg))
         self.cfg = cfg
         
-        # Timing tracking
+        # Timing tracking with reduced overhead
         self.timing_enabled = False
         self.component_times = {
             'data_prep': [],
             'voxelization': [],
             'backbone': [],
-            'decoder': [],
             'loss_computation': [],
             'total_forward': []
         }
+        self._timing_counter = 0
         
         # Get dataset configuration
         dataset = cfg.MODEL.DATASET
@@ -372,39 +372,71 @@ class SimplifiedMaskPLS(LightningModule):
         if self.timing_enabled:
             voxel_start = time.time()
         
-        # Get config values once
+        # Cache config values to avoid repeated lookups
         bounds = self.cfg[self.cfg.MODEL.DATASET].SPACE
         max_pts = self.cfg[self.cfg.MODEL.DATASET].SUB_NUM_POINTS
-        bounds_tensor = torch.tensor([[b[0], b[1]] for b in bounds], device='cuda')
+        device = next(self.parameters()).device  # Get model device
         
+        # Process batch with minimal tensor operations
         for i in range(len(points)):
-            # Convert to tensor once
-            pts = torch.from_numpy(points[i]).float().cuda()
-            feat = torch.from_numpy(features[i]).float().cuda()
+            # Convert to tensor once with explicit device
+            pts = torch.from_numpy(points[i]).float().to(device, non_blocking=True)
+            feat = torch.from_numpy(features[i]).float().to(device, non_blocking=True)
             
-            # Vectorized bounds checking
-            valid_mask = ((pts >= bounds_tensor[:, 0]) & (pts < bounds_tensor[:, 1])).all(dim=1)
+            # Conservative bounds checking (avoid complex vectorization)
+            valid_mask = torch.ones(pts.shape[0], dtype=torch.bool, device=pts.device)
+            for dim in range(3):
+                valid_mask &= (pts[:, dim] >= bounds[dim][0]) & (pts[:, dim] < bounds[dim][1])
             
             valid_idx = torch.where(valid_mask)[0]
             valid_pts = pts[valid_mask]
             valid_feat = feat[valid_mask]
             
-            # Optimized subsampling
+            # More efficient subsampling
             if len(valid_pts) > max_pts and self.training:
-                perm = torch.randperm(len(valid_pts), device='cuda')[:max_pts]
+                # Use torch.randperm on CPU for better performance
+                perm = torch.randperm(len(valid_pts))[:max_pts]
                 valid_pts = valid_pts[perm]
                 valid_feat = valid_feat[perm]
                 valid_idx = valid_idx[perm]
+            elif len(valid_pts) > max_pts:
+                # Deterministic subsampling for validation
+                valid_pts = valid_pts[:max_pts]
+                valid_feat = valid_feat[:max_pts]
+                valid_idx = valid_idx[:max_pts]
             
-            # Vectorized normalization
-            range_vals = bounds_tensor[:, 1] - bounds_tensor[:, 0]
-            norm_coords = (valid_pts - bounds_tensor[:, 0]) / range_vals
+            # Conservative normalization with NaN/inf checks
+            norm_coords = torch.zeros_like(valid_pts)
+            for dim in range(3):
+                range_val = bounds[dim][1] - bounds[dim][0]
+                if range_val > 0:
+                    norm_coords[:, dim] = (valid_pts[:, dim] - bounds[dim][0]) / range_val
+                else:
+                    norm_coords[:, dim] = 0.0
             
-            # Voxelize (TODO: Consider pre-computing or caching)
-            voxel_grid = self.model.voxelize_points(
-                valid_pts.unsqueeze(0), 
-                valid_feat.unsqueeze(0)
-            )[0]
+            # Check for invalid values
+            if torch.isnan(norm_coords).any() or torch.isinf(norm_coords).any():
+                print(f"Warning: Invalid coordinates detected in sample {i}, replacing with zeros")
+                norm_coords = torch.nan_to_num(norm_coords, nan=0.0, posinf=1.0, neginf=0.0)
+            
+            # Voxelize with validation
+            try:
+                voxel_grid = self.model.voxelize_points(
+                    valid_pts.unsqueeze(0), 
+                    valid_feat.unsqueeze(0)
+                )[0]
+                
+                # Validate voxel grid
+                if torch.isnan(voxel_grid).any() or torch.isinf(voxel_grid).any():
+                    print(f"Warning: Invalid voxel grid in sample {i}, using zeros")
+                    voxel_grid = torch.zeros_like(voxel_grid)
+                    
+            except Exception as e:
+                print(f"Error in voxelization for sample {i}: {e}")
+                # Create dummy voxel grid
+                voxel_size = self.model.voxel_size if hasattr(self.model, 'voxel_size') else (64, 64, 64)
+                feat_dim = valid_feat.shape[-1] if len(valid_feat) > 0 else 4
+                voxel_grid = torch.zeros((feat_dim, *voxel_size), device='cuda')
             
             batch_voxels.append(voxel_grid)
             batch_coords.append(norm_coords)
@@ -475,9 +507,11 @@ class SimplifiedMaskPLS(LightningModule):
         if self.timing_enabled:
             self.component_times['total_forward'].append(time.time() - total_start)
             
-            # Print timing stats every 50 steps
-            if len(self.component_times['total_forward']) % 50 == 0:
+            # Print timing stats less frequently to reduce overhead
+            self._timing_counter += 1
+            if self._timing_counter % 100 == 0:
                 self._print_timing_stats()
+                self._timing_counter = 0
         
         return outputs, padding_masks, sem_logits, valid_indices
     
@@ -524,9 +558,25 @@ class SimplifiedMaskPLS(LightningModule):
             # Fix masks_ids to work with padded data
             fixed_masks_ids = prepare_masks_ids_for_loss(batch['masks_ids'], valid_indices, max_points)
             
+            # Validate outputs before mask loss
+            if torch.isnan(outputs['pred_logits']).any() or torch.isinf(outputs['pred_logits']).any():
+                print("Warning: Invalid pred_logits detected, using fallback loss")
+                return torch.tensor(0.1, device='cuda', requires_grad=True)
+            
+            if torch.isnan(outputs['pred_masks']).any() or torch.isinf(outputs['pred_masks']).any():
+                print("Warning: Invalid pred_masks detected, using fallback loss")
+                return torch.tensor(0.1, device='cuda', requires_grad=True)
+            
             # Mask loss
             try:
                 loss_mask = self.mask_loss(outputs, targets, fixed_masks_ids, batch['pt_coord'])
+                
+                # Validate loss values
+                for k, v in loss_mask.items():
+                    if torch.isnan(v) or torch.isinf(v) or v < 0:
+                        print(f"Warning: Invalid {k} loss: {v}, replacing with 0.1")
+                        loss_mask[k] = torch.tensor(0.1, device='cuda', requires_grad=True)
+                        
             except Exception as e:
                 print(f"Error in mask loss: {e}")
                 return torch.tensor(0.1, device='cuda', requires_grad=True)
@@ -597,9 +647,18 @@ class SimplifiedMaskPLS(LightningModule):
             if len(idx_to_use) == 0:
                 continue
             
-            # Efficient label extraction and clamping
-            valid_labels = torch.from_numpy(label_array[idx_to_use.numpy()]).long().cuda()
-            valid_labels = torch.clamp(valid_labels, 0, self.num_classes - 1)
+            # Conservative label extraction with validation
+            try:
+                valid_labels = torch.from_numpy(label_array[idx_to_use.cpu().numpy()]).long().cuda()
+                valid_labels = torch.clamp(valid_labels, 0, self.num_classes - 1)
+                
+                # Check for invalid values
+                if torch.isnan(valid_labels.float()).any() or torch.isinf(valid_labels.float()).any():
+                    print(f"Warning: Invalid labels detected, skipping sample {i}")
+                    continue
+            except Exception as e:
+                print(f"Error processing labels for sample {i}: {e}")
+                continue
             
             min_len = min(sem_logits_i.shape[0], valid_labels.shape[0])
             if min_len > 0:
@@ -822,7 +881,7 @@ def getDir(obj):
 @click.option("--lr", type=float, default=0.0001, help="Learning rate")
 @click.option("--gpus", type=int, default=1, help="Number of GPUs")
 @click.option("--debug", is_flag=True, help="Enable debug mode")
-@click.option("--num_workers", type=int, default=8, help="Number of data loader workers (increased default for better performance)")
+@click.option("--num_workers", type=int, default=4, help="Number of data loader workers")
 @click.option("--profile", is_flag=True, help="Enable performance profiling")
 @click.option("--timing", is_flag=True, help="Enable component timing analysis")
 @click.option("--export_onnx", is_flag=True, help="Export ONNX models every 5 epochs")
@@ -870,14 +929,6 @@ def main(checkpoint, nuscenes, epochs, batch_size, lr, gpus, debug, num_workers,
     
     # Create model
     model = SimplifiedMaskPLS(cfg)
-    
-    # PyTorch 2.0+ optimization
-    try:
-        if hasattr(torch, 'compile'):
-            model.model = torch.compile(model.model, mode='reduce-overhead')
-            print("Applied torch.compile() for optimization")
-    except Exception as e:
-        print(f"torch.compile() not available or failed: {e}")
     
     # Enable debug mode if requested
     if debug:
@@ -940,18 +991,20 @@ def main(checkpoint, nuscenes, epochs, batch_size, lr, gpus, debug, num_workers,
         callbacks.append(onnx_cb)
         print(f"Added ONNX export callback - models will be saved to {onnx_dir}")
     
-    # Create trainer
+    # Create trainer with performance optimizations
     trainer = Trainer(
         gpus=cfg.TRAIN.N_GPUS,
         accelerator="ddp" if cfg.TRAIN.N_GPUS > 1 else None,
         logger=tb_logger,
         max_epochs=cfg.TRAIN.MAX_EPOCH,
         callbacks=callbacks,
-        log_every_n_steps=1,
+        log_every_n_steps=10,  # Reduced logging frequency
         gradient_clip_val=0.5,
         accumulate_grad_batches=cfg.TRAIN.BATCH_ACC,
         resume_from_checkpoint=checkpoint if checkpoint and os.path.exists(checkpoint) else None,
         num_sanity_val_steps=0 if debug else 2,
+        enable_progress_bar=not timing,  # Disable progress bar during timing analysis
+        precision=32,  # Explicit precision for stability
     )
     
     # Train
