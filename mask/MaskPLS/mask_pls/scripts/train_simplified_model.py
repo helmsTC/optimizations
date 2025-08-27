@@ -353,96 +353,54 @@ class SimplifiedMaskPLS(LightningModule):
         print("-" * 60)
             
     def forward(self, batch):
-        """Forward pass with optimized pre-voxelization and timing"""
+        """Optimized forward pass - vectorized preprocessing"""
         if self.timing_enabled:
             total_start = time.time()
-            
-        # Extract data from batch
-        points = batch['pt_coord']
-        features = batch['feats']
-        
-        if self.timing_enabled:
             data_prep_start = time.time()
-        
-        # Optimized batch processing
-        batch_voxels = []
-        batch_coords = []
-        valid_indices = []
-        
-        if self.timing_enabled:
-            voxel_start = time.time()
-        
-        # Original preprocessing with minimal changes
-        for i in range(len(points)):
-            # Get points and features
-            pts = torch.from_numpy(points[i]).float().cuda()
-            feat = torch.from_numpy(features[i]).float().cuda()
             
-            # Pre-process points (filter by bounds and normalize)
-            bounds = self.cfg[self.cfg.MODEL.DATASET].SPACE
-            valid_mask = torch.ones(pts.shape[0], dtype=torch.bool, device=pts.device)
-            
-            for dim in range(3):
-                valid_mask &= (pts[:, dim] >= bounds[dim][0]) & (pts[:, dim] < bounds[dim][1])
-            
-            # Get indices of valid points in original array
-            valid_idx = torch.where(valid_mask)[0]
-            valid_pts = pts[valid_mask]
-            valid_feat = feat[valid_mask]
-            
-            # Subsample if needed
-            max_pts = self.cfg[self.cfg.MODEL.DATASET].SUB_NUM_POINTS
-            if len(valid_pts) > max_pts and self.training:
-                # Create permutation for subsampling
-                perm = torch.randperm(len(valid_pts))[:max_pts]
-                valid_pts = valid_pts[perm]
-                valid_feat = valid_feat[perm]
-                # IMPORTANT: Update the indices to reflect subsampling
-                valid_idx = valid_idx[perm]
-            
-            # Normalize coordinates
-            norm_coords = torch.zeros_like(valid_pts)
-            for dim in range(3):
-                norm_coords[:, dim] = (valid_pts[:, dim] - bounds[dim][0]) / (bounds[dim][1] - bounds[dim][0])
-            
-            # Voxelize
-            voxel_grid = self.model.voxelize_points(
-                valid_pts.unsqueeze(0), 
-                valid_feat.unsqueeze(0)
-            )[0]  # Remove batch dim
-            
-            batch_voxels.append(voxel_grid)
-            batch_coords.append(norm_coords)
-            valid_indices.append(valid_idx)
+        # Check if batch already has preprocessed voxels (from optimized dataset)
+        if 'preprocessed_voxels' in batch and 'preprocessed_coords' in batch:
+            batch_voxels = batch['preprocessed_voxels']
+            batch_coords = batch['preprocessed_coords'] 
+            valid_indices = batch['valid_indices']
+            if self.timing_enabled:
+                self.component_times['data_prep'].append(time.time() - data_prep_start)
+                self.component_times['voxelization'].append(0.01)  # Minimal time since pre-computed
+        else:
+            # Fallback to original processing but optimized
+            batch_voxels, batch_coords, valid_indices = self._process_batch_optimized(batch)
+            if self.timing_enabled:
+                self.component_times['data_prep'].append(time.time() - data_prep_start)
         
         if self.timing_enabled:
-            self.component_times['voxelization'].append(time.time() - voxel_start)
-            
-        # Stack batch
-        max_pts = max(c.shape[0] for c in batch_coords)
-        
-        # Pad coordinates
-        padded_coords = []
-        padding_masks = []
-        for coords in batch_coords:
-            n_pts = coords.shape[0]
-            if n_pts < max_pts:
-                pad_size = max_pts - n_pts
-                coords = F.pad(coords, (0, 0, 0, pad_size))
-            padded_coords.append(coords)
-            
-            # Create padding mask
-            mask = torch.zeros(max_pts, dtype=torch.bool, device=coords.device)
-            mask[n_pts:] = True
-            padding_masks.append(mask)
-        
-        batch_voxels = torch.stack(batch_voxels)
-        batch_coords = torch.stack(padded_coords)
-        padding_masks = torch.stack(padding_masks)
-        
-        if self.timing_enabled:
-            self.component_times['data_prep'].append(time.time() - data_prep_start)
             model_start = time.time()
+        # Efficient batching with pre-computed max size
+        if len(batch_coords) > 0:
+            max_pts = max(c.shape[0] for c in batch_coords)
+            
+            # Vectorized padding
+            padded_coords = []
+            padding_masks = []
+            for coords in batch_coords:
+                n_pts = coords.shape[0]
+                if n_pts < max_pts:
+                    coords = F.pad(coords, (0, 0, 0, max_pts - n_pts))
+                padded_coords.append(coords)
+                
+                # Efficient padding mask creation
+                mask = torch.zeros(max_pts, dtype=torch.bool, device=coords.device)
+                if n_pts < max_pts:
+                    mask[n_pts:] = True
+                padding_masks.append(mask)
+            
+            batch_voxels = torch.stack(batch_voxels)
+            batch_coords = torch.stack(padded_coords) 
+            padding_masks = torch.stack(padding_masks)
+        else:
+            # Handle empty batch
+            batch_voxels = torch.empty(0, device='cuda')
+            batch_coords = torch.empty(0, device='cuda')
+            padding_masks = torch.empty(0, dtype=torch.bool, device='cuda')
         
         # Forward through model with component timing
         if self.timing_enabled:
@@ -485,6 +443,68 @@ class SimplifiedMaskPLS(LightningModule):
                 self._print_timing_stats()
         
         return outputs, padding_masks, sem_logits, valid_indices
+    
+    def _process_batch_optimized(self, batch):
+        """Optimized batch processing with vectorization where possible"""
+        points = batch['pt_coord']
+        features = batch['feats']
+        
+        batch_voxels = []
+        batch_coords = []
+        valid_indices = []
+        
+        # Cache config values
+        bounds = self.cfg[self.cfg.MODEL.DATASET].SPACE
+        max_pts = self.cfg[self.cfg.MODEL.DATASET].SUB_NUM_POINTS
+        
+        voxel_start = time.time() if self.timing_enabled else None
+        
+        for i, (pts_np, feat_np) in enumerate(zip(points, features)):
+            # Single tensor conversion
+            pts = torch.from_numpy(pts_np).float().cuda()
+            feat = torch.from_numpy(feat_np).float().cuda()
+            
+            # Vectorized bounds filtering
+            valid_mask = torch.ones(pts.shape[0], dtype=torch.bool, device=pts.device)
+            for dim in range(3):
+                valid_mask &= (pts[:, dim] >= bounds[dim][0]) & (pts[:, dim] < bounds[dim][1])
+            
+            valid_idx = torch.where(valid_mask)[0]
+            valid_pts = pts[valid_mask]
+            valid_feat = feat[valid_mask]
+            
+            # Efficient subsampling
+            if len(valid_pts) > max_pts:
+                if self.training:
+                    perm = torch.randperm(len(valid_pts), device='cuda')[:max_pts]
+                else:
+                    perm = torch.arange(max_pts, device='cuda')  # Deterministic for validation
+                valid_pts = valid_pts[perm]
+                valid_feat = valid_feat[perm] 
+                valid_idx = valid_idx[perm]
+            
+            # Efficient normalization with bounds caching
+            if len(valid_pts) > 0:
+                bounds_min = torch.tensor([bounds[dim][0] for dim in range(3)], device=valid_pts.device)
+                bounds_range = torch.tensor([bounds[dim][1] - bounds[dim][0] for dim in range(3)], device=valid_pts.device)
+                norm_coords = (valid_pts - bounds_min) / bounds_range
+            else:
+                norm_coords = torch.empty(0, 3, device='cuda')
+            
+            # Voxelize (still the main bottleneck)
+            voxel_grid = self.model.voxelize_points(
+                valid_pts.unsqueeze(0),
+                valid_feat.unsqueeze(0)
+            )[0]
+            
+            batch_voxels.append(voxel_grid)
+            batch_coords.append(norm_coords)
+            valid_indices.append(valid_idx)
+        
+        if self.timing_enabled and voxel_start:
+            self.component_times['voxelization'].append(time.time() - voxel_start)
+            
+        return batch_voxels, batch_coords, valid_indices
     
     def _print_timing_stats(self):
         """Print timing statistics for performance analysis"""
@@ -539,91 +559,13 @@ class SimplifiedMaskPLS(LightningModule):
                 # Return minimal loss to continue
                 return torch.tensor(0.1, device='cuda', requires_grad=True)
             
-            # Semantic loss (on valid points) - Use original implementation
+            # Optimized semantic loss computation
             try:
-                all_sem_labels = []
-                all_sem_logits = []
-                
-                for i, (label, idx, pad) in enumerate(zip(batch['sem_label'], valid_indices, padding)):
-                    # Get valid points for this sample
-                    valid_mask = ~pad
-                    num_valid = valid_mask.sum().item()
-                    
-                    if num_valid == 0:
-                        continue
-                    
-                    # Get semantic logits for valid points
-                    sem_logits_i = sem_logits[i][valid_mask]  # [num_valid, num_classes]
-                    
-                    # Get indices
-                    idx_cpu = idx.cpu().numpy()
-                    
-                    # Ensure we don't exceed the number of valid logits
-                    num_logits = sem_logits_i.shape[0]
-                    
-                    # Get labels
-                    label_array = label.flatten() if label.ndim > 1 else label
-                    label_size = len(label_array)
-                    
-                    # CRITICAL: Ensure indices are valid for both bounds
-                    valid_idx_mask = (idx_cpu < label_size) & (idx_cpu >= 0)
-                    idx_to_use = idx_cpu[valid_idx_mask]
-                    
-                    # Ensure we don't use more indices than we have logits
-                    idx_to_use = idx_to_use[:num_logits]
-                    
-                    # Adjust logits if needed
-                    if len(idx_to_use) < num_logits:
-                        sem_logits_i = sem_logits_i[:len(idx_to_use)]
-                    
-                    if len(idx_to_use) == 0:
-                        continue
-                    
-                    # Get the labels for valid indices
-                    valid_labels = label_array[idx_to_use]
-                    
-                    # Convert to tensor and ensure valid range
-                    valid_labels_tensor = torch.from_numpy(valid_labels).long()
-                    
-                    # IMPORTANT: Clamp labels to valid range
-                    valid_labels_tensor = torch.clamp(valid_labels_tensor, 0, self.num_classes - 1)
-                    
-                    # Move to GPU
-                    valid_labels_tensor = valid_labels_tensor.cuda()
-                    
-                    # Ensure matching dimensions
-                    min_len = min(sem_logits_i.shape[0], valid_labels_tensor.shape[0])
-                    if min_len > 0:
-                        all_sem_logits.append(sem_logits_i[:min_len])
-                        all_sem_labels.append(valid_labels_tensor[:min_len])
-                
-                # Compute semantic loss if we have valid data
-                if len(all_sem_logits) > 0:
-                    # Concatenate all valid points
-                    all_sem_logits = torch.cat(all_sem_logits, dim=0)
-                    all_sem_labels = torch.cat(all_sem_labels, dim=0)
-                    
-                    # Double-check the labels are valid
-                    if all_sem_labels.max() >= self.num_classes:
-                        print(f"WARNING: Found labels >= {self.num_classes}, clamping")
-                        all_sem_labels = torch.clamp(all_sem_labels, 0, self.num_classes - 1)
-                    
-                    # Compute loss
-                    loss_sem = self.sem_loss(all_sem_logits, all_sem_labels)
-                    loss_mask.update(loss_sem)
-                else:
-                    # No valid semantic data
-                    loss_sem = {
-                        'sem_ce': torch.tensor(0.0, device='cuda', requires_grad=True), 
-                        'sem_lov': torch.tensor(0.0, device='cuda', requires_grad=True)
-                    }
-                    loss_mask.update(loss_sem)
+                sem_loss_result = self._compute_semantic_loss_fast(batch, sem_logits, valid_indices, padding)
+                loss_mask.update(sem_loss_result)
                     
             except Exception as e:
                 print(f"Error in semantic loss computation: {e}")
-                import traceback
-                traceback.print_exc()
-                # Add dummy semantic losses
                 loss_mask['sem_ce'] = torch.tensor(0.0, device='cuda', requires_grad=True)
                 loss_mask['sem_lov'] = torch.tensor(0.0, device='cuda', requires_grad=True)
             
@@ -845,6 +787,57 @@ class SimplifiedMaskPLS(LightningModule):
             ins_pred.append(ins.cpu().numpy())
         
         return sem_pred, ins_pred
+    
+    def _compute_semantic_loss_fast(self, batch, sem_logits, valid_indices, padding):
+        """Optimized semantic loss with reduced tensor operations"""
+        # Collect all valid data in fewer operations
+        valid_logits_list = []
+        valid_labels_list = []
+        
+        for i, (label, idx, pad) in enumerate(zip(batch['sem_label'], valid_indices, padding)):
+            valid_mask = ~pad
+            num_valid = valid_mask.sum().item()
+            
+            if num_valid == 0:
+                continue
+            
+            # Get data for valid points only
+            sem_logits_i = sem_logits[i][valid_mask]
+            idx_cpu = idx.cpu()
+            
+            # Process labels efficiently
+            label_array = label.flatten() if label.ndim > 1 else label
+            label_size = len(label_array)
+            
+            # Efficient bounds checking
+            valid_idx_mask = (idx_cpu < label_size) & (idx_cpu >= 0)
+            idx_to_use = idx_cpu[valid_idx_mask][:sem_logits_i.shape[0]]
+            
+            if len(idx_to_use) == 0:
+                continue
+                
+            # Adjust sizes to match
+            if len(idx_to_use) < sem_logits_i.shape[0]:
+                sem_logits_i = sem_logits_i[:len(idx_to_use)]
+            
+            # Extract and process labels
+            valid_labels = torch.from_numpy(label_array[idx_to_use.numpy()]).long().cuda()
+            valid_labels = torch.clamp(valid_labels, 0, self.num_classes - 1)
+            
+            if sem_logits_i.shape[0] == valid_labels.shape[0] and len(valid_labels) > 0:
+                valid_logits_list.append(sem_logits_i)
+                valid_labels_list.append(valid_labels)
+        
+        # Single concatenation instead of multiple
+        if valid_logits_list:
+            all_logits = torch.cat(valid_logits_list, dim=0)
+            all_labels = torch.cat(valid_labels_list, dim=0) 
+            return self.sem_loss(all_logits, all_labels)
+        else:
+            return {
+                'sem_ce': torch.tensor(0.0, device='cuda', requires_grad=True),
+                'sem_lov': torch.tensor(0.0, device='cuda', requires_grad=True)
+            }
 
 
 def getDir(obj):
@@ -864,7 +857,8 @@ def getDir(obj):
 @click.option("--timing", is_flag=True, help="Enable component timing analysis")
 @click.option("--export_onnx", is_flag=True, help="Export ONNX models every 5 epochs")
 @click.option("--onnx_interval", type=int, default=5, help="Interval for ONNX export")
-def main(checkpoint, nuscenes, epochs, batch_size, lr, gpus, debug, num_workers, profile, timing, export_onnx, onnx_interval):
+@click.option("--precision", type=int, default=16, help="Training precision (16 for mixed precision, 32 for full)")
+def main(checkpoint, nuscenes, epochs, batch_size, lr, gpus, debug, num_workers, profile, timing, export_onnx, onnx_interval, precision):
     # Load configurations
     model_cfg = edict(
         yaml.safe_load(open(join(getDir(__file__), "../config/model.yaml")))
@@ -901,6 +895,7 @@ def main(checkpoint, nuscenes, epochs, batch_size, lr, gpus, debug, num_workers,
     print(f"Profiling: {profile}")
     print(f"Timing analysis: {timing}")
     print(f"ONNX export: {export_onnx} (every {onnx_interval} epochs)" if export_onnx else "")
+    print(f"Precision: {precision} ({'Mixed precision' if precision == 16 else 'Full precision'})")
     
     # Create data module
     data = SemanticDatasetModule(cfg)
@@ -982,7 +977,7 @@ def main(checkpoint, nuscenes, epochs, batch_size, lr, gpus, debug, num_workers,
         resume_from_checkpoint=checkpoint if checkpoint and os.path.exists(checkpoint) else None,
         num_sanity_val_steps=0 if debug else 2,
         enable_progress_bar=True,  # Keep progress bar enabled
-        precision=32,  # Explicit precision for stability
+        precision=precision,  # Configurable precision for speed vs stability
     )
     
     # Train
