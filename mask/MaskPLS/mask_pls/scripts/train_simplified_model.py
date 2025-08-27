@@ -886,7 +886,7 @@ def getDir(obj):
 @click.option("--skip_val", is_flag=True, help="Skip validation during training for speed")
 @click.option("--fast_mode", is_flag=True, help="Enable smart optimizations for large point clouds")
 @click.option("--chunk_size", type=int, default=None, help="Process point clouds in chunks (for very large clouds)")
-def main(checkpoint, nuscenes, epochs, batch_size, lr, gpus, debug, num_workers, profile, timing, export_onnx, onnx_interval, precision, max_points, skip_val, fast_mode):
+def main(checkpoint, nuscenes, epochs, batch_size, lr, gpus, debug, num_workers, profile, timing, export_onnx, onnx_interval, precision, max_points, skip_val, fast_mode, chunk_size):
     # Load configurations
     model_cfg = edict(
         yaml.safe_load(open(join(getDir(__file__), "../config/model.yaml")))
@@ -964,16 +964,35 @@ def main(checkpoint, nuscenes, epochs, batch_size, lr, gpus, debug, num_workers,
     # Create optimized data module
     data = SemanticDatasetModule(cfg)
     
-    # Apply dataloader optimizations
+    # Apply dataloader optimizations by overriding the train_dataloader method
     if hasattr(data, 'train_dataloader'):
         original_train_dataloader = data.train_dataloader
         def optimized_train_dataloader():
-            loader = original_train_dataloader()
-            # Add prefetch_factor and pin_memory for GPU transfer speedup
-            loader.prefetch_factor = 4 if cfg.TRAIN.NUM_WORKERS > 0 else 2
-            loader.pin_memory = True
-            loader.persistent_workers = True if cfg.TRAIN.NUM_WORKERS > 0 else False
-            return loader
+            from torch.utils.data import DataLoader
+            from mask_pls.datasets.semantic_dataset import BatchCollation
+            
+            dataset = data.train_mask_set
+            collate_fn = BatchCollation()
+            
+            # Create optimized DataLoader with performance settings
+            dataloader_kwargs = {
+                'dataset': dataset,
+                'batch_size': cfg.TRAIN.BATCH_SIZE,
+                'collate_fn': collate_fn,
+                'shuffle': True,
+                'num_workers': cfg.TRAIN.NUM_WORKERS,
+                'pin_memory': True,
+                'drop_last': False,
+                'timeout': 0,
+            }
+            
+            # Add performance optimizations only if workers > 0
+            if cfg.TRAIN.NUM_WORKERS > 0:
+                dataloader_kwargs['prefetch_factor'] = 4
+                dataloader_kwargs['persistent_workers'] = True
+            
+            return DataLoader(**dataloader_kwargs)
+            
         data.train_dataloader = optimized_train_dataloader
     
     # Create model with optimizations
