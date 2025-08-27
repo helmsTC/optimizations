@@ -303,16 +303,16 @@ class SimplifiedMaskPLS(LightningModule):
         self.save_hyperparameters(dict(cfg))
         self.cfg = cfg
         
-        # Timing tracking with reduced overhead
+        # Timing tracking
         self.timing_enabled = False
         self.component_times = {
             'data_prep': [],
             'voxelization': [],
             'backbone': [],
+            'decoder': [],
             'loss_computation': [],
             'total_forward': []
         }
-        self._timing_counter = 0
         
         # Get dataset configuration
         dataset = cfg.MODEL.DATASET
@@ -372,71 +372,44 @@ class SimplifiedMaskPLS(LightningModule):
         if self.timing_enabled:
             voxel_start = time.time()
         
-        # Cache config values to avoid repeated lookups
-        bounds = self.cfg[self.cfg.MODEL.DATASET].SPACE
-        max_pts = self.cfg[self.cfg.MODEL.DATASET].SUB_NUM_POINTS
-        device = next(self.parameters()).device  # Get model device
-        
-        # Process batch with minimal tensor operations
+        # Original preprocessing with minimal changes
         for i in range(len(points)):
-            # Convert to tensor once with explicit device
-            pts = torch.from_numpy(points[i]).float().to(device, non_blocking=True)
-            feat = torch.from_numpy(features[i]).float().to(device, non_blocking=True)
+            # Get points and features
+            pts = torch.from_numpy(points[i]).float().cuda()
+            feat = torch.from_numpy(features[i]).float().cuda()
             
-            # Conservative bounds checking (avoid complex vectorization)
+            # Pre-process points (filter by bounds and normalize)
+            bounds = self.cfg[self.cfg.MODEL.DATASET].SPACE
             valid_mask = torch.ones(pts.shape[0], dtype=torch.bool, device=pts.device)
+            
             for dim in range(3):
                 valid_mask &= (pts[:, dim] >= bounds[dim][0]) & (pts[:, dim] < bounds[dim][1])
             
+            # Get indices of valid points in original array
             valid_idx = torch.where(valid_mask)[0]
             valid_pts = pts[valid_mask]
             valid_feat = feat[valid_mask]
             
-            # More efficient subsampling
+            # Subsample if needed
+            max_pts = self.cfg[self.cfg.MODEL.DATASET].SUB_NUM_POINTS
             if len(valid_pts) > max_pts and self.training:
-                # Use torch.randperm on CPU for better performance
+                # Create permutation for subsampling
                 perm = torch.randperm(len(valid_pts))[:max_pts]
                 valid_pts = valid_pts[perm]
                 valid_feat = valid_feat[perm]
+                # IMPORTANT: Update the indices to reflect subsampling
                 valid_idx = valid_idx[perm]
-            elif len(valid_pts) > max_pts:
-                # Deterministic subsampling for validation
-                valid_pts = valid_pts[:max_pts]
-                valid_feat = valid_feat[:max_pts]
-                valid_idx = valid_idx[:max_pts]
             
-            # Conservative normalization with NaN/inf checks
+            # Normalize coordinates
             norm_coords = torch.zeros_like(valid_pts)
             for dim in range(3):
-                range_val = bounds[dim][1] - bounds[dim][0]
-                if range_val > 0:
-                    norm_coords[:, dim] = (valid_pts[:, dim] - bounds[dim][0]) / range_val
-                else:
-                    norm_coords[:, dim] = 0.0
+                norm_coords[:, dim] = (valid_pts[:, dim] - bounds[dim][0]) / (bounds[dim][1] - bounds[dim][0])
             
-            # Check for invalid values
-            if torch.isnan(norm_coords).any() or torch.isinf(norm_coords).any():
-                print(f"Warning: Invalid coordinates detected in sample {i}, replacing with zeros")
-                norm_coords = torch.nan_to_num(norm_coords, nan=0.0, posinf=1.0, neginf=0.0)
-            
-            # Voxelize with validation
-            try:
-                voxel_grid = self.model.voxelize_points(
-                    valid_pts.unsqueeze(0), 
-                    valid_feat.unsqueeze(0)
-                )[0]
-                
-                # Validate voxel grid
-                if torch.isnan(voxel_grid).any() or torch.isinf(voxel_grid).any():
-                    print(f"Warning: Invalid voxel grid in sample {i}, using zeros")
-                    voxel_grid = torch.zeros_like(voxel_grid)
-                    
-            except Exception as e:
-                print(f"Error in voxelization for sample {i}: {e}")
-                # Create dummy voxel grid
-                voxel_size = self.model.voxel_size if hasattr(self.model, 'voxel_size') else (64, 64, 64)
-                feat_dim = valid_feat.shape[-1] if len(valid_feat) > 0 else 4
-                voxel_grid = torch.zeros((feat_dim, *voxel_size), device='cuda')
+            # Voxelize
+            voxel_grid = self.model.voxelize_points(
+                valid_pts.unsqueeze(0), 
+                valid_feat.unsqueeze(0)
+            )[0]  # Remove batch dim
             
             batch_voxels.append(voxel_grid)
             batch_coords.append(norm_coords)
@@ -507,11 +480,9 @@ class SimplifiedMaskPLS(LightningModule):
         if self.timing_enabled:
             self.component_times['total_forward'].append(time.time() - total_start)
             
-            # Print timing stats less frequently to reduce overhead
-            self._timing_counter += 1
-            if self._timing_counter % 100 == 0:
+            # Print timing stats every 50 steps
+            if len(self.component_times['total_forward']) % 50 == 0:
                 self._print_timing_stats()
-                self._timing_counter = 0
         
         return outputs, padding_masks, sem_logits, valid_indices
     
@@ -558,36 +529,101 @@ class SimplifiedMaskPLS(LightningModule):
             # Fix masks_ids to work with padded data
             fixed_masks_ids = prepare_masks_ids_for_loss(batch['masks_ids'], valid_indices, max_points)
             
-            # Validate outputs before mask loss
-            if torch.isnan(outputs['pred_logits']).any() or torch.isinf(outputs['pred_logits']).any():
-                print("Warning: Invalid pred_logits detected, using fallback loss")
-                return torch.tensor(0.1, device='cuda', requires_grad=True)
-            
-            if torch.isnan(outputs['pred_masks']).any() or torch.isinf(outputs['pred_masks']).any():
-                print("Warning: Invalid pred_masks detected, using fallback loss")
-                return torch.tensor(0.1, device='cuda', requires_grad=True)
-            
             # Mask loss
             try:
                 loss_mask = self.mask_loss(outputs, targets, fixed_masks_ids, batch['pt_coord'])
-                
-                # Validate loss values
-                for k, v in loss_mask.items():
-                    if torch.isnan(v) or torch.isinf(v) or v < 0:
-                        print(f"Warning: Invalid {k} loss: {v}, replacing with 0.1")
-                        loss_mask[k] = torch.tensor(0.1, device='cuda', requires_grad=True)
-                        
             except Exception as e:
                 print(f"Error in mask loss: {e}")
+                print(f"pred_masks shape: {outputs['pred_masks'].shape}")
+                print(f"target masks shapes: {[t.shape for t in targets['masks']]}")
+                # Return minimal loss to continue
                 return torch.tensor(0.1, device='cuda', requires_grad=True)
             
-            # Optimized semantic loss computation
+            # Semantic loss (on valid points) - Use original implementation
             try:
-                sem_loss_result = self._compute_semantic_loss_optimized(batch, sem_logits, valid_indices, padding)
-                loss_mask.update(sem_loss_result)
+                all_sem_labels = []
+                all_sem_logits = []
+                
+                for i, (label, idx, pad) in enumerate(zip(batch['sem_label'], valid_indices, padding)):
+                    # Get valid points for this sample
+                    valid_mask = ~pad
+                    num_valid = valid_mask.sum().item()
+                    
+                    if num_valid == 0:
+                        continue
+                    
+                    # Get semantic logits for valid points
+                    sem_logits_i = sem_logits[i][valid_mask]  # [num_valid, num_classes]
+                    
+                    # Get indices
+                    idx_cpu = idx.cpu().numpy()
+                    
+                    # Ensure we don't exceed the number of valid logits
+                    num_logits = sem_logits_i.shape[0]
+                    
+                    # Get labels
+                    label_array = label.flatten() if label.ndim > 1 else label
+                    label_size = len(label_array)
+                    
+                    # CRITICAL: Ensure indices are valid for both bounds
+                    valid_idx_mask = (idx_cpu < label_size) & (idx_cpu >= 0)
+                    idx_to_use = idx_cpu[valid_idx_mask]
+                    
+                    # Ensure we don't use more indices than we have logits
+                    idx_to_use = idx_to_use[:num_logits]
+                    
+                    # Adjust logits if needed
+                    if len(idx_to_use) < num_logits:
+                        sem_logits_i = sem_logits_i[:len(idx_to_use)]
+                    
+                    if len(idx_to_use) == 0:
+                        continue
+                    
+                    # Get the labels for valid indices
+                    valid_labels = label_array[idx_to_use]
+                    
+                    # Convert to tensor and ensure valid range
+                    valid_labels_tensor = torch.from_numpy(valid_labels).long()
+                    
+                    # IMPORTANT: Clamp labels to valid range
+                    valid_labels_tensor = torch.clamp(valid_labels_tensor, 0, self.num_classes - 1)
+                    
+                    # Move to GPU
+                    valid_labels_tensor = valid_labels_tensor.cuda()
+                    
+                    # Ensure matching dimensions
+                    min_len = min(sem_logits_i.shape[0], valid_labels_tensor.shape[0])
+                    if min_len > 0:
+                        all_sem_logits.append(sem_logits_i[:min_len])
+                        all_sem_labels.append(valid_labels_tensor[:min_len])
+                
+                # Compute semantic loss if we have valid data
+                if len(all_sem_logits) > 0:
+                    # Concatenate all valid points
+                    all_sem_logits = torch.cat(all_sem_logits, dim=0)
+                    all_sem_labels = torch.cat(all_sem_labels, dim=0)
+                    
+                    # Double-check the labels are valid
+                    if all_sem_labels.max() >= self.num_classes:
+                        print(f"WARNING: Found labels >= {self.num_classes}, clamping")
+                        all_sem_labels = torch.clamp(all_sem_labels, 0, self.num_classes - 1)
+                    
+                    # Compute loss
+                    loss_sem = self.sem_loss(all_sem_logits, all_sem_labels)
+                    loss_mask.update(loss_sem)
+                else:
+                    # No valid semantic data
+                    loss_sem = {
+                        'sem_ce': torch.tensor(0.0, device='cuda', requires_grad=True), 
+                        'sem_lov': torch.tensor(0.0, device='cuda', requires_grad=True)
+                    }
+                    loss_mask.update(loss_sem)
                     
             except Exception as e:
                 print(f"Error in semantic loss computation: {e}")
+                import traceback
+                traceback.print_exc()
+                # Add dummy semantic losses
                 loss_mask['sem_ce'] = torch.tensor(0.0, device='cuda', requires_grad=True)
                 loss_mask['sem_lov'] = torch.tensor(0.0, device='cuda', requires_grad=True)
             
@@ -616,64 +652,6 @@ class SimplifiedMaskPLS(LightningModule):
             print(f"\nUnexpected error in training_step: {type(e).__name__}: {e}")
             return torch.tensor(0.1, device='cuda', requires_grad=True)
     
-    def _compute_semantic_loss_optimized(self, batch, sem_logits, valid_indices, padding):
-        """Optimized semantic loss computation"""
-        all_sem_labels = []
-        all_sem_logits = []
-        
-        for i, (label, idx, pad) in enumerate(zip(batch['sem_label'], valid_indices, padding)):
-            valid_mask = ~pad
-            num_valid = valid_mask.sum().item()
-            
-            if num_valid == 0:
-                continue
-            
-            sem_logits_i = sem_logits[i][valid_mask]
-            idx_cpu = idx.cpu()
-            
-            # Vectorized bounds checking
-            label_array = label.flatten() if label.ndim > 1 else label
-            label_size = len(label_array)
-            
-            valid_idx_mask = (idx_cpu < label_size) & (idx_cpu >= 0)
-            idx_to_use = idx_cpu[valid_idx_mask]
-            
-            num_logits = sem_logits_i.shape[0]
-            idx_to_use = idx_to_use[:num_logits]
-            
-            if len(idx_to_use) < num_logits:
-                sem_logits_i = sem_logits_i[:len(idx_to_use)]
-            
-            if len(idx_to_use) == 0:
-                continue
-            
-            # Conservative label extraction with validation
-            try:
-                valid_labels = torch.from_numpy(label_array[idx_to_use.cpu().numpy()]).long().cuda()
-                valid_labels = torch.clamp(valid_labels, 0, self.num_classes - 1)
-                
-                # Check for invalid values
-                if torch.isnan(valid_labels.float()).any() or torch.isinf(valid_labels.float()).any():
-                    print(f"Warning: Invalid labels detected, skipping sample {i}")
-                    continue
-            except Exception as e:
-                print(f"Error processing labels for sample {i}: {e}")
-                continue
-            
-            min_len = min(sem_logits_i.shape[0], valid_labels.shape[0])
-            if min_len > 0:
-                all_sem_logits.append(sem_logits_i[:min_len])
-                all_sem_labels.append(valid_labels[:min_len])
-        
-        if len(all_sem_logits) > 0:
-            all_sem_logits = torch.cat(all_sem_logits, dim=0)
-            all_sem_labels = torch.cat(all_sem_labels, dim=0)
-            return self.sem_loss(all_sem_logits, all_sem_labels)
-        else:
-            return {
-                'sem_ce': torch.tensor(0.0, device='cuda', requires_grad=True),
-                'sem_lov': torch.tensor(0.0, device='cuda', requires_grad=True)
-            }
     
     def validation_step(self, batch, batch_idx):
         try:
@@ -998,12 +976,12 @@ def main(checkpoint, nuscenes, epochs, batch_size, lr, gpus, debug, num_workers,
         logger=tb_logger,
         max_epochs=cfg.TRAIN.MAX_EPOCH,
         callbacks=callbacks,
-        log_every_n_steps=10,  # Reduced logging frequency
+        log_every_n_steps=1,
         gradient_clip_val=0.5,
         accumulate_grad_batches=cfg.TRAIN.BATCH_ACC,
         resume_from_checkpoint=checkpoint if checkpoint and os.path.exists(checkpoint) else None,
         num_sanity_val_steps=0 if debug else 2,
-        enable_progress_bar=not timing,  # Disable progress bar during timing analysis
+        enable_progress_bar=True,  # Keep progress bar enabled
         precision=32,  # Explicit precision for stability
     )
     
