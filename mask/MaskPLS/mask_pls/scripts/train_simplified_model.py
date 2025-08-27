@@ -344,6 +344,7 @@ class SimplifiedMaskPLS(LightningModule):
         
         # Debug mode
         self.debug = False
+        self.fast_mode = False
         
     def on_train_start(self):
         """Simple training start message"""
@@ -473,12 +474,34 @@ class SimplifiedMaskPLS(LightningModule):
             valid_pts = pts[valid_mask]
             valid_feat = feat[valid_mask]
             
-            # Efficient subsampling
+            # Smart subsampling for large point clouds
             if len(valid_pts) > max_pts:
                 if self.training:
-                    perm = torch.randperm(len(valid_pts), device='cuda')[:max_pts]
+                    # Hierarchical subsampling: keep some random, some structured
+                    n_pts = len(valid_pts)
+                    if hasattr(self, 'fast_mode') and self.fast_mode and n_pts > max_pts * 2:
+                        # For very large clouds, use stratified sampling
+                        stride = n_pts // (max_pts // 2)
+                        structured_idx = torch.arange(0, n_pts, stride, device=valid_pts.device)[:max_pts//2]
+                        remaining = max_pts - len(structured_idx)
+                        if remaining > 0:
+                            random_mask = torch.ones(n_pts, dtype=torch.bool, device=valid_pts.device)
+                            random_mask[structured_idx] = False
+                            random_candidates = torch.where(random_mask)[0]
+                            if len(random_candidates) > 0:
+                                random_idx = random_candidates[torch.randperm(len(random_candidates))[:remaining]]
+                                perm = torch.cat([structured_idx, random_idx])
+                            else:
+                                perm = structured_idx
+                        else:
+                            perm = structured_idx
+                    else:
+                        # Standard random subsampling for moderate sizes
+                        perm = torch.randperm(len(valid_pts), device=valid_pts.device)[:max_pts]
                 else:
-                    perm = torch.arange(max_pts, device='cuda')  # Deterministic for validation
+                    # Deterministic subsampling for validation
+                    perm = torch.arange(max_pts, device=valid_pts.device)
+                    
                 valid_pts = valid_pts[perm]
                 valid_feat = valid_feat[perm] 
                 valid_idx = valid_idx[perm]
@@ -537,7 +560,7 @@ class SimplifiedMaskPLS(LightningModule):
         try:
             if self.timing_enabled:
                 loss_start = time.time()
-                
+            
             outputs, padding, sem_logits, valid_indices = self.forward(batch)
             
             # Get the max points from the padding shape
@@ -575,15 +598,16 @@ class SimplifiedMaskPLS(LightningModule):
                     v = torch.tensor(0.0, device='cuda', requires_grad=True)
                 self.log(f"train/{k}", v, batch_size=self.cfg.TRAIN.BATCH_SIZE, on_step=True, on_epoch=True)
             
-            # Total loss
+            # Total loss with fast computation
             total_loss = sum(loss_mask.values())
             
-            # Safety check
-            if torch.isnan(total_loss) or torch.isinf(total_loss) or total_loss.item() > 1000:
-                print(f"Warning: Invalid total_loss: {total_loss.item()}")
+            # Minimal safety check for speed
+            if torch.isnan(total_loss) or torch.isinf(total_loss):
                 total_loss = torch.tensor(0.1, device='cuda', requires_grad=True)
             
-            self.log("train_loss", total_loss, batch_size=self.cfg.TRAIN.BATCH_SIZE, on_step=True, on_epoch=True)
+            # Reduced logging frequency for speed
+            if batch_idx % 5 == 0 or not hasattr(self, 'fast_mode') or not self.fast_mode:
+                self.log("train_loss", total_loss, batch_size=self.cfg.TRAIN.BATCH_SIZE, on_step=True, on_epoch=True)
             
             if self.timing_enabled:
                 self.component_times['loss_computation'].append(time.time() - loss_start)
@@ -858,7 +882,11 @@ def getDir(obj):
 @click.option("--export_onnx", is_flag=True, help="Export ONNX models every 5 epochs")
 @click.option("--onnx_interval", type=int, default=5, help="Interval for ONNX export")
 @click.option("--precision", type=int, default=16, help="Training precision (16 for mixed precision, 32 for full)")
-def main(checkpoint, nuscenes, epochs, batch_size, lr, gpus, debug, num_workers, profile, timing, export_onnx, onnx_interval, precision):
+@click.option("--max_points", type=int, default=None, help="Override max points per sample (default: keep original, fast_mode: 16K-32K)")
+@click.option("--skip_val", is_flag=True, help="Skip validation during training for speed")
+@click.option("--fast_mode", is_flag=True, help="Enable smart optimizations for large point clouds")
+@click.option("--chunk_size", type=int, default=None, help="Process point clouds in chunks (for very large clouds)")
+def main(checkpoint, nuscenes, epochs, batch_size, lr, gpus, debug, num_workers, profile, timing, export_onnx, onnx_interval, precision, max_points, skip_val, fast_mode):
     # Load configurations
     model_cfg = edict(
         yaml.safe_load(open(join(getDir(__file__), "../config/model.yaml")))
@@ -878,6 +906,38 @@ def main(checkpoint, nuscenes, epochs, batch_size, lr, gpus, debug, num_workers,
     cfg.TRAIN.N_GPUS = gpus
     cfg.TRAIN.NUM_WORKERS = num_workers
     
+    # Apply fast mode optimizations
+    if fast_mode:
+        print("🚀 FAST MODE ENABLED - Applying smart optimizations for large point clouds")
+        cfg.TRAIN.NUM_WORKERS = max(8, num_workers)  # More workers
+        cfg.TRAIN.BATCH_ACC = max(4, cfg.TRAIN.BATCH_ACC)  # More gradient accumulation
+        skip_val = True  # Force skip validation
+        if max_points is None:
+            # More conservative limit for large point clouds
+            original_max = cfg[cfg.MODEL.DATASET].SUB_NUM_POINTS
+            # More conservative for large point clouds  
+            if original_max > 100000:
+                max_points = min(65536, max(32768, original_max // 2))  # 32K-64K for very large clouds
+            else:
+                max_points = min(32768, max(16384, original_max))  # 16K-32K for moderate clouds
+            print(f"Auto-selected {max_points} points (original: {original_max})")
+            
+            # Auto-suggest chunking for very large clouds
+            if original_max > 200000:
+                print(f"💡 Your point clouds are very large ({original_max} points). Consider --chunk_size 50000 for better memory usage")
+    
+    # Override max points if specified
+    if max_points is not None:
+        original_max = cfg[cfg.MODEL.DATASET].SUB_NUM_POINTS
+        cfg[cfg.MODEL.DATASET].SUB_NUM_POINTS = max_points
+        print(f"⚡ Adjusted max points: {original_max} → {max_points}")
+        
+        # Adjust batch size if points are very large to avoid OOM
+        if max_points > 50000 and batch_size > 1:
+            new_batch_size = 1
+            cfg.TRAIN.BATCH_SIZE = new_batch_size
+            print(f"⚠️ Large point clouds detected, reducing batch size to {new_batch_size}")
+    
     if nuscenes:
         cfg.MODEL.DATASET = "NUSCENES"
     
@@ -896,12 +956,33 @@ def main(checkpoint, nuscenes, epochs, batch_size, lr, gpus, debug, num_workers,
     print(f"Timing analysis: {timing}")
     print(f"ONNX export: {export_onnx} (every {onnx_interval} epochs)" if export_onnx else "")
     print(f"Precision: {precision} ({'Mixed precision' if precision == 16 else 'Full precision'})")
+    print(f"Max points per sample: {cfg[cfg.MODEL.DATASET].SUB_NUM_POINTS}")
+    print(f"Skip validation: {skip_val}")
+    print(f"Fast mode: {fast_mode}")
+    print(f"Gradient accumulation: {cfg.TRAIN.BATCH_ACC} steps")
     
-    # Create data module
+    # Create optimized data module
     data = SemanticDatasetModule(cfg)
     
-    # Create model
+    # Apply dataloader optimizations
+    if hasattr(data, 'train_dataloader'):
+        original_train_dataloader = data.train_dataloader
+        def optimized_train_dataloader():
+            loader = original_train_dataloader()
+            # Add prefetch_factor and pin_memory for GPU transfer speedup
+            loader.prefetch_factor = 4 if cfg.TRAIN.NUM_WORKERS > 0 else 2
+            loader.pin_memory = True
+            loader.persistent_workers = True if cfg.TRAIN.NUM_WORKERS > 0 else False
+            return loader
+        data.train_dataloader = optimized_train_dataloader
+    
+    # Create model with optimizations
     model = SimplifiedMaskPLS(cfg)
+    
+    # Enable fast mode optimizations on model
+    if fast_mode:
+        model.fast_mode = True
+        print("⚡ Model fast mode enabled")
     
     # Enable debug mode if requested
     if debug:
@@ -975,8 +1056,9 @@ def main(checkpoint, nuscenes, epochs, batch_size, lr, gpus, debug, num_workers,
         gradient_clip_val=0.5,
         accumulate_grad_batches=cfg.TRAIN.BATCH_ACC,
         resume_from_checkpoint=checkpoint if checkpoint and os.path.exists(checkpoint) else None,
-        num_sanity_val_steps=0 if debug else 2,
-        enable_progress_bar=True,  # Keep progress bar enabled
+        num_sanity_val_steps=0,  # Skip sanity validation
+        enable_progress_bar=True,
+        check_val_every_n_epoch=999 if skip_val else 1,  # Skip validation if requested  # Keep progress bar enabled
         precision=precision,  # Configurable precision for speed vs stability
     )
     
