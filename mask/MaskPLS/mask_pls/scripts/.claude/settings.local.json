@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(C:\\Users\\freer\\OneDrive\\Desktop\\New folder (5)\\optimizations\\mask\\MaskPLS\\mask_pls\\models/**)",
+      "Read(C:\\Users\\freer\\OneDrive\\Desktop\\New folder (5)\\optimizations\\mask\\MaskPLS\\mask_pls\\config/**)",
+      "Read(C:\\Users\\freer\\OneDrive\\Desktop\\New folder (5)\\optimizations\\mask\\MaskPLS\\mask_pls\\config/**)",
+      "Read(C:\\Users\\freer\\OneDrive\\Desktop\\New folder (5)\\optimizations\\mask\\MaskPLS\\mask_pls\\models/**)",
+      "Read(C:\\Users\\freer\\OneDrive\\Desktop\\New folder (5)\\optimizations\\mask\\MaskPLS\\mask_pls/**)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
