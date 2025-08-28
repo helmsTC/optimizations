@@ -291,10 +291,11 @@ class ProperMaskLoss(torch.nn.Module):
 
 class FixedOptimizedMaskPLS(LightningModule):
     """Fixed optimized MaskPLS with proper model performance"""
-    def __init__(self, cfg):
+    def __init__(self, cfg, onnx_interval=5):
         super().__init__()
         self.save_hyperparameters(dict(cfg))
         self.cfg = cfg
+        self.onnx_interval = onnx_interval
         
         # Get dataset config
         dataset = cfg.MODEL.DATASET
@@ -329,6 +330,9 @@ class FixedOptimizedMaskPLS(LightningModule):
         # Performance tracking
         self.batch_times = []
         self.last_time = time.time()
+        
+        # ONNX export tracking
+        self.last_onnx_export_epoch = -1
         
     def forward(self, batch):
         """Optimized forward pass with proper voxelization"""
@@ -594,7 +598,7 @@ class FixedOptimizedMaskPLS(LightningModule):
         return sem_pred, ins_pred
     
     def validation_epoch_end(self, outputs):
-        """Compute validation metrics"""
+        """Compute validation metrics and export ONNX if needed"""
         try:
             bs = self.cfg.TRAIN.BATCH_SIZE
             pq = self.evaluator.get_mean_pq()
@@ -608,10 +612,97 @@ class FixedOptimizedMaskPLS(LightningModule):
             print(f"\nValidation Metrics - PQ: {pq:.4f}, IoU: {iou:.4f}, RQ: {rq:.4f}")
             
             self.evaluator.reset()
+            
+            # Export ONNX at specified intervals
+            current_epoch = self.current_epoch
+            if (self.onnx_interval > 0 and 
+                current_epoch > 0 and 
+                current_epoch % self.onnx_interval == 0 and 
+                current_epoch != self.last_onnx_export_epoch):
+                self.export_to_onnx(current_epoch, pq, iou)
+                self.last_onnx_export_epoch = current_epoch
+                
         except Exception as e:
             print(f"Metrics computation error: {e}")
             self.log("metrics/pq", 0.0, batch_size=self.cfg.TRAIN.BATCH_SIZE)
             self.log("metrics/iou", 0.0, batch_size=self.cfg.TRAIN.BATCH_SIZE)
+    
+    def export_to_onnx(self, epoch, pq, iou):
+        """Export the model to ONNX format"""
+        try:
+            print(f"\n{'='*60}")
+            print(f"Exporting ONNX model at epoch {epoch}")
+            print(f"Current metrics - PQ: {pq:.4f}, IoU: {iou:.4f}")
+            print(f"{'='*60}")
+            
+            # Create output directory
+            onnx_dir = Path("experiments") / f"{self.cfg.EXPERIMENT.ID}_fixed_v3" / "onnx_exports"
+            onnx_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Output filename with epoch and metrics
+            output_path = onnx_dir / f"model_epoch{epoch:03d}_pq{pq:.3f}_iou{iou:.3f}.onnx"
+            
+            # Set model to eval mode
+            self.model.eval()
+            
+            # Create dummy inputs matching the actual model inputs
+            batch_size = 1
+            num_points = 10000
+            D, H, W = self.voxelizer.spatial_shape
+            C = 4  # XYZI features
+            
+            # Pre-voxelized features
+            dummy_voxels = torch.randn(batch_size, C, D, H, W, device='cuda')
+            # Normalized point coordinates
+            dummy_coords = torch.rand(batch_size, num_points, 3, device='cuda')
+            
+            # Export with proper settings
+            with torch.no_grad():
+                torch.onnx.export(
+                    self.model,
+                    (dummy_voxels, dummy_coords),
+                    str(output_path),
+                    export_params=True,
+                    opset_version=16,
+                    do_constant_folding=True,
+                    input_names=['voxel_features', 'point_coords'],
+                    output_names=['pred_logits', 'pred_masks', 'sem_logits'],
+                    dynamic_axes={
+                        'voxel_features': {0: 'batch_size'},
+                        'point_coords': {0: 'batch_size', 1: 'num_points'},
+                        'pred_logits': {0: 'batch_size'},
+                        'pred_masks': {0: 'batch_size', 1: 'num_points'},
+                        'sem_logits': {0: 'batch_size', 1: 'num_points'}
+                    },
+                    verbose=False
+                )
+            
+            # Verify the exported model
+            import onnx
+            onnx_model = onnx.load(str(output_path))
+            onnx.checker.check_model(onnx_model)
+            
+            # Get file size
+            file_size_mb = output_path.stat().st_size / (1024 * 1024)
+            
+            print(f"✓ ONNX model exported successfully")
+            print(f"  File: {output_path}")
+            print(f"  Size: {file_size_mb:.2f} MB")
+            print(f"  Opset Version: 16")
+            print(f"  Input shapes:")
+            print(f"    - voxel_features: [{batch_size}, {C}, {D}, {H}, {W}]")
+            print(f"    - point_coords: [{batch_size}, {num_points}, 3]")
+            print(f"{'='*60}\n")
+            
+            # Set model back to train mode
+            self.model.train()
+            
+        except Exception as e:
+            print(f"ONNX export failed: {e}")
+            import traceback
+            traceback.print_exc()
+            # Set model back to train mode even if export fails
+            self.model.train()
     
     def configure_optimizers(self):
         """Use original optimizer configuration for stability"""
@@ -646,7 +737,8 @@ class FixedOptimizedMaskPLS(LightningModule):
 @click.option("--num_workers", type=int, default=4, help="Number of workers")
 @click.option("--nuscenes", is_flag=True, help="Use NuScenes dataset")
 @click.option("--checkpoint", type=str, default=None, help="Resume from checkpoint")
-def main(epochs, batch_size, lr, gpus, num_workers, nuscenes, checkpoint):
+@click.option("--onnx_interval", type=int, default=5, help="Export ONNX model every N epochs (0 to disable)")
+def main(epochs, batch_size, lr, gpus, num_workers, nuscenes, checkpoint, onnx_interval):
     """Fixed Ultra-optimized MaskPLS training with proper performance"""
     
     print("="*60)
@@ -689,12 +781,13 @@ def main(epochs, batch_size, lr, gpus, num_workers, nuscenes, checkpoint):
     print(f"  Point Sampling: {cfg[dataset].SUB_NUM_POINTS}")
     print(f"  Loss Point Sampling: {cfg.LOSS.NUM_POINTS}")
     print(f"  Mask Point Sampling: {cfg.LOSS.NUM_MASK_PTS}")
+    print(f"  ONNX Export Interval: {'Every ' + str(onnx_interval) + ' epochs' if onnx_interval > 0 else 'Disabled'}")
     
     # Create data module
     data = SemanticDatasetModule(cfg)
     
-    # Create model
-    model = FixedOptimizedMaskPLS(cfg)
+    # Create model with ONNX export interval
+    model = FixedOptimizedMaskPLS(cfg, onnx_interval=onnx_interval)
     
     # Load checkpoint if provided
     if checkpoint:
@@ -742,6 +835,17 @@ def main(epochs, batch_size, lr, gpus, num_workers, nuscenes, checkpoint):
     trainer.fit(model, data)
     
     print("\nTraining completed!")
+    
+    # Export final ONNX model
+    if onnx_interval > 0:
+        print("\nExporting final ONNX model...")
+        try:
+            # Get final metrics
+            final_pq = model.evaluator.get_mean_pq() if hasattr(model.evaluator, 'get_mean_pq') else 0.0
+            final_iou = model.evaluator.get_mean_iou() if hasattr(model.evaluator, 'get_mean_iou') else 0.0
+            model.export_to_onnx(epochs, final_pq, final_iou)
+        except Exception as e:
+            print(f"Final ONNX export failed: {e}")
 
 
 if __name__ == "__main__":
