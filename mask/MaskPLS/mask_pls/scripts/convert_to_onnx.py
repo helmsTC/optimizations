@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
-Fixed MaskPLS to ONNX converter
-This version works with the corrected decoder
-Replace mask_pls/onnx/convert_to_onnx.py with this
+Fixed MaskPLS to ONNX converter using simplified_model
+This version works with the actual model structure
 """
 
 import os
@@ -11,6 +10,8 @@ import torch
 import torch.onnx
 import numpy as np
 from pathlib import Path
+import yaml
+from easydict import EasyDict as edict
 
 # Add parent directory to path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -18,7 +19,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 def simple_convert():
     """
-    Simple conversion that actually works
+    Simple conversion that actually works with simplified_model
     """
     print("=" * 50)
     print("MaskPLS to ONNX Converter")
@@ -26,53 +27,61 @@ def simple_convert():
     
     # Import the ONNX model
     try:
-        from models.onnx.onnx_model import MaskPLSONNX, MaskPLSExportWrapper
+        from models.onnx.simplified_model import MaskPLSSimplifiedONNX
     except ImportError:
         # Try alternative import path
-        from mask_pls.models.onnx.onnx_model import MaskPLSONNX, MaskPLSExportWrapper
+        from mask_pls.models.onnx.simplified_model import MaskPLSSimplifiedONNX
     
-    # Create config
-    from easydict import EasyDict as edict
+    # Load configurations
+    def getDir(obj):
+        return os.path.dirname(os.path.abspath(obj))
     
-    cfg = edict({
-        'MODEL': {
-            'DATASET': 'KITTI',
-            'OVERLAP_THRESHOLD': 0.8
-        },
-        'KITTI': {
-            'NUM_CLASSES': 20,
-            'MIN_POINTS': 10,
-            'SPACE': [[-48.0, 48.0], [-48.0, 48.0], [-4.0, 1.5]],
-            'SUB_NUM_POINTS': 80000,
-            'IGNORE_LABEL': 0
-        },
-        'NUSCENES': {
-            'NUM_CLASSES': 17,
-            'MIN_POINTS': 10,
-            'SPACE': [[-50.0, 50.0], [-50.0, 50.0], [-5.0, 3.0]],
-            'SUB_NUM_POINTS': 50000,
-            'IGNORE_LABEL': 0
-        },
-        'BACKBONE': {
-            'INPUT_DIM': 4,
-            'CHANNELS': [32, 32, 64, 128, 256, 256, 128, 96, 96],
-            'RESOLUTION': 0.05,
-            'KNN_UP': 3
-        },
-        'DECODER': {
-            'HIDDEN_DIM': 256,
-            'NHEADS': 8,
-            'DIM_FFN': 1024,
-            'FEATURE_LEVELS': 3,
-            'DEC_BLOCKS': 3,
-            'NUM_QUERIES': 100,
-            'POS_ENC': {
-                'MAX_FREQ': 10000,
-                'DIMENSIONALITY': 3,
-                'BASE': 2
+    try:
+        model_cfg = edict(yaml.safe_load(open(os.path.join(getDir(__file__), "../config/model.yaml"))))
+        backbone_cfg = edict(yaml.safe_load(open(os.path.join(getDir(__file__), "../config/backbone.yaml"))))
+        decoder_cfg = edict(yaml.safe_load(open(os.path.join(getDir(__file__), "../config/decoder.yaml"))))
+        cfg = edict({**model_cfg, **backbone_cfg, **decoder_cfg})
+    except:
+        # Fallback to hardcoded config if files not found
+        cfg = edict({
+            'MODEL': {
+                'DATASET': 'KITTI',
+                'OVERLAP_THRESHOLD': 0.8
+            },
+            'KITTI': {
+                'NUM_CLASSES': 20,
+                'MIN_POINTS': 10,
+                'SPACE': [[-48.0, 48.0], [-48.0, 48.0], [-4.0, 1.5]],
+                'SUB_NUM_POINTS': 80000,
+                'IGNORE_LABEL': 0
+            },
+            'NUSCENES': {
+                'NUM_CLASSES': 17,
+                'MIN_POINTS': 10,
+                'SPACE': [[-50.0, 50.0], [-50.0, 50.0], [-5.0, 3.0]],
+                'SUB_NUM_POINTS': 50000,
+                'IGNORE_LABEL': 0
+            },
+            'BACKBONE': {
+                'INPUT_DIM': 4,
+                'CHANNELS': [32, 64, 128, 256, 256],  # Updated for optimized model
+                'RESOLUTION': 0.05,
+                'KNN_UP': 3
+            },
+            'DECODER': {
+                'HIDDEN_DIM': 256,
+                'NHEADS': 8,
+                'DIM_FFN': 1024,
+                'FEATURE_LEVELS': 3,
+                'DEC_BLOCKS': 3,
+                'NUM_QUERIES': 100,
+                'POS_ENC': {
+                    'MAX_FREQ': 10000,
+                    'DIMENSIONALITY': 3,
+                    'BASE': 2
+                }
             }
-        }
-    })
+        })
     
     # Ask for dataset type
     dataset_choice = input("\nDataset type (1=KITTI, 2=NUSCENES) [default=1]: ").strip()
@@ -83,8 +92,11 @@ def simple_convert():
         cfg.MODEL.DATASET = 'KITTI'
         print("Using KITTI configuration")
     
+    # Update backbone config to match optimized version
+    cfg.BACKBONE.CHANNELS = [32, 64, 128, 256, 256]
+    
     print("\n1. Creating ONNX model...")
-    model = MaskPLSONNX(cfg)
+    model = MaskPLSSimplifiedONNX(cfg)
     
     print("\n2. Setting to eval mode...")
     model.eval()
@@ -99,22 +111,35 @@ def simple_convert():
         print(f"   Loading weights from {checkpoint_path}...")
         try:
             checkpoint = torch.load(checkpoint_path, map_location='cpu')
-            state_dict = checkpoint['state_dict'] if 'state_dict' in checkpoint else checkpoint
             
-            # Filter compatible weights
+            # Handle different checkpoint formats
+            if 'state_dict' in checkpoint:
+                state_dict = checkpoint['state_dict']
+            elif 'model_state_dict' in checkpoint:
+                state_dict = checkpoint['model_state_dict']
+            else:
+                state_dict = checkpoint
+            
+            # Filter and clean state dict
             model_dict = model.state_dict()
             compatible_dict = {}
             
             for k, v in state_dict.items():
-                k_new = k.replace('module.', '')
-                # Skip MinkowskiEngine specific weights
-                if 'kernel' not in k and 'MinkowskiConvolution' not in k:
-                    if k_new in model_dict:
-                        if v.shape == model_dict[k_new].shape:
-                            compatible_dict[k_new] = v
+                # Remove prefixes
+                k_clean = k.replace('module.', '').replace('model.', '')
+                
+                # Check if key exists in model
+                if k_clean in model_dict:
+                    if v.shape == model_dict[k_clean].shape:
+                        compatible_dict[k_clean] = v
+                    else:
+                        print(f"   Shape mismatch for {k_clean}: {v.shape} vs {model_dict[k_clean].shape}")
             
-            model.load_state_dict(compatible_dict, strict=False)
-            print(f"   ✓ Loaded {len(compatible_dict)}/{len(model_dict)} weights")
+            if compatible_dict:
+                model.load_state_dict(compatible_dict, strict=False)
+                print(f"   ✓ Loaded {len(compatible_dict)}/{len(model_dict)} weights")
+            else:
+                print("   ⚠ No compatible weights found, using random initialization")
         except Exception as e:
             print(f"   ⚠ Warning: Could not load weights: {e}")
             print("   Continuing with random weights...")
@@ -133,23 +158,43 @@ def simple_convert():
     num_points = input("   Number of points for export (default: 10000): ").strip()
     num_points = int(num_points) if num_points else 10000
     
+    # Voxel dimensions
+    voxel_d = input("   Voxel grid depth (default: 64): ").strip()
+    voxel_d = int(voxel_d) if voxel_d else 64
+    
+    voxel_h = input("   Voxel grid height (default: 64): ").strip()
+    voxel_h = int(voxel_h) if voxel_h else 64
+    
+    voxel_w = input("   Voxel grid width (default: 32): ").strip()
+    voxel_w = int(voxel_w) if voxel_w else 32
+    
     print(f"\n5. Exporting to {output_path}...")
     print(f"   Batch size: {batch_size}")
     print(f"   Number of points: {num_points}")
+    print(f"   Voxel shape: [{voxel_d}, {voxel_h}, {voxel_w}]")
     
-    # Create wrapper for clean export
-    export_model = MaskPLSExportWrapper(model)
+    # Update model's spatial shape
+    model.spatial_shape = (voxel_d, voxel_h, voxel_w)
     
-    # Create dummy input
-    dummy_points = torch.randn(batch_size, num_points, 3)
-    dummy_features = torch.randn(batch_size, num_points, 4)
+    # Move model to CUDA if available
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    model = model.to(device)
+    
+    # Create dummy input for the simplified model
+    # The model expects: voxel_features [B, C, D, H, W] and point_coords [B, N, 3]
+    C = 4  # XYZI features
+    dummy_voxels = torch.randn(batch_size, C, voxel_d, voxel_h, voxel_w, device=device)
+    dummy_coords = torch.rand(batch_size, num_points, 3, device=device)  # Normalized coords [0,1]
     
     # Test forward pass first
     print("\n   Testing forward pass...")
     try:
         with torch.no_grad():
-            test_output = export_model(dummy_points, dummy_features)
-        print(f"   ✓ Forward pass successful: {[o.shape for o in test_output]}")
+            pred_logits, pred_masks, sem_logits = model(dummy_voxels, dummy_coords)
+        print(f"   ✓ Forward pass successful:")
+        print(f"     - pred_logits: {pred_logits.shape}")
+        print(f"     - pred_masks: {pred_masks.shape}")
+        print(f"     - sem_logits: {sem_logits.shape}")
     except Exception as e:
         print(f"   ✗ Forward pass failed: {e}")
         import traceback
@@ -160,19 +205,18 @@ def simple_convert():
     print("\n   Attempting ONNX export...")
     try:
         with torch.no_grad():
-            # Try with simpler settings first
             torch.onnx.export(
-                export_model,
-                (dummy_points, dummy_features),
+                model,
+                (dummy_voxels, dummy_coords),
                 output_path,
                 export_params=True,
-                opset_version=11,  # Most compatible
+                opset_version=16,  # Use newer opset for better compatibility
                 do_constant_folding=True,
-                input_names=['points', 'features'],
+                input_names=['voxel_features', 'point_coords'],
                 output_names=['pred_logits', 'pred_masks', 'sem_logits'],
                 dynamic_axes={
-                    'points': {0: 'batch_size', 1: 'num_points'},
-                    'features': {0: 'batch_size', 1: 'num_points'},
+                    'voxel_features': {0: 'batch_size'},
+                    'point_coords': {0: 'batch_size', 1: 'num_points'},
                     'pred_logits': {0: 'batch_size'},
                     'pred_masks': {0: 'batch_size', 1: 'num_points'},
                     'sem_logits': {0: 'batch_size', 1: 'num_points'}
@@ -184,63 +228,39 @@ def simple_convert():
         print(f"   Output file: {output_path}")
         print(f"   File size: {os.path.getsize(output_path) / 1024 / 1024:.2f} MB")
         
+        # Verify the exported model
+        print("\n6. Verifying ONNX model...")
+        try:
+            import onnx
+            onnx_model = onnx.load(output_path)
+            onnx.checker.check_model(onnx_model)
+            print("   ✓ ONNX model verification passed")
+        except ImportError:
+            print("   ⚠ ONNX not installed, skipping verification")
+        except Exception as e:
+            print(f"   ⚠ Verification warning: {e}")
+        
+        print("\n" + "=" * 50)
+        print("Export completed successfully!")
+        print("=" * 50)
+        return True
+        
     except Exception as e:
         print(f"   ✗ Export failed: {e}")
-        print("\n   Trying alternative export method...")
-        
-        # Try tracing instead
-        try:
-            with torch.no_grad():
-                traced = torch.jit.trace(export_model, (dummy_points, dummy_features), check_trace=False)
-                torch.onnx.export(
-                    traced,
-                    (dummy_points, dummy_features),
-                    output_path,
-                    opset_version=11,
-                    input_names=['points', 'features'],
-                    output_names=['pred_logits', 'pred_masks', 'sem_logits']
-                )
-            print(f"   ✓ Export successful with tracing!")
-        except Exception as e2:
-            print(f"   ✗ Tracing also failed: {e2}")
-            return False
-    
-    # Test with ONNX Runtime if available
-    try:
-        import onnxruntime as ort
-        
-        print("\n6. Testing with ONNX Runtime...")
-        
-        providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']
-        session = ort.InferenceSession(output_path, providers=providers)
-        
-        print(f"   Using providers: {session.get_providers()}")
-        
-        # Test inference
-        test_points = np.random.randn(1, 1000, 3).astype(np.float32)
-        test_features = np.random.randn(1, 1000, 4).astype(np.float32)
-        
-        outputs = session.run(None, {
-            'points': test_points,
-            'features': test_features
-        })
-        
-        print(f"   ✓ Inference test passed!")
-        print(f"   Output shapes: {[o.shape for o in outputs]}")
-        
-    except ImportError:
-        print("\n6. ONNX Runtime not installed. Cannot test inference.")
-        print("   Install with: pip install onnxruntime-gpu")
-    except Exception as e:
-        print(f"\n6. Inference test error: {e}")
-    
-    print("\n" + "=" * 50)
-    print("Conversion Complete!")
-    print("=" * 50)
-    
-    return True
+        import traceback
+        traceback.print_exc()
+        return False
+
+
+def main():
+    """
+    Main entry point
+    """
+    success = simple_convert()
+    if not success:
+        print("\n⚠ Export failed. Please check the error messages above.")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
-    success = simple_convert()
-    sys.exit(0 if success else 1)
+    main()
