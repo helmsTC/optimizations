@@ -99,4 +99,73 @@ class HighResVoxelizer:
         # Convert back to float32 if needed
         if dtype == torch.float16:
             voxel_grids = voxel_grids.float()
-
+        
+        return voxel_grids, point_coords, valid_indices
+    
+    def _get_valid_mask(self, points):
+        """Get mask for points within bounds"""
+        return ((points >= self.bounds_min) & 
+                (points < self.bounds_max)).all(dim=1)
+    
+    def _trilinear_voxelize(self, voxel_grid, voxel_count, points, features, norm_coords):
+        """
+        Trilinear splatting for smooth voxelization
+        """
+        D, H, W = self.spatial_shape
+        
+        # Get voxel coordinates
+        voxel_coords = norm_coords * torch.tensor([D, H, W], device=self.device)
+        
+        # Get integer and fractional parts
+        voxel_coords_floor = torch.floor(voxel_coords).long()
+        voxel_coords_ceil = torch.ceil(voxel_coords).long()
+        voxel_coords_frac = voxel_coords - voxel_coords_floor.float()
+        
+        # Clamp coordinates
+        voxel_coords_floor = torch.clamp(voxel_coords_floor, 0, 
+                                        torch.tensor([D-1, H-1, W-1], device=self.device))
+        voxel_coords_ceil = torch.clamp(voxel_coords_ceil, 0,
+                                       torch.tensor([D-1, H-1, W-1], device=self.device))
+        
+        # Compute trilinear weights
+        weights = torch.stack([
+            (1 - voxel_coords_frac[:, 0]) * (1 - voxel_coords_frac[:, 1]) * (1 - voxel_coords_frac[:, 2]),
+            voxel_coords_frac[:, 0] * (1 - voxel_coords_frac[:, 1]) * (1 - voxel_coords_frac[:, 2]),
+            (1 - voxel_coords_frac[:, 0]) * voxel_coords_frac[:, 1] * (1 - voxel_coords_frac[:, 2]),
+            voxel_coords_frac[:, 0] * voxel_coords_frac[:, 1] * (1 - voxel_coords_frac[:, 2]),
+            (1 - voxel_coords_frac[:, 0]) * (1 - voxel_coords_frac[:, 1]) * voxel_coords_frac[:, 2],
+            voxel_coords_frac[:, 0] * (1 - voxel_coords_frac[:, 1]) * voxel_coords_frac[:, 2],
+            (1 - voxel_coords_frac[:, 0]) * voxel_coords_frac[:, 1] * voxel_coords_frac[:, 2],
+            voxel_coords_frac[:, 0] * voxel_coords_frac[:, 1] * voxel_coords_frac[:, 2]
+        ], dim=0).T
+        
+        # Get 8 corner coordinates
+        corners = torch.stack([
+            voxel_coords_floor,
+            torch.stack([voxel_coords_ceil[:, 0], voxel_coords_floor[:, 1], voxel_coords_floor[:, 2]], dim=1),
+            torch.stack([voxel_coords_floor[:, 0], voxel_coords_ceil[:, 1], voxel_coords_floor[:, 2]], dim=1),
+            torch.stack([voxel_coords_ceil[:, 0], voxel_coords_ceil[:, 1], voxel_coords_floor[:, 2]], dim=1),
+            torch.stack([voxel_coords_floor[:, 0], voxel_coords_floor[:, 1], voxel_coords_ceil[:, 2]], dim=1),
+            torch.stack([voxel_coords_ceil[:, 0], voxel_coords_floor[:, 1], voxel_coords_ceil[:, 2]], dim=1),
+            torch.stack([voxel_coords_floor[:, 0], voxel_coords_ceil[:, 1], voxel_coords_ceil[:, 2]], dim=1),
+            voxel_coords_ceil
+        ], dim=0)
+        
+        # Splat to voxels
+        for i in range(8):
+            corner = corners[i]
+            weight = weights[:, i:i+1]
+            
+            # Flatten indices
+            flat_idx = corner[:, 0] * H * W + corner[:, 1] * W + corner[:, 2]
+            
+            # Accumulate weighted features
+            for c in range(features.shape[1]):
+                voxel_grid[c].view(-1).scatter_add_(
+                    0, flat_idx, features[:, c] * weight.squeeze()
+                )
+            
+            # Accumulate weights
+            voxel_count.view(-1).scatter_add_(
+                0, flat_idx, weight.squeeze()
+            )
