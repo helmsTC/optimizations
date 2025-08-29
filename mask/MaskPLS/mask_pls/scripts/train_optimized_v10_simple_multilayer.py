@@ -642,17 +642,56 @@ class JITFixedOptimizedMaskPLS(LightningModule):
                     pred_logits = enhanced_outputs["pred_logits"]
                     print(f"✓ Using multi-layer decoder logits (3 layers)")
                     
-                    # For masks, we need to ensure shape compatibility
-                    if enhanced_outputs["pred_masks"].shape[-1] == pred_masks.shape[-1]:
-                        pred_masks = enhanced_outputs["pred_masks"]
-                        print(f"✓ Using multi-layer decoder masks")
-                    else:
-                        print(f"Mask shape mismatch: {enhanced_outputs['pred_masks'].shape} vs {pred_masks.shape}")
+                    # For masks, we need to reshape from [B, queries, feat_dim] to [B, points, queries]
+                    decoder_masks = enhanced_outputs["pred_masks"]  # [B, 100, 256]
+                    target_shape = pred_masks.shape  # [B, points, 100]
                     
-                    # Store auxiliary outputs for deep supervision
+                    try:
+                        # Reshape decoder masks to match expected format
+                        # We need to transpose and project: [B, 100, 256] -> [B, points, 100]
+                        B, num_queries, feat_dim = decoder_masks.shape
+                        target_points = target_shape[1]
+                        
+                        # Create a projection layer if needed to go from 256 features to point space
+                        if not hasattr(self, 'mask_projection'):
+                            self.mask_projection = torch.nn.Linear(feat_dim, target_points).to(decoder_masks.device)
+                            print(f"✓ Created mask projection: {feat_dim} -> {target_points}")
+                        
+                        # Project and transpose: [B, 100, 256] -> [B, 100, points] -> [B, points, 100]
+                        projected_masks = self.mask_projection(decoder_masks)  # [B, 100, points]
+                        reshaped_masks = projected_masks.transpose(1, 2)  # [B, points, 100]
+                        
+                        if reshaped_masks.shape == target_shape:
+                            pred_masks = reshaped_masks
+                            print(f"✓ Using multi-layer decoder masks: {reshaped_masks.shape}")
+                        else:
+                            print(f"Mask reshape failed: {reshaped_masks.shape} vs {target_shape}")
+                        
+                    except Exception as mask_error:
+                        print(f"Mask reshaping error: {mask_error}")
+                        print(f"Mask shape mismatch: {decoder_masks.shape} vs {target_shape}")
+                    
+                    # Store auxiliary outputs for deep supervision (reshape them too)
                     if "aux_outputs" in enhanced_outputs and enhanced_outputs["aux_outputs"]:
-                        print(f"✓ Adding {len(enhanced_outputs['aux_outputs'])} auxiliary outputs for deep supervision")
-                        self._last_enhanced_outputs = enhanced_outputs
+                        try:
+                            # Reshape auxiliary masks as well
+                            reshaped_aux_outputs = []
+                            for aux_out in enhanced_outputs["aux_outputs"]:
+                                aux_masks = aux_out["pred_masks"]  # [B, 100, 256]
+                                aux_projected = self.mask_projection(aux_masks)  # [B, 100, points]
+                                aux_reshaped = aux_projected.transpose(1, 2)  # [B, points, 100]
+                                
+                                reshaped_aux_outputs.append({
+                                    "pred_logits": aux_out["pred_logits"],
+                                    "pred_masks": aux_reshaped
+                                })
+                            
+                            enhanced_outputs["aux_outputs"] = reshaped_aux_outputs
+                            print(f"✓ Adding {len(reshaped_aux_outputs)} auxiliary outputs for deep supervision")
+                            self._last_enhanced_outputs = enhanced_outputs
+                        except Exception as aux_error:
+                            print(f"Auxiliary mask reshaping error: {aux_error}")
+                            self._last_enhanced_outputs = None
                     else:
                         self._last_enhanced_outputs = None
                         
