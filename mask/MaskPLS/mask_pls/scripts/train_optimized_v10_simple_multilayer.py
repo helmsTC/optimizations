@@ -471,8 +471,8 @@ class SimpleMultiLayerDecoder(torch.nn.Module):
             ) for _ in range(3)
         ])
         
-        # Final prediction heads
-        self.class_head = torch.nn.Linear(d_model, 20)
+        # Final prediction heads - match v10 output dimensions
+        self.class_head = torch.nn.Linear(d_model, 21)  # 20 classes + 1 for no-object/background
         self.mask_head = torch.nn.Linear(d_model, d_model)
         
     def forward(self, encoded_features):
@@ -534,8 +534,9 @@ class JITFixedOptimizedMaskPLS(LightningModule):
         
         # ADD MULTI-LAYER DECODER - Simple extension
         self.multi_decoder = SimpleMultiLayerDecoder(d_model=256, num_queries=100)
-        self.feature_proj = torch.nn.Linear(4, 256)  # Project from voxel features (C=4) to decoder dim
-        self._debug_shapes = False  # Set to True to enable shape debugging
+        # We'll determine the input dimension dynamically based on actual voxel grid shape
+        self.feature_proj = None  # Initialize dynamically
+        self._debug_shapes = True  # Re-enable to debug the dimension issue
         
         # Fixed JIT loss
         self.mask_loss = FixedMaskLoss(cfg.LOSS, cfg[dataset])
@@ -622,11 +623,14 @@ class JITFixedOptimizedMaskPLS(LightningModule):
                 # Flatten spatial dims: [B, C, D*H*W] -> [B, D*H*W, C]
                 spatial_features = voxel_grids.view(B, C, -1).permute(0, 2, 1)  # [B, spatial_pts, C]
                 
-                # Project to decoder dimension (C -> 256)
-                if spatial_features.shape[-1] != 256:
-                    projected_features = self.feature_proj(spatial_features)  # [B, spatial_pts, 256]
-                else:
-                    projected_features = spatial_features
+                # Initialize feature projection dynamically if needed
+                if self.feature_proj is None:
+                    input_dim = spatial_features.shape[-1]
+                    self.feature_proj = torch.nn.Linear(input_dim, 256).to(spatial_features.device)
+                    print(f"✓ Initialized feature projection: {input_dim} -> 256")
+                
+                # Project to decoder dimension
+                projected_features = self.feature_proj(spatial_features)  # [B, spatial_pts, 256]
                 
                 # Multi-layer decoder forward
                 enhanced_outputs = self.multi_decoder(projected_features)
