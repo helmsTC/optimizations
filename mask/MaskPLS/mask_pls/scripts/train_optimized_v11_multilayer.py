@@ -234,14 +234,14 @@ class HighResVoxelizer:
                     valid_indices.append(torch.empty(0, dtype=torch.bool, device=self.device))
                     continue
                 
-                # Normalize to [0, 1]
-                normalized = (pts - self.bounds_min) / self.bounds_range
-                normalized = torch.clamp(normalized, 0.0, 1.0)
+                # Normalize to [0, 1] - ensure consistent dtypes
+                normalized = (pts.float() - self.bounds_min.float()) / self.bounds_range.float()
+                normalized = torch.clamp(normalized.float(), 0.0, 1.0)
                 normalized_coords.append(normalized)
                 
-                # Convert to voxel coordinates
-                voxel_coords = (normalized * self.spatial_dims_int.float()).long()
-                voxel_coords = torch.clamp(voxel_coords, 0, self.spatial_dims_int)
+                # Convert to voxel coordinates - ensure consistent types
+                voxel_coords = (normalized.float() * self.spatial_dims_int.float()).long()
+                voxel_coords = torch.clamp(voxel_coords.long(), 0, self.spatial_dims_int.long())
                 
                 valid_mask = (
                     (voxel_coords >= 0).all(dim=1) & 
@@ -252,19 +252,19 @@ class HighResVoxelizer:
                 if valid_mask.sum() == 0:
                     continue
                 
-                valid_coords = voxel_coords[valid_mask]
-                valid_feats = feat[valid_mask]
+                valid_coords = voxel_coords[valid_mask].long()
+                valid_feats = feat[valid_mask].float()
                 
-                # Scatter features
+                # Scatter features - ensure all tensors are consistent types
                 linear_indices = (
-                    valid_coords[:, 0] * H * W + 
-                    valid_coords[:, 1] * W + 
-                    valid_coords[:, 2]
-                )
+                    valid_coords[:, 0].long() * H * W + 
+                    valid_coords[:, 1].long() * W + 
+                    valid_coords[:, 2].long()
+                ).long()
                 
                 for c in range(C):
-                    voxel_grids[b, c].view(-1).scatter_add_(0, linear_indices, valid_feats[:, c])
-                voxel_counts[b, 0].view(-1).scatter_add_(0, linear_indices, torch.ones_like(linear_indices, dtype=torch.float32))
+                    voxel_grids[b, c].view(-1).scatter_add_(0, linear_indices, valid_feats[:, c].float())
+                voxel_counts[b, 0].view(-1).scatter_add_(0, linear_indices, torch.ones_like(linear_indices, dtype=torch.float32, device=self.device))
                 
             except Exception as e:
                 print(f"Voxelization error batch {b}: {e}")
@@ -609,7 +609,7 @@ def train(config, batch_size, epochs, lr, max_batches):
         limit_val_batches=int(max_batches) if max_batches is not None else 1.0,
         gradient_clip_val=0.1,
         accumulate_grad_batches=1,
-        precision=16
+        precision=32
     )
     
     print(f"\nStarting multi-layer training...")
