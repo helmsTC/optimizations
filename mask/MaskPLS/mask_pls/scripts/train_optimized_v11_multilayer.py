@@ -64,6 +64,11 @@ class MultiHeadAttention(torch.nn.Module):
         self.dropout = torch.nn.Dropout(dropout)
         
     def forward(self, query, key, value, attn_mask=None):
+        # Ensure all inputs are float32
+        query = query.float()
+        key = key.float()  
+        value = value.float()
+        
         B, N, _ = query.size()
         
         # Linear projections
@@ -286,6 +291,9 @@ class EnhancedMaskPLSModel(LightningModule):
         self.config = config
         self.save_hyperparameters()
         
+        # Ensure model uses float32 precision
+        self.to(torch.float32)
+        
         # High-res voxelizer - fix bounds from config
         bounds = config.get('KITTI', {}).get('SPACE', [[-50.0,50.0],[-50.0,50.0],[-5.0,3.0]])
         self.voxelizer = HighResVoxelizer(
@@ -354,12 +362,14 @@ class EnhancedMaskPLSModel(LightningModule):
             points_batch, features_batch
         )
         
-        # CNN encoding
+        # CNN encoding - ensure consistent tensor types
+        voxel_grids = voxel_grids.float()  # Ensure float32 for model compatibility
         encoded_features = self.encoder(voxel_grids)  # [B, 128, 30, 30, 15]
         
         # Reshape and project features for transformer
         B, C, D, H, W = encoded_features.shape
         point_features = encoded_features.view(B, C, -1).permute(0, 2, 1)  # [B, N, 128]
+        point_features = point_features.float()  # Ensure float32
         point_features = self.feature_proj(point_features)  # [B, N, 256]
         
         # Multi-layer decoder with progressive refinement
@@ -468,6 +478,12 @@ class EnhancedMaskPLSModel(LightningModule):
     
     def training_step(self, batch, batch_idx):
         try:
+            # Ensure batch tensors are float32
+            if 'pt_coord' in batch:
+                batch['pt_coord'] = [pts.float() for pts in batch['pt_coord']]
+            if 'feats' in batch:
+                batch['feats'] = [feats.float() for feats in batch['feats']]
+                
             outputs, normalized_coords, valid_indices = self(batch)
             
             # Prepare targets - fix batch structure like v10
