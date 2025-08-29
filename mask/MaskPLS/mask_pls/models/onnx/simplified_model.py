@@ -215,7 +215,12 @@ class MaskPLSSimplifiedONNX(nn.Module):
         
         # Spatial configuration for voxelization
         self.spatial_shape = (32, 32, 16)  # Reduced size for efficiency
-        self.coordinate_bounds = self.data_cfg.SPACE
+        
+        # Register coordinate bounds as a buffer so it gets exported to ONNX
+        coord_bounds = self.data_cfg.SPACE
+        # Convert to tensor and register as buffer
+        self.register_buffer('coordinate_bounds', 
+                           torch.tensor(coord_bounds, dtype=torch.float32))
         
         # Encoder
         self.encoder = SimpleVoxelEncoder(cfg.BACKBONE)
@@ -251,7 +256,8 @@ class MaskPLSSimplifiedONNX(nn.Module):
             # Normalize coordinates to [0, 1]
             norm_coords = torch.zeros_like(points[b])
             for i in range(3):
-                min_val, max_val = self.coordinate_bounds[i]
+                min_val = self.coordinate_bounds[i, 0]
+                max_val = self.coordinate_bounds[i, 1]
                 norm_coords[:, i] = (points[b, :, i] - min_val) / (max_val - min_val)
             
             # Clip to valid range
@@ -266,6 +272,16 @@ class MaskPLSSimplifiedONNX(nn.Module):
                 voxel_grids[b, :, d, h, w] += features[b, idx]
         
         return voxel_grids
+    
+    def get_coordinate_bounds(self):
+        """
+        Get the coordinate bounds as a tensor
+        This will be preserved in ONNX export
+        
+        Returns:
+            coordinate_bounds: [3, 2] tensor with [[xmin, xmax], [ymin, ymax], [zmin, zmax]]
+        """
+        return self.coordinate_bounds
     
     def forward(self, voxel_features, point_coords):
         """
