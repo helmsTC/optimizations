@@ -560,7 +560,7 @@ class JITFixedOptimizedMaskPLS(LightningModule):
         
         # HIGH-RES voxelizer (difference #1)
         self.voxelizer = HighResVoxelizer(
-            (120, 120, 60),  # High resolution
+            (120, 120, 60),  # High resolution like original
             cfg[dataset].SPACE,
             device='cuda'
         )
@@ -650,9 +650,12 @@ class JITFixedOptimizedMaskPLS(LightningModule):
                 # Use voxel grids as encoded features (they're already processed)
                 B, C, D, H, W = voxel_grids.shape
                 
-                # Reshape voxel grid to sequence format
+                # Reshape voxel grid to sequence format for transformer
                 # Flatten spatial dims: [B, C, D*H*W] -> [B, D*H*W, C]
                 spatial_features = voxel_grids.view(B, C, -1).permute(0, 2, 1)  # [B, spatial_pts, C]
+                
+                # Use full resolution - this is key for quality
+                print(f"Using full spatial resolution: {spatial_features.shape}")
                 
                 # Initialize feature projection dynamically if needed
                 if self.feature_proj is None:
@@ -666,8 +669,8 @@ class JITFixedOptimizedMaskPLS(LightningModule):
                 # Multi-layer decoder forward
                 enhanced_outputs = self.multi_decoder(projected_features)
                 
-                # TEMPORARILY DISABLE multi-layer decoder to debug base model
-                USE_MULTILAYER = False  # Toggle this to enable/disable
+                # RE-ENABLE multi-layer decoder with PROPER implementation
+                USE_MULTILAYER = True  # Based on original architecture
                 
                 # Use enhanced outputs if shapes are correct
                 if USE_MULTILAYER and (enhanced_outputs["pred_logits"].shape[1] == pred_logits.shape[1] and 
@@ -681,19 +684,17 @@ class JITFixedOptimizedMaskPLS(LightningModule):
                     target_shape = pred_masks.shape  # [B, points, 100]
                     
                     try:
-                        # Reshape decoder masks to match expected format
-                        # We need to transpose and project: [B, 100, 256] -> [B, points, 100]
+                        # PROPER IMPLEMENTATION: Use einsum like original
+                        # Original: outputs_mask = torch.einsum("bqc,bpc->bpq", mask_embed, mask_features)
                         B, num_queries, feat_dim = decoder_masks.shape
-                        target_points = target_shape[1]
                         
-                        # Create a projection layer if needed to go from 256 features to point space
-                        if not hasattr(self, 'mask_projection'):
-                            self.mask_projection = torch.nn.Linear(feat_dim, target_points).to(decoder_masks.device)
-                            print(f"✓ Created mask projection: {feat_dim} -> {target_points}")
+                        # decoder_masks is [B, queries, 256] (mask embeddings)
+                        # projected_features is [B, points, 256] (point features)
+                        # We want [B, points, queries] output
                         
-                        # Project and transpose: [B, 100, 256] -> [B, 100, points] -> [B, points, 100]
-                        projected_masks = self.mask_projection(decoder_masks)  # [B, 100, points]
-                        reshaped_masks = projected_masks.transpose(1, 2)  # [B, points, 100]
+                        # Use einsum exactly like the original
+                        reshaped_masks = torch.einsum("bqc,bpc->bpq", decoder_masks, projected_features)
+                        print(f"✓ Using ORIGINAL einsum mask computation: {reshaped_masks.shape}")
                         
                         if reshaped_masks.shape == target_shape:
                             pred_masks = reshaped_masks
@@ -705,15 +706,15 @@ class JITFixedOptimizedMaskPLS(LightningModule):
                         print(f"Mask reshaping error: {mask_error}")
                         print(f"Mask shape mismatch: {decoder_masks.shape} vs {target_shape}")
                     
-                    # Store auxiliary outputs for deep supervision (reshape them too)
+                    # Store auxiliary outputs for deep supervision (like original)
                     if "aux_outputs" in enhanced_outputs and enhanced_outputs["aux_outputs"]:
                         try:
-                            # Reshape auxiliary masks as well
+                            # Reshape auxiliary masks using einsum
                             reshaped_aux_outputs = []
                             for aux_out in enhanced_outputs["aux_outputs"]:
                                 aux_masks = aux_out["pred_masks"]  # [B, 100, 256]
-                                aux_projected = self.mask_projection(aux_masks)  # [B, 100, points]
-                                aux_reshaped = aux_projected.transpose(1, 2)  # [B, points, 100]
+                                # Use einsum for auxiliary outputs too
+                                aux_reshaped = torch.einsum("bqc,bpc->bpq", aux_masks, projected_features)
                                 
                                 reshaped_aux_outputs.append({
                                     "pred_logits": aux_out["pred_logits"],
@@ -721,7 +722,7 @@ class JITFixedOptimizedMaskPLS(LightningModule):
                                 })
                             
                             enhanced_outputs["aux_outputs"] = reshaped_aux_outputs
-                            print(f"✓ Adding {len(reshaped_aux_outputs)} auxiliary outputs for deep supervision (6-layer decoder)")
+                            print(f"✓ Adding {len(reshaped_aux_outputs)} auxiliary outputs for deep supervision")
                             self._last_enhanced_outputs = enhanced_outputs
                         except Exception as aux_error:
                             print(f"Auxiliary mask reshaping error: {aux_error}")
@@ -730,7 +731,12 @@ class JITFixedOptimizedMaskPLS(LightningModule):
                         self._last_enhanced_outputs = None
                         
                 else:
-                    print(f"Logits shape mismatch: {enhanced_outputs['pred_logits'].shape} vs {pred_logits.shape}")
+                    if USE_MULTILAYER:
+                        # Only print if we're actually trying to use multilayer
+                        if enhanced_outputs["pred_logits"].shape == pred_logits.shape:
+                            print(f"DEBUG: Shapes match but comparison failed (floating point issue?)")
+                        else:
+                            print(f"Logits shape mismatch: {enhanced_outputs['pred_logits'].shape} vs {pred_logits.shape}")
                 
             except Exception as e:
                 print(f"Multi-layer decoder error, using original: {e}")
@@ -882,9 +888,31 @@ class JITFixedOptimizedMaskPLS(LightningModule):
                 print(f"DEBUG: Semantic loss error: {e}")
                 sem_loss_value = torch.tensor(0.1, device='cuda')
             
-            # TEMPORARILY DISABLE AUXILIARY LOSSES for debugging
+            # RE-ENABLE AUXILIARY LOSSES (difference #4 - deep supervision like original)
             aux_loss_value = torch.tensor(0.0, device='cuda', requires_grad=True)
-            print("DEBUG: Auxiliary losses disabled for debugging main loss")
+            if outputs.get('aux_outputs') and len(outputs['aux_outputs']) > 0:
+                aux_weight = 0.4  # Standard auxiliary loss weight from original
+                for i, aux_output in enumerate(outputs['aux_outputs']):
+                    try:
+                        # Compute loss for each auxiliary output (like original)
+                        aux_outputs_dict = {
+                            'pred_logits': aux_output['pred_logits'],
+                            'pred_masks': aux_output['pred_masks'],
+                            'aux_outputs': []  # No nested aux outputs
+                        }
+                        aux_mask_losses = self.mask_loss(aux_outputs_dict, targets, batch.get('masks_ids', []), batch.get('pt_coord', []))
+                        layer_aux_loss = sum(aux_mask_losses.values()) * aux_weight
+                        aux_loss_value = aux_loss_value + layer_aux_loss
+                        
+                        if i == 0:  # Only print for first aux layer to avoid spam
+                            print(f"✓ Auxiliary loss layer {i}: {layer_aux_loss.item():.4f}")
+                            
+                    except Exception as e:
+                        if i == 0:  # Only print error once
+                            print(f"Auxiliary loss error: {e}")
+                        continue
+            else:
+                print("DEBUG: No auxiliary outputs available")
             # if outputs.get('aux_outputs') and len(outputs['aux_outputs']) > 0:
             #     aux_weight = 0.4  # Standard auxiliary loss weight
             #     for i, aux_output in enumerate(outputs['aux_outputs']):
@@ -913,8 +941,8 @@ class JITFixedOptimizedMaskPLS(LightningModule):
             print(f"DEBUG: Loss components - Mask: {mask_loss_sum.item():.4f}, Sem: {sem_loss_value.item():.4f}, Aux: {aux_loss_value.item():.4f}")
             print(f"DEBUG: Raw total loss: {raw_total_loss.item():.4f}")
             
-            # Moderate clamping
-            total_loss = torch.clamp(raw_total_loss, 0.001, 50.0)  # Moderate clamping
+            # Reasonable clamping to allow proper learning
+            total_loss = torch.clamp(raw_total_loss, 0.001, 100.0)  # Allow proper loss range
             print(f"DEBUG: Clamped total loss: {total_loss.item():.4f}")
             
             # Additional stability checks
@@ -955,7 +983,14 @@ class JITFixedOptimizedMaskPLS(LightningModule):
                 if len(self.batch_times) > 50:
                     self.batch_times.pop(0)
                 avg_time = np.mean(self.batch_times)
-                print(f"Batch {batch_idx}: {step_time:.2f}s (avg: {avg_time:.2f}s), loss: {total_loss:.4f}")
+                
+                # Memory monitoring
+                if torch.cuda.is_available():
+                    allocated = torch.cuda.memory_allocated() / 1024**3  # GB
+                    reserved = torch.cuda.memory_reserved() / 1024**3  # GB
+                    print(f"Batch {batch_idx}: {step_time:.2f}s (avg: {avg_time:.2f}s), loss: {total_loss:.4f}, Mem: {allocated:.2f}/{reserved:.2f}GB")
+                else:
+                    print(f"Batch {batch_idx}: {step_time:.2f}s (avg: {avg_time:.2f}s), loss: {total_loss:.4f}")
             
             # MONITOR gradients before returning loss
             if batch_idx % 20 == 0:  # Check every 20 batches
@@ -973,10 +1008,18 @@ class JITFixedOptimizedMaskPLS(LightningModule):
                 if total_grad_norm > 10.0 or max_grad > 5.0:
                     print("WARNING: Large gradients detected - potential instability")
             
+            # Clear cache periodically to prevent OOM
+            if batch_idx % 20 == 0 and torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                gc.collect()
+            
             return total_loss
             
         except Exception as e:
             print(f"Training error {batch_idx}: {e}")
+            # Clear memory on error
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             return torch.tensor(0.1, device='cuda', requires_grad=True)
     
     def prepare_targets(self, batch, max_points, valid_indices):
@@ -1398,7 +1441,7 @@ def main(epochs, batch_size, lr, gpus, num_workers, nuscenes, checkpoint, onnx_i
         max_epochs=epochs,
         callbacks=[lr_monitor, checkpoint_callback],
         log_every_n_steps=10,
-        gradient_clip_val=0.05,  # ULTRA-aggressive clipping (was 0.1)
+        gradient_clip_val=0.1,  # Standard clipping
         accumulate_grad_batches=cfg.TRAIN.BATCH_ACC,
         precision=16,
         num_sanity_val_steps=0,
