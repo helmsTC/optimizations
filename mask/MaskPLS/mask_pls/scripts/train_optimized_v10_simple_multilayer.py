@@ -481,17 +481,37 @@ class SimpleMultiLayerDecoder(torch.nn.Module):
         # Initialize queries
         queries = self.query_embed.weight.unsqueeze(0).repeat(B, 1, 1)
         
-        # 3-layer progressive decoding
-        for layer in self.layers:
-            queries = layer(queries, encoded_features)
+        # Store predictions from each layer for auxiliary supervision
+        all_pred_logits = []
+        all_pred_masks = []
         
-        # Final predictions
-        pred_logits = self.class_head(queries)
-        pred_masks = self.mask_head(queries)
+        # 3-layer progressive decoding with intermediate predictions
+        for i, layer in enumerate(self.layers):
+            queries = layer(queries, encoded_features)
+            
+            # Get predictions at each layer
+            layer_logits = self.class_head(queries)
+            layer_masks = self.mask_head(queries)
+            
+            all_pred_logits.append(layer_logits)
+            all_pred_masks.append(layer_masks)
+        
+        # Final predictions (last layer)
+        pred_logits = all_pred_logits[-1]
+        pred_masks = all_pred_masks[-1]
+        
+        # Auxiliary outputs (all layers except the last)
+        aux_outputs = []
+        for i in range(len(all_pred_logits) - 1):
+            aux_outputs.append({
+                "pred_logits": all_pred_logits[i],
+                "pred_masks": all_pred_masks[i]
+            })
         
         return {
             "pred_logits": pred_logits,
-            "pred_masks": pred_masks
+            "pred_masks": pred_masks,
+            "aux_outputs": aux_outputs  # For auxiliary supervision
         }
 
 
@@ -616,14 +636,22 @@ class JITFixedOptimizedMaskPLS(LightningModule):
                     enhanced_outputs["pred_logits"].shape[2] == pred_logits.shape[2]):
                     
                     pred_logits = enhanced_outputs["pred_logits"]
-                    print("✓ Using multi-layer decoder logits")
+                    print(f"✓ Using multi-layer decoder logits (3 layers)")
                     
                     # For masks, we need to ensure shape compatibility
                     if enhanced_outputs["pred_masks"].shape[-1] == pred_masks.shape[-1]:
                         pred_masks = enhanced_outputs["pred_masks"]
-                        print("✓ Using multi-layer decoder masks")
+                        print(f"✓ Using multi-layer decoder masks")
                     else:
                         print(f"Mask shape mismatch: {enhanced_outputs['pred_masks'].shape} vs {pred_masks.shape}")
+                    
+                    # Store auxiliary outputs for deep supervision
+                    if "aux_outputs" in enhanced_outputs and enhanced_outputs["aux_outputs"]:
+                        print(f"✓ Adding {len(enhanced_outputs['aux_outputs'])} auxiliary outputs for deep supervision")
+                        self._last_enhanced_outputs = enhanced_outputs
+                    else:
+                        self._last_enhanced_outputs = None
+                        
                 else:
                     print(f"Logits shape mismatch: {enhanced_outputs['pred_logits'].shape} vs {pred_logits.shape}")
                 
@@ -644,10 +672,18 @@ class JITFixedOptimizedMaskPLS(LightningModule):
             pred_masks = torch.zeros(B, batch_coords.shape[1], 100, device='cuda')
             sem_logits = torch.zeros(B, batch_coords.shape[1], self.num_classes, device='cuda')
         
+        # Check if we have auxiliary outputs from multi-layer decoder
+        aux_outputs = []
+        try:
+            if hasattr(self, '_last_enhanced_outputs') and self._last_enhanced_outputs:
+                aux_outputs = self._last_enhanced_outputs.get("aux_outputs", [])
+        except:
+            aux_outputs = []
+        
         outputs = {
             'pred_logits': pred_logits,
             'pred_masks': pred_masks,
-            'aux_outputs': []
+            'aux_outputs': aux_outputs
         }
         
         return outputs, padding_masks, sem_logits, valid_indices
@@ -720,8 +756,32 @@ class JITFixedOptimizedMaskPLS(LightningModule):
             mask_losses = self.mask_loss(outputs, targets, batch.get('masks_ids', []), batch.get('pt_coord', []))
             sem_loss_value = self.compute_sem_loss(batch, sem_logits, valid_indices, padding)
             
-            # Total loss with ORIGINAL weighting
-            total_loss = sum(mask_losses.values()) + sem_loss_value
+            # AUXILIARY LOSSES for deep supervision
+            aux_loss_value = torch.tensor(0.0, device='cuda', requires_grad=True)
+            if outputs.get('aux_outputs') and len(outputs['aux_outputs']) > 0:
+                aux_weight = 0.4  # Standard auxiliary loss weight
+                for i, aux_output in enumerate(outputs['aux_outputs']):
+                    try:
+                        # Compute loss for each auxiliary output
+                        aux_outputs_dict = {
+                            'pred_logits': aux_output['pred_logits'],
+                            'pred_masks': aux_output['pred_masks'],
+                            'aux_outputs': []  # No nested aux outputs
+                        }
+                        aux_mask_losses = self.mask_loss(aux_outputs_dict, targets, batch.get('masks_ids', []), batch.get('pt_coord', []))
+                        layer_aux_loss = sum(aux_mask_losses.values()) * aux_weight
+                        aux_loss_value = aux_loss_value + layer_aux_loss
+                        
+                        if i == 0:  # Only print for first aux layer to avoid spam
+                            print(f"✓ Auxiliary loss layer {i}: {layer_aux_loss.item():.4f}")
+                            
+                    except Exception as e:
+                        if i == 0:  # Only print error once
+                            print(f"Auxiliary loss error: {e}")
+                        continue
+            
+            # Total loss with ORIGINAL weighting + auxiliary losses
+            total_loss = sum(mask_losses.values()) + sem_loss_value + aux_loss_value
             total_loss = torch.clamp(total_loss, 0.0, 100.0)
             
             if torch.isnan(total_loss) or torch.isinf(total_loss):
@@ -735,6 +795,10 @@ class JITFixedOptimizedMaskPLS(LightningModule):
                         self.log(f"train/{k}", v, batch_size=self.cfg.TRAIN.BATCH_SIZE)
                 if torch.isfinite(sem_loss_value):
                     self.log("train/sem_loss", sem_loss_value, batch_size=self.cfg.TRAIN.BATCH_SIZE)
+                
+                # Log auxiliary loss
+                if aux_loss_value.item() > 0:
+                    self.log("train/aux_loss", aux_loss_value, batch_size=self.cfg.TRAIN.BATCH_SIZE)
                 
                 step_time = time.time() - step_start
                 self.batch_times.append(step_time)
@@ -1115,8 +1179,8 @@ def main(epochs, batch_size, lr, gpus, num_workers, nuscenes, checkpoint, onnx_i
     data = SemanticDatasetModule(cfg)
     model = JITFixedOptimizedMaskPLS(cfg, onnx_interval=onnx_interval)
     
-    # Enable debug shapes for first few batches
-    model._debug_shapes = True
+    # Disable debug shapes now that it's working
+    model._debug_shapes = False
     
     if checkpoint:
         print(f"Loading checkpoint: {checkpoint}")
