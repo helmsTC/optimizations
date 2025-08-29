@@ -305,9 +305,19 @@ class FixedMaskLoss(torch.nn.Module):
         return {"loss_ce": torch.clamp(loss_ce, 0.0, 20.0)}
     
     def loss_masks(self, outputs, targets, indices, num_masks, masks_ids):
-        """ORIGINAL mask loss with FIXED JIT functions"""
+        """ORIGINAL mask loss with FIXED JIT functions + DEBUGGING"""
+        
+        print(f"\n=== MASK LOSS DEBUG ===")
+        print(f"Targets masks: {[t.shape if hasattr(t, 'shape') else type(t) for t in targets['masks']]}")
+        print(f"Outputs pred_masks: {outputs['pred_masks'].shape}")
+        print(f"Indices: {[(i[0].shape, i[1].shape) if len(i) == 2 else 'invalid' for i in indices]}")
+        print(f"Num masks: {num_masks}")
+        
         masks = [t for t in targets["masks"] if t.numel() > 0]
+        print(f"Valid masks after filtering: {len(masks)}")
+        
         if not masks:
+            print(f"ERROR: No valid masks found - returning fallback loss")
             device = outputs["pred_masks"].device
             return {
                 "loss_mask": torch.tensor(0.1, device=device, requires_grad=True),
@@ -316,7 +326,10 @@ class FixedMaskLoss(torch.nn.Module):
         
         try:
             n_masks = [m.shape[0] for m in masks]
+            print(f"N_masks per sample: {n_masks}, total: {sum(n_masks)}")
+            
             if sum(n_masks) == 0:
+                print(f"ERROR: All masks have 0 instances - returning fallback loss")
                 device = outputs["pred_masks"].device
                 return {
                     "loss_mask": torch.tensor(0.1, device=device, requires_grad=True),
@@ -328,7 +341,12 @@ class FixedMaskLoss(torch.nn.Module):
             pred_idx = self._get_pred_permutation_idx(indices)
             tgt_idx = self._get_tgt_permutation_idx(indices, n_masks)
             
+            print(f"Pred idx: {len(pred_idx[0]) if isinstance(pred_idx, tuple) else 'invalid'} predictions")
+            print(f"Tgt idx: {len(tgt_idx)} targets")
+            
             if len(pred_idx[0]) == 0 or len(tgt_idx) == 0:
+                print(f"ERROR: Empty indices after Hungarian matching - no matched pred/target pairs")
+                print(f"  This suggests Hungarian matcher found no valid assignments")
                 device = outputs["pred_masks"].device
                 return {
                     "loss_mask": torch.tensor(0.1, device=device, requires_grad=True),
@@ -351,7 +369,10 @@ class FixedMaskLoss(torch.nn.Module):
                     # Use original-like fallback
                     idx = [torch.randperm(m.shape[1], device=m.device)[:min(self.n_mask_pts, m.shape[1])] for m in masks]
                 
+                print(f"Point sampling successful: {[len(i) for i in idx] if idx else 'failed'}")
+                
                 if not idx or all(len(i) == 0 for i in idx):
+                    print(f"ERROR: Point sampling failed - no points to compute loss on")
                     device = pred_masks.device
                     return {
                         "loss_mask": torch.tensor(0.1, device=device, requires_grad=True),
@@ -387,9 +408,17 @@ class FixedMaskLoss(torch.nn.Module):
                 point_logits = torch.cat(point_logits_list)
             
             # FIXED: Use the global JIT functions (difference #2)
+            mask_loss_val = sigmoid_ce_loss_jit(point_logits, point_labels, float(num_masks))
+            dice_loss_val = dice_loss_jit(point_logits, point_labels, float(num_masks))
+            
+            print(f"SUCCESS: Computed real mask losses - BCE: {mask_loss_val.item():.4f}, Dice: {dice_loss_val.item():.4f}")
+            print(f"Point logits range: [{point_logits.min().item():.3f}, {point_logits.max().item():.3f}]")
+            print(f"Point labels range: [{point_labels.min().item():.3f}, {point_labels.max().item():.3f}]")
+            print(f"=== END MASK LOSS DEBUG ===\n")
+            
             losses = {
-                "loss_mask": torch.clamp(sigmoid_ce_loss_jit(point_logits, point_labels, float(num_masks)), 0.0, 15.0),
-                "loss_dice": torch.clamp(dice_loss_jit(point_logits, point_labels, float(num_masks)), 0.0, 15.0),
+                "loss_mask": torch.clamp(mask_loss_val, 0.0, 15.0),
+                "loss_dice": torch.clamp(dice_loss_val, 0.0, 15.0),
             }
             
             return losses
@@ -942,11 +971,20 @@ class JITFixedOptimizedMaskPLS(LightningModule):
                     }
                     print(f"DEBUG: Using SIMPLE LOSS - CE: {simple_ce_loss.item():.4f}")
                 else:
+                    print(f"\nDEBUG: Using COMPLEX LOSS with real targets for learning")
+                    print(f"Calling mask_loss with:")
+                    print(f"  outputs keys: {list(outputs.keys())}")
+                    print(f"  targets keys: {list(targets.keys())}")
+                    print(f"  masks_ids: {len(batch.get('masks_ids', []))} items")
+                    print(f"  pt_coord: {len(batch.get('pt_coord', []))} items")
+                    
                     mask_losses = self.mask_loss(outputs, targets, batch.get('masks_ids', []), batch.get('pt_coord', []))
                     print(f"DEBUG: Individual mask losses: {[(k, v.item()) for k, v in mask_losses.items()]}")
             except Exception as e:
                 print(f"DEBUG: Mask loss error: {e}")
-                mask_losses = {'loss_ce': torch.tensor(50.0, device='cuda'), 'loss_dice': torch.tensor(50.0, device='cuda'), 'loss_mask': torch.tensor(50.0, device='cuda')}
+                import traceback
+                print(f"Full traceback:\n{traceback.format_exc()}")
+                mask_losses = {'loss_ce': torch.tensor(2.0, device='cuda'), 'loss_dice': torch.tensor(2.0, device='cuda'), 'loss_mask': torch.tensor(2.0, device='cuda')}
             
             try:
                 sem_loss_value = self.compute_sem_loss(batch, sem_logits, valid_indices, padding)
