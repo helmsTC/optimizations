@@ -454,26 +454,32 @@ class FixedMaskLoss(torch.nn.Module):
 
 
 class SimpleMultiLayerDecoder(torch.nn.Module):
-    """6-layer decoder - closer to original architecture"""
+    """2-layer decoder - reduced for debugging"""
     def __init__(self, d_model=256, num_queries=100):
         super().__init__()
         
         # Query embeddings  
         self.query_embed = torch.nn.Embedding(num_queries, d_model)
         
-        # 6-layer decoder for better progressive refinement
+        # 2-layer decoder for debugging (reduced from 6)
         self.layers = torch.nn.ModuleList([
             torch.nn.TransformerDecoderLayer(
                 d_model=d_model, 
                 nhead=8, 
                 dim_feedforward=512,
                 batch_first=True
-            ) for _ in range(6)
+            ) for _ in range(2)
         ])
         
         # Final prediction heads - match v10 output dimensions
         self.class_head = torch.nn.Linear(d_model, 21)  # 20 classes + 1 for no-object/background
         self.mask_head = torch.nn.Linear(d_model, d_model)
+        
+        # Better initialization to prevent extreme predictions
+        torch.nn.init.xavier_uniform_(self.class_head.weight, gain=0.1)
+        torch.nn.init.constant_(self.class_head.bias, 0)
+        torch.nn.init.xavier_uniform_(self.mask_head.weight, gain=0.1)
+        torch.nn.init.constant_(self.mask_head.bias, 0)
         
     def forward(self, encoded_features):
         B, N, C = encoded_features.shape
@@ -640,7 +646,7 @@ class JITFixedOptimizedMaskPLS(LightningModule):
                     enhanced_outputs["pred_logits"].shape[2] == pred_logits.shape[2]):
                     
                     pred_logits = enhanced_outputs["pred_logits"]
-                    print(f"✓ Using multi-layer decoder logits (6 layers)")
+                    print(f"✓ Using multi-layer decoder logits (2 layers - debug)")
                     
                     # For masks, we need to reshape from [B, queries, feat_dim] to [B, points, queries]
                     decoder_masks = enhanced_outputs["pred_masks"]  # [B, 100, 256]
@@ -802,6 +808,10 @@ class JITFixedOptimizedMaskPLS(LightningModule):
             print(f"DEBUG: targets count: {len(targets) if targets else 0}")
             
             try:
+                # More detailed debugging before mask loss
+                print(f"DEBUG: Target shapes: {[t.get('labels', torch.empty(0)).shape if isinstance(t, dict) else 'not_dict' for t in targets]}")
+                print(f"DEBUG: Target label ranges: {[t.get('labels', torch.empty(0)).unique().tolist() if isinstance(t, dict) and 'labels' in t else 'no_labels' for t in targets]}")
+                
                 mask_losses = self.mask_loss(outputs, targets, batch.get('masks_ids', []), batch.get('pt_coord', []))
                 print(f"DEBUG: Individual mask losses: {[(k, v.item()) for k, v in mask_losses.items()]}")
             except Exception as e:
