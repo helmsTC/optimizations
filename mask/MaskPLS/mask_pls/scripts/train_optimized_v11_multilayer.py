@@ -286,10 +286,11 @@ class EnhancedMaskPLSModel(LightningModule):
         self.config = config
         self.save_hyperparameters()
         
-        # High-res voxelizer
+        # High-res voxelizer - fix bounds from config
+        bounds = config.get('KITTI', {}).get('SPACE', [[-50.0,50.0],[-50.0,50.0],[-5.0,3.0]])
         self.voxelizer = HighResVoxelizer(
             spatial_shape=(120, 120, 60),
-            bounds=config.bounds,
+            bounds=bounds,
             device='cuda'
         )
         
@@ -319,19 +320,21 @@ class EnhancedMaskPLSModel(LightningModule):
             num_queries=100
         )
         
-        # Loss components
+        # Loss components - fix config mapping
+        loss_weights = config.get('LOSS', {}).get('WEIGHTS', [2.0, 5.0, 5.0])
+        
         self.matcher = HungarianMatcher(
-            cost_class=config.set_cost_class,
-            cost_mask=config.set_cost_mask, 
-            cost_dice=config.set_cost_dice,
-            num_points=config.oversample_ratio
+            cost_class=1.0,  # Fixed values
+            cost_mask=5.0, 
+            cost_dice=5.0,
+            num_points=config.get('LOSS', {}).get('NUM_POINTS', 70000)
         )
         
-        # Loss weights matching original
+        # Loss weights from config
         self.weight_dict = {
-            'loss_ce': config.cls_loss_coef,
-            'loss_mask': config.mask_loss_coef,
-            'loss_dice': config.dice_loss_coef,
+            'loss_ce': loss_weights[0],    # 2.0
+            'loss_mask': loss_weights[2],  # 5.0 
+            'loss_dice': loss_weights[1],  # 5.0
         }
         
         # Add auxiliary loss weights (deep supervision)
@@ -523,8 +526,8 @@ class EnhancedMaskPLSModel(LightningModule):
         
         scheduler = torch.optim.lr_scheduler.StepLR(
             optimizer,
-            step_size=self.config.lr_drop,
-            gamma=0.1
+            step_size=self.config.get('TRAIN', {}).get('STEP', 80),
+            gamma=self.config.get('TRAIN', {}).get('DECAY', 0.1)
         )
         
         return {
@@ -577,7 +580,7 @@ def train(config, batch_size, epochs, lr, max_batches):
     
     # Enhanced config for multi-layer
     config.aux_loss_coef = 0.4  # Auxiliary loss weight
-    config.num_classes = 19  # Semantic classes
+    config.num_classes = config.get('KITTI', {}).get('NUM_CLASSES', 20)  # From config
     
     # Setup data
     data_module = SemanticDatasetModule(config)
