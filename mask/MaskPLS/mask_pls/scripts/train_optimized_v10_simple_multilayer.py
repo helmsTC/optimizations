@@ -537,7 +537,7 @@ class JITFixedOptimizedMaskPLS(LightningModule):
         # We'll determine the input dimension dynamically based on actual voxel grid shape
         self.feature_proj = None  # Initialize dynamically
         self._debug_shapes = False  # Disable debug - everything working now
-        self._use_multilayer = False  # DISABLE multi-layer to debug loss issue
+        self._use_multilayer = True   # RE-ENABLE multi-layer (it was working)
         
         # Fixed JIT loss
         self.mask_loss = FixedMaskLoss(cfg.LOSS, cfg[dataset])
@@ -608,39 +608,34 @@ class JITFixedOptimizedMaskPLS(LightningModule):
             # Get CNN features from original model
             pred_logits, pred_masks, sem_logits = self.model(voxel_grids, batch_coords)
             
-            # STEP 1: Add multi-layer decoder with careful tensor handling
-            if not self._use_multilayer:
-                print("DEBUG: Using original v10 outputs (multi-layer disabled)")
-            
-            # Multi-layer decoder logic (disabled for debugging)
-            if self._use_multilayer:
-                try:
-                    # Debug: Print tensor shapes to understand what we're working with
-                    if hasattr(self, '_debug_shapes') and self._debug_shapes:
-                        print(f"Debug - voxel_grids shape: {voxel_grids.shape}")
-                        print(f"Debug - batch_coords shape: {batch_coords.shape}")
-                        print(f"Debug - pred_logits shape: {pred_logits.shape}")
-                        print(f"Debug - pred_masks shape: {pred_masks.shape}")
+            # STEP 1: Add multi-layer decoder with careful tensor handling  
+            try:
+                # Debug: Print tensor shapes to understand what we're working with  
+                if hasattr(self, '_debug_shapes') and self._debug_shapes:
+                    print(f"Debug - voxel_grids shape: {voxel_grids.shape}")
+                    print(f"Debug - batch_coords shape: {batch_coords.shape}")
+                    print(f"Debug - pred_logits shape: {pred_logits.shape}")
+                    print(f"Debug - pred_masks shape: {pred_masks.shape}")
                 
-                    # Multi-layer decoder processing
-                    # Use voxel grids as encoded features (they're already processed)
-                    B, C, D, H, W = voxel_grids.shape
-                    
-                    # Reshape voxel grid to sequence format
-                    # Flatten spatial dims: [B, C, D*H*W] -> [B, D*H*W, C]
-                    spatial_features = voxel_grids.view(B, C, -1).permute(0, 2, 1)  # [B, spatial_pts, C]
-                    
-                    # Initialize feature projection dynamically if needed
-                    if self.feature_proj is None:
-                        input_dim = spatial_features.shape[-1]
-                        self.feature_proj = torch.nn.Linear(input_dim, 256).to(spatial_features.device)
-                        print(f"✓ Initialized feature projection: {input_dim} -> 256")
-                    
-                    # Project to decoder dimension
-                    projected_features = self.feature_proj(spatial_features)  # [B, spatial_pts, 256]
-                    
-                    # Multi-layer decoder forward
-                    enhanced_outputs = self.multi_decoder(projected_features)
+                # Multi-layer decoder processing
+                # Use voxel grids as encoded features (they're already processed)
+                B, C, D, H, W = voxel_grids.shape
+                
+                # Reshape voxel grid to sequence format
+                # Flatten spatial dims: [B, C, D*H*W] -> [B, D*H*W, C]
+                spatial_features = voxel_grids.view(B, C, -1).permute(0, 2, 1)  # [B, spatial_pts, C]
+                
+                # Initialize feature projection dynamically if needed
+                if self.feature_proj is None:
+                    input_dim = spatial_features.shape[-1]
+                    self.feature_proj = torch.nn.Linear(input_dim, 256).to(spatial_features.device)
+                    print(f"✓ Initialized feature projection: {input_dim} -> 256")
+                
+                # Project to decoder dimension
+                projected_features = self.feature_proj(spatial_features)  # [B, spatial_pts, 256]
+                
+                # Multi-layer decoder forward
+                enhanced_outputs = self.multi_decoder(projected_features)
                 
                     # Use enhanced outputs if shapes are correct
                     if (enhanced_outputs["pred_logits"].shape[1] == pred_logits.shape[1] and 
