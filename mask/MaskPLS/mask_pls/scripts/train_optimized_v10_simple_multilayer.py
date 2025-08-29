@@ -585,20 +585,12 @@ class JITFixedOptimizedMaskPLS(LightningModule):
             # Get CNN features from original model
             pred_logits, pred_masks, sem_logits = self.model(voxel_grids, batch_coords)
             
-            # Extract CNN features for multi-layer decoder
-            # Assuming the model has CNN features we can access
+            # TEMPORARILY DISABLE multi-layer decoder to test base functionality
+            # TODO: Re-enable once base v10 copy is confirmed working
             try:
-                # Get encoded features - patch into the CNN output
-                B, C, D, H, W = voxel_grids.shape
-                cnn_features = voxel_grids.view(B, C, -1).permute(0, 2, 1)  # [B, N, C]
-                cnn_features = self.feature_proj(cnn_features)  # [B, N, 256]
-                
-                # Multi-layer decoder forward
-                enhanced_outputs = self.multi_decoder(cnn_features)
-                
-                # Use enhanced outputs
-                pred_logits = enhanced_outputs["pred_logits"]
-                pred_masks = enhanced_outputs["pred_masks"]
+                # For now, just use original outputs (test base v10 functionality)
+                print("Using original v10 outputs (multi-layer decoder disabled for testing)")
+                pass
                 
             except Exception as e:
                 print(f"Multi-layer decoder error, using original: {e}")
