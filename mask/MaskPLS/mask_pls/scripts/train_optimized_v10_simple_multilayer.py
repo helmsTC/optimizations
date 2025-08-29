@@ -514,7 +514,8 @@ class JITFixedOptimizedMaskPLS(LightningModule):
         
         # ADD MULTI-LAYER DECODER - Simple extension
         self.multi_decoder = SimpleMultiLayerDecoder(d_model=256, num_queries=100)
-        self.feature_proj = torch.nn.Linear(128, 256)  # Project to decoder dim
+        self.feature_proj = torch.nn.Linear(4, 256)  # Project from voxel features (C=4) to decoder dim
+        self._debug_shapes = False  # Set to True to enable shape debugging
         
         # Fixed JIT loss
         self.mask_loss = FixedMaskLoss(cfg.LOSS, cfg[dataset])
@@ -585,16 +586,50 @@ class JITFixedOptimizedMaskPLS(LightningModule):
             # Get CNN features from original model
             pred_logits, pred_masks, sem_logits = self.model(voxel_grids, batch_coords)
             
-            # TEMPORARILY DISABLE multi-layer decoder to test base functionality
-            # TODO: Re-enable once base v10 copy is confirmed working
+            # STEP 1: Add multi-layer decoder with careful tensor handling
             try:
-                # For now, just use original outputs (test base v10 functionality)
-                print("Using original v10 outputs (multi-layer decoder disabled for testing)")
-                pass
+                # Debug: Print tensor shapes to understand what we're working with
+                if hasattr(self, '_debug_shapes') and self._debug_shapes:
+                    print(f"Debug - voxel_grids shape: {voxel_grids.shape}")
+                    print(f"Debug - batch_coords shape: {batch_coords.shape}")
+                    print(f"Debug - pred_logits shape: {pred_logits.shape}")
+                    print(f"Debug - pred_masks shape: {pred_masks.shape}")
+                
+                # Use voxel grids as encoded features (they're already processed)
+                B, C, D, H, W = voxel_grids.shape
+                
+                # Reshape voxel grid to sequence format
+                # Flatten spatial dims: [B, C, D*H*W] -> [B, D*H*W, C]
+                spatial_features = voxel_grids.view(B, C, -1).permute(0, 2, 1)  # [B, spatial_pts, C]
+                
+                # Project to decoder dimension (C -> 256)
+                if spatial_features.shape[-1] != 256:
+                    projected_features = self.feature_proj(spatial_features)  # [B, spatial_pts, 256]
+                else:
+                    projected_features = spatial_features
+                
+                # Multi-layer decoder forward
+                enhanced_outputs = self.multi_decoder(projected_features)
+                
+                # Use enhanced outputs if shapes are correct
+                if (enhanced_outputs["pred_logits"].shape[1] == pred_logits.shape[1] and 
+                    enhanced_outputs["pred_logits"].shape[2] == pred_logits.shape[2]):
+                    
+                    pred_logits = enhanced_outputs["pred_logits"]
+                    print("✓ Using multi-layer decoder logits")
+                    
+                    # For masks, we need to ensure shape compatibility
+                    if enhanced_outputs["pred_masks"].shape[-1] == pred_masks.shape[-1]:
+                        pred_masks = enhanced_outputs["pred_masks"]
+                        print("✓ Using multi-layer decoder masks")
+                    else:
+                        print(f"Mask shape mismatch: {enhanced_outputs['pred_masks'].shape} vs {pred_masks.shape}")
+                else:
+                    print(f"Logits shape mismatch: {enhanced_outputs['pred_logits'].shape} vs {pred_logits.shape}")
                 
             except Exception as e:
                 print(f"Multi-layer decoder error, using original: {e}")
-                # Fallback to original outputs
+                # Fallback to original outputs (safe)
                 pass
             
             # Stability
@@ -1079,6 +1114,9 @@ def main(epochs, batch_size, lr, gpus, num_workers, nuscenes, checkpoint, onnx_i
     
     data = SemanticDatasetModule(cfg)
     model = JITFixedOptimizedMaskPLS(cfg, onnx_interval=onnx_interval)
+    
+    # Enable debug shapes for first few batches
+    model._debug_shapes = True
     
     if checkpoint:
         print(f"Loading checkpoint: {checkpoint}")
