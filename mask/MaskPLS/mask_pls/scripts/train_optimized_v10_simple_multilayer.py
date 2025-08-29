@@ -642,16 +642,16 @@ class JITFixedOptimizedMaskPLS(LightningModule):
                     # Multi-layer decoder forward
                     enhanced_outputs = self.multi_decoder(projected_features)
                 
-                # Use enhanced outputs if shapes are correct
-                if (enhanced_outputs["pred_logits"].shape[1] == pred_logits.shape[1] and 
-                    enhanced_outputs["pred_logits"].shape[2] == pred_logits.shape[2]):
-                    
-                    pred_logits = enhanced_outputs["pred_logits"]
-                    print(f"✓ Using multi-layer decoder logits (6 layers)")
-                    
-                    # For masks, we need to reshape from [B, queries, feat_dim] to [B, points, queries]
-                    decoder_masks = enhanced_outputs["pred_masks"]  # [B, 100, 256]
-                    target_shape = pred_masks.shape  # [B, points, 100]
+                    # Use enhanced outputs if shapes are correct
+                    if (enhanced_outputs["pred_logits"].shape[1] == pred_logits.shape[1] and 
+                        enhanced_outputs["pred_logits"].shape[2] == pred_logits.shape[2]):
+                        
+                        pred_logits = enhanced_outputs["pred_logits"]
+                        print(f"✓ Using multi-layer decoder logits (6 layers)")
+                        
+                        # For masks, we need to reshape from [B, queries, feat_dim] to [B, points, queries]
+                        decoder_masks = enhanced_outputs["pred_masks"]  # [B, 100, 256]
+                        target_shape = pred_masks.shape  # [B, points, 100]
                     
                     try:
                         # Reshape decoder masks to match expected format
