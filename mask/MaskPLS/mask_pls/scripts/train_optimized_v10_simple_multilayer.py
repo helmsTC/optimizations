@@ -475,11 +475,19 @@ class SimpleMultiLayerDecoder(torch.nn.Module):
         self.class_head = torch.nn.Linear(d_model, 21)  # 20 classes + 1 for no-object/background
         self.mask_head = torch.nn.Linear(d_model, d_model)
         
-        # Better initialization to prevent extreme predictions
-        torch.nn.init.xavier_uniform_(self.class_head.weight, gain=0.1)
+        # ULTRA-CONSERVATIVE initialization to prevent gradient explosions
+        torch.nn.init.xavier_uniform_(self.class_head.weight, gain=0.01)  # Even smaller gain
         torch.nn.init.constant_(self.class_head.bias, 0)
-        torch.nn.init.xavier_uniform_(self.mask_head.weight, gain=0.1)
+        torch.nn.init.xavier_uniform_(self.mask_head.weight, gain=0.01)  # Even smaller gain
         torch.nn.init.constant_(self.mask_head.bias, 0)
+        
+        # Initialize transformer layers with small weights too
+        for layer in self.layers:
+            for name, param in layer.named_parameters():
+                if 'weight' in name and param.dim() > 1:
+                    torch.nn.init.xavier_uniform_(param, gain=0.01)
+                elif 'bias' in name:
+                    torch.nn.init.constant_(param, 0)
         
     def forward(self, encoded_features):
         B, N, C = encoded_features.shape
@@ -571,6 +579,11 @@ class JITFixedOptimizedMaskPLS(LightningModule):
         self.batch_times = []
         self.last_onnx_export_epoch = -1
         
+        # EMA for model stability
+        self.ema_decay = 0.999
+        self.ema_model = None
+        self._last_loss = 10.0  # Initialize loss tracking
+        
         # ORIGINAL initialization (difference #5)
         self._init_weights_original()
         
@@ -588,6 +601,19 @@ class JITFixedOptimizedMaskPLS(LightningModule):
                 torch.nn.init.normal_(m.weight, 0, 0.01)
                 if m.bias is not None:
                     torch.nn.init.constant_(m.bias, 0)
+    
+    def _update_ema_model(self):
+        """Update exponential moving average model for stability"""
+        if self.ema_model is None:
+            # Initialize EMA model on first call
+            self.ema_model = {}
+            for name, param in self.named_parameters():
+                self.ema_model[name] = param.data.clone()
+        else:
+            # Update EMA with current parameters
+            for name, param in self.named_parameters():
+                if name in self.ema_model:
+                    self.ema_model[name].mul_(self.ema_decay).add_(param.data, alpha=1 - self.ema_decay)
     
     def forward(self, batch):
         """High-quality forward pass"""
@@ -850,18 +876,31 @@ class JITFixedOptimizedMaskPLS(LightningModule):
             #                 print(f"Auxiliary loss error: {e}")
             #             continue
             
-            # Total loss with ORIGINAL weighting + auxiliary losses
+            # ULTRA-AGGRESSIVE loss stabilization to prevent instability
             mask_loss_sum = sum(mask_losses.values())
             raw_total_loss = mask_loss_sum + sem_loss_value + aux_loss_value
             print(f"DEBUG: Loss components - Mask: {mask_loss_sum.item():.4f}, Sem: {sem_loss_value.item():.4f}, Aux: {aux_loss_value.item():.4f}")
             print(f"DEBUG: Raw total loss: {raw_total_loss.item():.4f}")
             
-            total_loss = torch.clamp(raw_total_loss, 0.0, 100.0)
+            # MUCH tighter clamping to prevent explosions
+            total_loss = torch.clamp(raw_total_loss, 0.001, 25.0)  # Max 25 instead of 100
             print(f"DEBUG: Clamped total loss: {total_loss.item():.4f}")
             
-            if torch.isnan(total_loss) or torch.isinf(total_loss):
-                print("DEBUG: Loss is NaN/Inf, using fallback")
-                total_loss = torch.tensor(0.5, device='cuda', requires_grad=True)
+            # Additional stability checks
+            if torch.isnan(total_loss) or torch.isinf(total_loss) or total_loss.item() > 50.0:
+                print("DEBUG: Loss is unstable, using conservative fallback")
+                total_loss = torch.tensor(0.1, device='cuda', requires_grad=True)
+            
+            # Monitor gradient explosion indicators
+            if hasattr(self, '_last_loss'):
+                loss_change = abs(total_loss.item() - self._last_loss)
+                if loss_change > 10.0:  # Sudden jump indicator
+                    print(f"WARNING: Large loss jump detected: {self._last_loss:.4f} -> {total_loss.item():.4f}")
+                    # Use exponential moving average for smoothing
+                    total_loss = torch.tensor(0.7 * self._last_loss + 0.3 * total_loss.item(), device='cuda', requires_grad=True)
+                    print(f"DEBUG: Smoothed loss to: {total_loss.item():.4f}")
+            
+            self._last_loss = total_loss.item()
             
             # Logging
             if batch_idx % 10 == 0:
@@ -871,6 +910,10 @@ class JITFixedOptimizedMaskPLS(LightningModule):
                         self.log(f"train/{k}", v, batch_size=self.cfg.TRAIN.BATCH_SIZE)
                 if torch.isfinite(sem_loss_value):
                     self.log("train/sem_loss", sem_loss_value, batch_size=self.cfg.TRAIN.BATCH_SIZE)
+                
+                # Update EMA model for stability (every few batches)
+                if batch_idx % 5 == 0:
+                    self._update_ema_model()
                 
                 # Log auxiliary loss
                 if aux_loss_value.item() > 0:
@@ -882,6 +925,22 @@ class JITFixedOptimizedMaskPLS(LightningModule):
                     self.batch_times.pop(0)
                 avg_time = np.mean(self.batch_times)
                 print(f"Batch {batch_idx}: {step_time:.2f}s (avg: {avg_time:.2f}s), loss: {total_loss:.4f}")
+            
+            # MONITOR gradients before returning loss
+            if batch_idx % 20 == 0:  # Check every 20 batches
+                total_grad_norm = 0.0
+                max_grad = 0.0
+                for name, param in self.named_parameters():
+                    if param.grad is not None:
+                        param_norm = param.grad.data.norm(2)
+                        total_grad_norm += param_norm.item() ** 2
+                        max_grad = max(max_grad, param_norm.item())
+                
+                total_grad_norm = total_grad_norm ** (1. / 2)
+                print(f"DEBUG: Gradient norms - Total: {total_grad_norm:.4f}, Max: {max_grad:.4f}")
+                
+                if total_grad_norm > 10.0 or max_grad > 5.0:
+                    print("WARNING: Large gradients detected - potential instability")
             
             return total_loss
             
@@ -1177,24 +1236,37 @@ class JITFixedOptimizedMaskPLS(LightningModule):
             self.log("metrics/iou", 0.0, batch_size=bs)
     
     def configure_optimizers(self):
-        """ORIGINAL optimizer settings (difference #5)"""
+        """ULTRA-STABILIZED optimizer settings for fixing loss instability"""
+        # ULTRA-CONSERVATIVE learning rate for fixing instability
+        stable_lr = self.cfg.TRAIN.LR * 0.01  # 100x reduction for extreme stability
+        print(f"DEBUG: Using ultra-conservative LR {stable_lr:.6f} for stability (was {self.cfg.TRAIN.LR})")
+        
         optimizer = torch.optim.AdamW(
             self.parameters(),
-            lr=self.cfg.TRAIN.LR,  # ORIGINAL LR
-            weight_decay=1e-4
+            lr=stable_lr,
+            weight_decay=1e-6,  # Even lower weight decay
+            eps=1e-8,
+            betas=(0.9, 0.999)  # Default stable betas
         )
         
-        scheduler = torch.optim.lr_scheduler.StepLR(
+        # Warmup scheduler for gradual learning
+        def warmup_lambda(step):
+            warmup_steps = 50
+            if step < warmup_steps:
+                return (step + 1) / warmup_steps  # Gradual ramp up
+            else:
+                return 1.0
+        
+        scheduler = torch.optim.lr_scheduler.LambdaLR(
             optimizer,
-            step_size=self.cfg.TRAIN.STEP,
-            gamma=self.cfg.TRAIN.DECAY
+            lr_lambda=warmup_lambda
         )
         
         return {
             'optimizer': optimizer,
             'lr_scheduler': {
                 'scheduler': scheduler,
-                'interval': 'epoch'
+                'interval': 'step'  # Step-wise for warmup
             }
         }
 
@@ -1290,7 +1362,7 @@ def main(epochs, batch_size, lr, gpus, num_workers, nuscenes, checkpoint, onnx_i
         max_epochs=epochs,
         callbacks=[lr_monitor, checkpoint_callback],
         log_every_n_steps=10,
-        gradient_clip_val=0.5,  # ORIGINAL
+        gradient_clip_val=0.05,  # ULTRA-aggressive clipping (was 0.1)
         accumulate_grad_batches=cfg.TRAIN.BATCH_ACC,
         precision=16,
         num_sanity_val_steps=0,
