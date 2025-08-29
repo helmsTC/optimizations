@@ -16,12 +16,11 @@ import time
 import gc
 from pathlib import Path
 from easydict import EasyDict as edict
-from pytorch_lightning import Trainer
+from pytorch_lightning import Trainer, LightningModule
 from pytorch_lightning import loggers as pl_loggers
 from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint, Callback
 from collections import OrderedDict, defaultdict
 import torch.nn.functional as F
-from pytorch_lightning.core.lightning import LightningModule
 import warnings
 
 # Import model components
@@ -667,8 +666,11 @@ class JITFixedOptimizedMaskPLS(LightningModule):
                 # Multi-layer decoder forward
                 enhanced_outputs = self.multi_decoder(projected_features)
                 
+                # TEMPORARILY DISABLE multi-layer decoder to debug base model
+                USE_MULTILAYER = False  # Toggle this to enable/disable
+                
                 # Use enhanced outputs if shapes are correct
-                if (enhanced_outputs["pred_logits"].shape[1] == pred_logits.shape[1] and 
+                if USE_MULTILAYER and (enhanced_outputs["pred_logits"].shape[1] == pred_logits.shape[1] and 
                     enhanced_outputs["pred_logits"].shape[2] == pred_logits.shape[2]):
                     
                     pred_logits = enhanced_outputs["pred_logits"]
@@ -822,10 +824,15 @@ class JITFixedOptimizedMaskPLS(LightningModule):
             if all(len(v) == 0 for v in valid_indices):
                 return torch.tensor(0.1, device='cuda', requires_grad=True)
             
-            # Prepare targets
+            # Prepare targets - ensure correct structure for loss function
             targets = self.prepare_targets(batch, padding.shape[1], valid_indices)
-            if targets is None:
-                return torch.tensor(0.1, device='cuda', requires_grad=True)
+            if targets is None or not isinstance(targets, dict) or 'classes' not in targets:
+                print("DEBUG: Invalid targets, creating empty but structured targets")
+                # Create empty but properly structured targets
+                targets = {
+                    'classes': [torch.empty(0, dtype=torch.long, device='cuda') for _ in range(len(batch['pt_coord']))],
+                    'masks': [torch.empty(0, padding.shape[1], device='cuda') for _ in range(len(batch['pt_coord']))]
+                }
             
             # ORIGINAL loss computation with FIXED JIT - DEBUG
             print(f"DEBUG: outputs keys: {outputs.keys()}")
@@ -835,11 +842,35 @@ class JITFixedOptimizedMaskPLS(LightningModule):
             
             try:
                 # More detailed debugging before mask loss
-                print(f"DEBUG: Target shapes: {[t.get('labels', torch.empty(0)).shape if isinstance(t, dict) else 'not_dict' for t in targets]}")
-                print(f"DEBUG: Target label ranges: {[t.get('labels', torch.empty(0)).unique().tolist() if isinstance(t, dict) and 'labels' in t else 'no_labels' for t in targets]}")
+                if isinstance(targets, dict) and 'classes' in targets:
+                    print(f"DEBUG: Target classes count: {[len(t) for t in targets['classes']]}")
+                    print(f"DEBUG: Target masks count: {[t.shape if hasattr(t, 'shape') else 'no_shape' for t in targets['masks']]}")
+                else:
+                    print(f"DEBUG: Invalid targets structure: {type(targets)}")
                 
-                mask_losses = self.mask_loss(outputs, targets, batch.get('masks_ids', []), batch.get('pt_coord', []))
-                print(f"DEBUG: Individual mask losses: {[(k, v.item()) for k, v in mask_losses.items()]}")
+                # SIMPLIFIED LOSS for debugging - just use basic CE loss
+                USE_SIMPLE_LOSS = True
+                
+                if USE_SIMPLE_LOSS:
+                    # Simple cross-entropy loss on predictions
+                    pred_logits = outputs['pred_logits']  # [B, num_queries, num_classes+1]
+                    B, Q, C = pred_logits.shape
+                    
+                    # Create simple targets - just use background class for all queries
+                    simple_targets = torch.full((B, Q), self.num_classes, dtype=torch.long, device=pred_logits.device)
+                    
+                    # Basic cross-entropy
+                    simple_ce_loss = F.cross_entropy(pred_logits.reshape(B*Q, C), simple_targets.reshape(B*Q))
+                    
+                    mask_losses = {
+                        'loss_ce': torch.clamp(simple_ce_loss, 0.0, 10.0),
+                        'loss_dice': torch.tensor(0.1, device='cuda', requires_grad=True),
+                        'loss_mask': torch.tensor(0.1, device='cuda', requires_grad=True)
+                    }
+                    print(f"DEBUG: Using SIMPLE LOSS - CE: {simple_ce_loss.item():.4f}")
+                else:
+                    mask_losses = self.mask_loss(outputs, targets, batch.get('masks_ids', []), batch.get('pt_coord', []))
+                    print(f"DEBUG: Individual mask losses: {[(k, v.item()) for k, v in mask_losses.items()]}")
             except Exception as e:
                 print(f"DEBUG: Mask loss error: {e}")
                 mask_losses = {'loss_ce': torch.tensor(50.0, device='cuda'), 'loss_dice': torch.tensor(50.0, device='cuda'), 'loss_mask': torch.tensor(50.0, device='cuda')}
@@ -882,8 +913,8 @@ class JITFixedOptimizedMaskPLS(LightningModule):
             print(f"DEBUG: Loss components - Mask: {mask_loss_sum.item():.4f}, Sem: {sem_loss_value.item():.4f}, Aux: {aux_loss_value.item():.4f}")
             print(f"DEBUG: Raw total loss: {raw_total_loss.item():.4f}")
             
-            # MUCH tighter clamping to prevent explosions
-            total_loss = torch.clamp(raw_total_loss, 0.001, 25.0)  # Max 25 instead of 100
+            # Moderate clamping
+            total_loss = torch.clamp(raw_total_loss, 0.001, 50.0)  # Moderate clamping
             print(f"DEBUG: Clamped total loss: {total_loss.item():.4f}")
             
             # Additional stability checks
@@ -949,12 +980,17 @@ class JITFixedOptimizedMaskPLS(LightningModule):
             return torch.tensor(0.1, device='cuda', requires_grad=True)
     
     def prepare_targets(self, batch, max_points, valid_indices):
-        """Target preparation"""
+        """Target preparation - ensure proper structure for loss function"""
         try:
-            if 'masks_cls' not in batch or 'masks' not in batch:
-                return None
-            
+            # Always initialize with proper structure
             targets = {'classes': [], 'masks': []}
+            
+            if 'masks_cls' not in batch or 'masks' not in batch:
+                # Return empty but properly structured targets
+                for i in range(len(batch.get('pt_coord', []))):
+                    targets['classes'].append(torch.empty(0, dtype=torch.long, device='cuda'))
+                    targets['masks'].append(torch.empty(0, max_points, device='cuda'))
+                return targets
             
             for i in range(len(batch['masks_cls'])):
                 try:
@@ -1237,8 +1273,8 @@ class JITFixedOptimizedMaskPLS(LightningModule):
     
     def configure_optimizers(self):
         """ULTRA-STABILIZED optimizer settings for fixing loss instability"""
-        # ULTRA-CONSERVATIVE learning rate for fixing instability
-        stable_lr = self.cfg.TRAIN.LR * 0.01  # 100x reduction for extreme stability
+        # MODERATE learning rate - not too conservative
+        stable_lr = self.cfg.TRAIN.LR * 0.1  # 10x reduction (back to previous)
         print(f"DEBUG: Using ultra-conservative LR {stable_lr:.6f} for stability (was {self.cfg.TRAIN.LR})")
         
         optimizer = torch.optim.AdamW(
