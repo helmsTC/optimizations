@@ -454,21 +454,21 @@ class FixedMaskLoss(torch.nn.Module):
 
 
 class SimpleMultiLayerDecoder(torch.nn.Module):
-    """Simple 3-layer decoder - minimal addition to v10"""
+    """6-layer decoder - closer to original architecture"""
     def __init__(self, d_model=256, num_queries=100):
         super().__init__()
         
         # Query embeddings  
         self.query_embed = torch.nn.Embedding(num_queries, d_model)
         
-        # Simple 3-layer decoder using PyTorch's built-in transformer
+        # 6-layer decoder for better progressive refinement
         self.layers = torch.nn.ModuleList([
             torch.nn.TransformerDecoderLayer(
                 d_model=d_model, 
                 nhead=8, 
                 dim_feedforward=512,
                 batch_first=True
-            ) for _ in range(3)
+            ) for _ in range(6)
         ])
         
         # Final prediction heads - match v10 output dimensions
@@ -536,7 +536,7 @@ class JITFixedOptimizedMaskPLS(LightningModule):
         self.multi_decoder = SimpleMultiLayerDecoder(d_model=256, num_queries=100)
         # We'll determine the input dimension dynamically based on actual voxel grid shape
         self.feature_proj = None  # Initialize dynamically
-        self._debug_shapes = True  # Re-enable to debug the dimension issue
+        self._debug_shapes = False  # Disable debug - everything working now
         
         # Fixed JIT loss
         self.mask_loss = FixedMaskLoss(cfg.LOSS, cfg[dataset])
@@ -640,7 +640,7 @@ class JITFixedOptimizedMaskPLS(LightningModule):
                     enhanced_outputs["pred_logits"].shape[2] == pred_logits.shape[2]):
                     
                     pred_logits = enhanced_outputs["pred_logits"]
-                    print(f"✓ Using multi-layer decoder logits (3 layers)")
+                    print(f"✓ Using multi-layer decoder logits (6 layers)")
                     
                     # For masks, we need to reshape from [B, queries, feat_dim] to [B, points, queries]
                     decoder_masks = enhanced_outputs["pred_masks"]  # [B, 100, 256]
@@ -687,7 +687,7 @@ class JITFixedOptimizedMaskPLS(LightningModule):
                                 })
                             
                             enhanced_outputs["aux_outputs"] = reshaped_aux_outputs
-                            print(f"✓ Adding {len(reshaped_aux_outputs)} auxiliary outputs for deep supervision")
+                            print(f"✓ Adding {len(reshaped_aux_outputs)} auxiliary outputs for deep supervision (6-layer decoder)")
                             self._last_enhanced_outputs = enhanced_outputs
                         except Exception as aux_error:
                             print(f"Auxiliary mask reshaping error: {aux_error}")
