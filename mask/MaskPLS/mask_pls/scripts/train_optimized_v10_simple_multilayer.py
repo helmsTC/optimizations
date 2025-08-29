@@ -537,6 +537,7 @@ class JITFixedOptimizedMaskPLS(LightningModule):
         # We'll determine the input dimension dynamically based on actual voxel grid shape
         self.feature_proj = None  # Initialize dynamically
         self._debug_shapes = False  # Disable debug - everything working now
+        self._use_multilayer = False  # DISABLE multi-layer to debug loss issue
         
         # Fixed JIT loss
         self.mask_loss = FixedMaskLoss(cfg.LOSS, cfg[dataset])
@@ -608,7 +609,14 @@ class JITFixedOptimizedMaskPLS(LightningModule):
             pred_logits, pred_masks, sem_logits = self.model(voxel_grids, batch_coords)
             
             # STEP 1: Add multi-layer decoder with careful tensor handling
+            if not self._use_multilayer:
+                print("DEBUG: Using original v10 outputs (multi-layer disabled)")
+            
             try:
+                if not self._use_multilayer:
+                    # Skip multi-layer decoder for debugging
+                    pass
+                elif self._use_multilayer:
                 # Debug: Print tensor shapes to understand what we're working with
                 if hasattr(self, '_debug_shapes') and self._debug_shapes:
                     print(f"Debug - voxel_grids shape: {voxel_grids.shape}")
@@ -795,39 +803,56 @@ class JITFixedOptimizedMaskPLS(LightningModule):
             if targets is None:
                 return torch.tensor(0.1, device='cuda', requires_grad=True)
             
-            # ORIGINAL loss computation with FIXED JIT
-            mask_losses = self.mask_loss(outputs, targets, batch.get('masks_ids', []), batch.get('pt_coord', []))
-            sem_loss_value = self.compute_sem_loss(batch, sem_logits, valid_indices, padding)
+            # ORIGINAL loss computation with FIXED JIT - add debugging
+            try:
+                mask_losses = self.mask_loss(outputs, targets, batch.get('masks_ids', []), batch.get('pt_coord', []))
+                print(f"DEBUG: Mask losses: {[(k, v.item()) for k, v in mask_losses.items() if torch.isfinite(v)]}")
+            except Exception as e:
+                print(f"DEBUG: Mask loss computation failed: {e}")
+                mask_losses = {'loss_ce': torch.tensor(50.0, device='cuda'), 'loss_dice': torch.tensor(50.0, device='cuda'), 'loss_mask': torch.tensor(50.0, device='cuda')}
             
-            # AUXILIARY LOSSES for deep supervision
+            try:
+                sem_loss_value = self.compute_sem_loss(batch, sem_logits, valid_indices, padding)
+                print(f"DEBUG: Sem loss: {sem_loss_value.item()}")
+            except Exception as e:
+                print(f"DEBUG: Sem loss computation failed: {e}")
+                sem_loss_value = torch.tensor(0.1, device='cuda')
+            
+            # TEMPORARILY DISABLE AUXILIARY LOSSES for debugging
             aux_loss_value = torch.tensor(0.0, device='cuda', requires_grad=True)
-            if outputs.get('aux_outputs') and len(outputs['aux_outputs']) > 0:
-                aux_weight = 0.4  # Standard auxiliary loss weight
-                for i, aux_output in enumerate(outputs['aux_outputs']):
-                    try:
-                        # Compute loss for each auxiliary output
-                        aux_outputs_dict = {
-                            'pred_logits': aux_output['pred_logits'],
-                            'pred_masks': aux_output['pred_masks'],
-                            'aux_outputs': []  # No nested aux outputs
-                        }
-                        aux_mask_losses = self.mask_loss(aux_outputs_dict, targets, batch.get('masks_ids', []), batch.get('pt_coord', []))
-                        layer_aux_loss = sum(aux_mask_losses.values()) * aux_weight
-                        aux_loss_value = aux_loss_value + layer_aux_loss
-                        
-                        if i == 0:  # Only print for first aux layer to avoid spam
-                            print(f"✓ Auxiliary loss layer {i}: {layer_aux_loss.item():.4f}")
-                            
-                    except Exception as e:
-                        if i == 0:  # Only print error once
-                            print(f"Auxiliary loss error: {e}")
-                        continue
+            print("DEBUG: Auxiliary losses disabled for debugging")
+            # if outputs.get('aux_outputs') and len(outputs['aux_outputs']) > 0:
+            #     aux_weight = 0.4  # Standard auxiliary loss weight
+            #     for i, aux_output in enumerate(outputs['aux_outputs']):
+            #         try:
+            #             # Compute loss for each auxiliary output
+            #             aux_outputs_dict = {
+            #                 'pred_logits': aux_output['pred_logits'],
+            #                 'pred_masks': aux_output['pred_masks'],
+            #                 'aux_outputs': []  # No nested aux outputs
+            #             }
+            #             aux_mask_losses = self.mask_loss(aux_outputs_dict, targets, batch.get('masks_ids', []), batch.get('pt_coord', []))
+            #             layer_aux_loss = sum(aux_mask_losses.values()) * aux_weight
+            #             aux_loss_value = aux_loss_value + layer_aux_loss
+            #             
+            #             if i == 0:  # Only print for first aux layer to avoid spam
+            #                 print(f"✓ Auxiliary loss layer {i}: {layer_aux_loss.item():.4f}")
+            #                 
+            #         except Exception as e:
+            #             if i == 0:  # Only print error once
+            #                 print(f"Auxiliary loss error: {e}")
+            #             continue
             
             # Total loss with ORIGINAL weighting + auxiliary losses
-            total_loss = sum(mask_losses.values()) + sem_loss_value + aux_loss_value
-            total_loss = torch.clamp(total_loss, 0.0, 100.0)
+            raw_total_loss = sum(mask_losses.values()) + sem_loss_value + aux_loss_value
+            print(f"DEBUG: Raw total loss: {raw_total_loss.item():.4f}")
+            print(f"DEBUG: Loss components - Mask sum: {sum(mask_losses.values()).item():.4f}, Sem: {sem_loss_value.item():.4f}, Aux: {aux_loss_value.item():.4f}")
+            
+            total_loss = torch.clamp(raw_total_loss, 0.0, 100.0)
+            print(f"DEBUG: Clamped total loss: {total_loss.item():.4f}")
             
             if torch.isnan(total_loss) or torch.isinf(total_loss):
+                print("DEBUG: Loss is NaN/Inf, using fallback")
                 total_loss = torch.tensor(0.5, device='cuda', requires_grad=True)
             
             # Logging
