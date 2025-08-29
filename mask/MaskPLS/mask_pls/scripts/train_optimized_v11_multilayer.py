@@ -357,15 +357,15 @@ class EnhancedMaskPLSModel(LightningModule):
         
         for pts in batch['pt_coord']:
             if isinstance(pts, np.ndarray):
-                points_batch.append(torch.from_numpy(pts.astype(np.float32)))
+                points_batch.append(torch.from_numpy(pts.astype(np.float32)).to(self.device))
             else:
-                points_batch.append(pts.float())
+                points_batch.append(pts.float().to(self.device))
         
         for feats in batch['feats']:
             if isinstance(feats, np.ndarray):
-                features_batch.append(torch.from_numpy(feats.astype(np.float32)))
+                features_batch.append(torch.from_numpy(feats.astype(np.float32)).to(self.device))
             else:
-                features_batch.append(feats.float())
+                features_batch.append(feats.float().to(self.device))
         
         # High-res voxelization
         voxel_grids, normalized_coords, valid_indices = self.voxelizer.voxelize_batch_highres(
@@ -486,15 +486,15 @@ class EnhancedMaskPLSModel(LightningModule):
     
     def training_step(self, batch, batch_idx):
         try:
-            # Ensure batch tensors are float32 - handle numpy arrays
+            # Ensure batch tensors are float32 and on correct device
             if 'pt_coord' in batch:
                 batch['pt_coord'] = [
-                    torch.from_numpy(pts).float() if isinstance(pts, np.ndarray) else pts.float() 
+                    torch.from_numpy(pts).float().to(self.device) if isinstance(pts, np.ndarray) else pts.float().to(self.device) 
                     for pts in batch['pt_coord']
                 ]
             if 'feats' in batch:
                 batch['feats'] = [
-                    torch.from_numpy(feats).float() if isinstance(feats, np.ndarray) else feats.float()
+                    torch.from_numpy(feats).float().to(self.device) if isinstance(feats, np.ndarray) else feats.float().to(self.device)
                     for feats in batch['feats']
                 ]
                 
@@ -511,14 +511,14 @@ class EnhancedMaskPLSModel(LightningModule):
                     masks = batch['instance_masks'][b]
                     
                     if isinstance(labels, np.ndarray):
-                        labels = torch.from_numpy(labels).long()
+                        labels = torch.from_numpy(labels).long().to(self.device)
                     else:
-                        labels = labels.long()
+                        labels = labels.long().to(self.device)
                     
                     if isinstance(masks, np.ndarray):
-                        masks = torch.from_numpy(masks.astype(np.float32)).float()
+                        masks = torch.from_numpy(masks.astype(np.float32)).float().to(self.device)
                     else:
-                        masks = masks.float()
+                        masks = masks.float().to(self.device)
                     
                     targets.append({
                         'labels': labels,
@@ -630,8 +630,10 @@ def train(config, batch_size, epochs, lr, max_batches):
     # Setup data
     data_module = SemanticDatasetModule(config)
     
-    # Setup model
+    # Setup model and ensure it's on GPU
     model = EnhancedMaskPLSModel(config)
+    if torch.cuda.is_available():
+        model = model.cuda()
     
     # Setup trainer
     callbacks = [
