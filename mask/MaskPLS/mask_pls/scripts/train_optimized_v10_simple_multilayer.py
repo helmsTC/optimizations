@@ -583,6 +583,10 @@ class JITFixedOptimizedMaskPLS(LightningModule):
         self.ema_model = None
         self._last_loss = 10.0  # Initialize loss tracking
         
+        # Debug flag for detailed logging
+        self._debug_training = True
+        self._first_batch_debug = True  # Flag for first batch analysis
+        
         # ORIGINAL initialization (difference #5)
         self._init_weights_original()
         
@@ -892,6 +896,17 @@ class JITFixedOptimizedMaskPLS(LightningModule):
                     'masks': [torch.empty(0, padding.shape[1], device='cuda') for _ in range(len(batch['pt_coord']))]
                 }
             
+            # DEBUG: Check if we actually have ground truth data
+            total_gt_masks = sum(len(t) for t in targets['classes'])
+            print(f"DEBUG: Total ground truth masks in batch: {total_gt_masks}")
+            if total_gt_masks == 0:
+                print("WARNING: No ground truth masks found - model can't learn without supervision!")
+                print(f"Batch keys: {list(batch.keys())}")
+                if 'masks_cls' in batch:
+                    print(f"masks_cls sample: {batch['masks_cls'][:2] if len(batch['masks_cls']) > 0 else 'empty'}")
+                if 'masks' in batch:
+                    print(f"masks sample: {[type(m) for m in batch['masks'][:2]] if len(batch['masks']) > 0 else 'empty'}")
+            
             # ORIGINAL loss computation with FIXED JIT - DEBUG
             print(f"DEBUG: outputs keys: {outputs.keys()}")
             print(f"DEBUG: pred_logits range: [{outputs['pred_logits'].min().item():.3f}, {outputs['pred_logits'].max().item():.3f}]")
@@ -907,7 +922,7 @@ class JITFixedOptimizedMaskPLS(LightningModule):
                     print(f"DEBUG: Invalid targets structure: {type(targets)}")
                 
                 # SIMPLIFIED LOSS for debugging - just use basic CE loss
-                USE_SIMPLE_LOSS = True
+                USE_SIMPLE_LOSS = False  # DISABLED - need real targets for learning
                 
                 if USE_SIMPLE_LOSS:
                     # Simple cross-entropy loss on predictions
@@ -1013,7 +1028,7 @@ class JITFixedOptimizedMaskPLS(LightningModule):
             
             self._last_loss = total_loss.item()
             
-            # Logging
+            # Enhanced logging with learning indicators
             if batch_idx % 10 == 0:
                 self.log("train_loss", total_loss, batch_size=self.cfg.TRAIN.BATCH_SIZE)
                 for k, v in mask_losses.items():
@@ -1021,6 +1036,12 @@ class JITFixedOptimizedMaskPLS(LightningModule):
                         self.log(f"train/{k}", v, batch_size=self.cfg.TRAIN.BATCH_SIZE)
                 if torch.isfinite(sem_loss_value):
                     self.log("train/sem_loss", sem_loss_value, batch_size=self.cfg.TRAIN.BATCH_SIZE)
+                
+                # Show learning progress indicators
+                if hasattr(self, '_prev_loss'):
+                    loss_trend = "↓" if total_loss < self._prev_loss else "↑" if total_loss > self._prev_loss else "="
+                    print(f"Loss trend: {self._prev_loss:.3f} -> {total_loss.item():.3f} {loss_trend}")
+                self._prev_loss = total_loss.item()
                 
                 # Update EMA model for stability (every few batches)
                 if batch_idx % 5 == 0:
@@ -1080,7 +1101,19 @@ class JITFixedOptimizedMaskPLS(LightningModule):
             # Always initialize with proper structure
             targets = {'classes': [], 'masks': []}
             
+            # DEBUG: Check what's in the batch
+            if self._debug_training and hasattr(self, '_first_batch_debug'):
+                print(f"DEBUG: First batch analysis:")
+                for key in batch.keys():
+                    val = batch[key]
+                    if isinstance(val, list):
+                        print(f"  {key}: list length {len(val)}, sample types: {[type(v).__name__ for v in val[:2]]}")
+                    else:
+                        print(f"  {key}: {type(val).__name__} shape {getattr(val, 'shape', 'no shape')}")
+                self._first_batch_debug = False
+            
             if 'masks_cls' not in batch or 'masks' not in batch:
+                print(f"DEBUG: Missing ground truth data - keys available: {list(batch.keys())}")
                 # Return empty but properly structured targets
                 for i in range(len(batch.get('pt_coord', []))):
                     targets['classes'].append(torch.empty(0, dtype=torch.long, device='cuda'))
@@ -1338,7 +1371,7 @@ class JITFixedOptimizedMaskPLS(LightningModule):
             return [], []
     
     def validation_epoch_end(self, outputs):
-        """Metrics computation"""
+        """Metrics computation with detailed logging"""
         try:
             bs = self.cfg.TRAIN.BATCH_SIZE
             
@@ -1346,14 +1379,36 @@ class JITFixedOptimizedMaskPLS(LightningModule):
                 pq = self.evaluator.get_mean_pq()
                 iou = self.evaluator.get_mean_iou()
                 rq = self.evaluator.get_mean_rq()
-            except:
+            except Exception as e:
+                print(f"Evaluator error: {e}")
                 pq = iou = rq = 0.0
             
             self.log("metrics/pq", pq, batch_size=bs)
             self.log("metrics/iou", iou, batch_size=bs)
             self.log("metrics/rq", rq, batch_size=bs)
             
-            print(f"\nValidation Metrics - PQ: {pq:.4f}, IoU: {iou:.4f}, RQ: {rq:.4f}")
+            # Enhanced logging
+            epoch = self.current_epoch
+            print(f"\n{'='*60}")
+            print(f"EPOCH {epoch} VALIDATION RESULTS:")
+            print(f"  PQ (Panoptic Quality): {pq:.4f}")
+            print(f"  IoU (Intersection over Union): {iou:.4f}")
+            print(f"  RQ (Recognition Quality): {rq:.4f}")
+            
+            # Show progress trend
+            if hasattr(self, '_prev_metrics'):
+                prev_pq, prev_iou, prev_rq = self._prev_metrics
+                pq_trend = "↑" if pq > prev_pq else "↓" if pq < prev_pq else "="
+                iou_trend = "↑" if iou > prev_iou else "↓" if iou < prev_iou else "="
+                print(f"  Trends: PQ {pq_trend}, IoU {iou_trend}")
+            
+            self._prev_metrics = (pq, iou, rq)
+            
+            if pq > 0 or iou > 0:
+                print(f"  ✓ Model is learning! Metrics improving from 0.")
+            else:
+                print(f"  ⚠ Still zero metrics - check ground truth data and loss.")
+            print(f"{'='*60}")
             
             try:
                 self.evaluator.reset()
