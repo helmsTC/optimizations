@@ -354,8 +354,21 @@ class EnhancedMaskPLSModel(LightningModule):
     
     def forward(self, batch):
         # Fix batch structure - use same format as v10
-        points_batch = batch['pt_coord']
-        features_batch = batch['feats']
+        # Handle numpy arrays and ensure tensor conversion
+        points_batch = []
+        features_batch = []
+        
+        for pts in batch['pt_coord']:
+            if isinstance(pts, np.ndarray):
+                points_batch.append(torch.from_numpy(pts.astype(np.float32)))
+            else:
+                points_batch.append(pts.float())
+        
+        for feats in batch['feats']:
+            if isinstance(feats, np.ndarray):
+                features_batch.append(torch.from_numpy(feats.astype(np.float32)))
+            else:
+                features_batch.append(feats.float())
         
         # High-res voxelization
         voxel_grids, normalized_coords, valid_indices = self.voxelizer.voxelize_batch_highres(
@@ -478,11 +491,17 @@ class EnhancedMaskPLSModel(LightningModule):
     
     def training_step(self, batch, batch_idx):
         try:
-            # Ensure batch tensors are float32
+            # Ensure batch tensors are float32 - handle numpy arrays
             if 'pt_coord' in batch:
-                batch['pt_coord'] = [pts.float() for pts in batch['pt_coord']]
+                batch['pt_coord'] = [
+                    torch.from_numpy(pts).float() if isinstance(pts, np.ndarray) else pts.float() 
+                    for pts in batch['pt_coord']
+                ]
             if 'feats' in batch:
-                batch['feats'] = [feats.float() for feats in batch['feats']]
+                batch['feats'] = [
+                    torch.from_numpy(feats).float() if isinstance(feats, np.ndarray) else feats.float()
+                    for feats in batch['feats']
+                ]
                 
             outputs, normalized_coords, valid_indices = self(batch)
             
@@ -492,9 +511,23 @@ class EnhancedMaskPLSModel(LightningModule):
             
             for b in range(batch_size):
                 if 'instance_labels' in batch and 'instance_masks' in batch:
+                    # Handle numpy arrays in targets
+                    labels = batch['instance_labels'][b]
+                    masks = batch['instance_masks'][b]
+                    
+                    if isinstance(labels, np.ndarray):
+                        labels = torch.from_numpy(labels).long()
+                    else:
+                        labels = labels.long()
+                    
+                    if isinstance(masks, np.ndarray):
+                        masks = torch.from_numpy(masks.astype(np.float32)).float()
+                    else:
+                        masks = masks.float()
+                    
                     targets.append({
-                        'labels': batch['instance_labels'][b].long(),
-                        'masks': batch['instance_masks'][b].float()
+                        'labels': labels,
+                        'masks': masks
                     })
                 else:
                     # Fallback for missing targets
