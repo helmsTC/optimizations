@@ -10,6 +10,7 @@ import numpy as np
 import onnxruntime as ort
 import torch
 import click
+import yaml
 from pathlib import Path
 import time
 from collections import OrderedDict
@@ -19,7 +20,7 @@ class ONNXPointCloudProcessor:
     """Process point clouds using ONNX model"""
     
     def __init__(self, onnx_model_path, max_points=70000, voxel_shape=(64, 64, 32), 
-                 coordinate_bounds=None, device='cpu'):
+                 coordinate_bounds=None, device='cpu', dataset='kitti', config_path=None):
         """
         Initialize the ONNX processor
         
@@ -29,10 +30,52 @@ class ONNXPointCloudProcessor:
             voxel_shape: Voxel grid dimensions (D, H, W)
             coordinate_bounds: Point cloud bounds [[-x,+x], [-y,+y], [-z,+z]]
             device: 'cpu' or 'cuda'
+            dataset: Dataset type ('kitti' or 'nuscenes')
+            config_path: Path to semantic-kitti.yaml or nuscenes.yaml config file
         """
         self.max_points = max_points
         self.voxel_shape = voxel_shape
         self.device = device
+        self.dataset = dataset
+        
+        # Load class mappings from config file
+        if config_path is None:
+            # Try to find the config file relative to script location
+            script_dir = Path(__file__).parent
+            if dataset.lower() == 'nuscenes':
+                config_path = script_dir.parent / 'datasets' / 'nuscenes.yaml'
+            else:
+                config_path = script_dir.parent / 'datasets' / 'semantic-kitti.yaml'
+        
+        if Path(config_path).exists():
+            print(f"Loading class mappings from: {config_path}")
+            with open(config_path, 'r') as f:
+                config = yaml.safe_load(f)
+            
+            # Get learning_map_inv from config
+            self.learning_map_inv = np.zeros(20, dtype=np.uint32)
+            if 'learning_map_inv' in config:
+                for k, v in config['learning_map_inv'].items():
+                    if k < len(self.learning_map_inv):
+                        self.learning_map_inv[k] = v
+            else:
+                print("Warning: learning_map_inv not found in config, using identity mapping")
+                self.learning_map_inv = np.arange(20, dtype=np.uint32)
+            
+            # Store other useful mappings
+            self.class_strings = config.get('labels', {})
+            self.learning_map = config.get('learning_map', {})
+            
+            print(f"  Loaded {len(self.learning_map_inv)} class mappings")
+        else:
+            print(f"Warning: Config file not found at {config_path}, using default mappings")
+            # Fallback to hardcoded mappings for KITTI
+            self.learning_map_inv = np.array([
+                0, 10, 11, 15, 18, 20, 30, 31, 32, 40,
+                44, 48, 49, 50, 51, 70, 71, 72, 80, 81
+            ], dtype=np.uint32)
+            self.class_strings = {}
+            self.learning_map = {}
         
         # Default KITTI bounds if not provided
         if coordinate_bounds is None:
@@ -341,33 +384,43 @@ def encode_semantickitti_label(semantic, instance):
     Encode semantic and instance labels into SemanticKITTI format
     
     SemanticKITTI uses 32-bit integers where:
-    - Lower 16 bits: semantic label
+    - Lower 16 bits: semantic label (original SemanticKITTI label, not predicted class)
     - Upper 16 bits: instance label
     
     Args:
-        semantic: Semantic class label (0-255)
+        semantic: Semantic class label (original SemanticKITTI label 0-255)
         instance: Instance ID (0-65535)
     
     Returns:
         label: 32-bit encoded label
     """
-    return (instance << 16) | (semantic & 0xFFFF)
+    return ((instance & 0xFFFF) << 16) | (semantic & 0xFFFF)
 
 
-def save_results_semantickitti(results, output_dir, filename_base, save_pointcloud=True):
+def save_results_semantickitti(results, output_dir, filename_base, save_pointcloud=True, 
+                              learning_map_inv=None, class_strings=None):
     """Save results in SemanticKITTI format"""
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     
-    # Get labels
+    # Get labels (these are predicted classes 0-19)
     semantic_labels = results['semantic_labels']
     instance_labels = results['instance_labels']
+    
+    # Map predicted classes to original SemanticKITTI labels
+    if learning_map_inv is not None:
+        # Ensure semantic_labels are within valid range
+        semantic_labels = np.clip(semantic_labels, 0, len(learning_map_inv) - 1)
+        # Map to original labels
+        semantic_labels_mapped = learning_map_inv[semantic_labels].astype(np.uint32)
+    else:
+        semantic_labels_mapped = semantic_labels.astype(np.uint32)
     
     # Encode labels in SemanticKITTI format
     encoded_labels = np.zeros(len(semantic_labels), dtype=np.uint32)
     for i in range(len(semantic_labels)):
         encoded_labels[i] = encode_semantickitti_label(
-            semantic_labels[i], 
+            semantic_labels_mapped[i], 
             instance_labels[i]
         )
     
@@ -376,7 +429,10 @@ def save_results_semantickitti(results, output_dir, filename_base, save_pointclo
     encoded_labels.astype(np.uint32).tofile(label_path)
     print(f"\nSaved label file: {label_path}")
     print(f"  Shape: {encoded_labels.shape}")
-    print(f"  Unique semantic classes: {len(np.unique(semantic_labels))}")
+    print(f"  Dtype: {encoded_labels.dtype}")
+    print(f"  Unique predicted classes: {len(np.unique(semantic_labels))}")
+    if learning_map_inv is not None:
+        print(f"  Unique mapped labels: {len(np.unique(semantic_labels_mapped))}")
     print(f"  Unique instances: {len(np.unique(instance_labels[instance_labels > 0]))}")
     
     # Save point cloud (optional - usually you'd use the original)
@@ -410,10 +466,15 @@ def save_results_semantickitti(results, output_dir, filename_base, save_pointclo
         f.write(f"Total points: {len(results['original_points'])}\n")
         f.write(f"Labeled points: {np.sum(semantic_labels > 0)}\n")
         f.write(f"Unlabeled points: {np.sum(semantic_labels == 0)}\n")
-        f.write(f"\nSemantic classes:\n")
+        f.write(f"\nPredicted classes (0-19):\n")
         unique_classes, counts = np.unique(semantic_labels, return_counts=True)
         for cls, count in zip(unique_classes, counts):
-            f.write(f"  Class {cls}: {count} points\n")
+            if learning_map_inv is not None and cls < len(learning_map_inv):
+                mapped_label = learning_map_inv[cls]
+                class_name = class_strings.get(int(mapped_label), "unknown") if class_strings else "unknown"
+                f.write(f"  Class {cls} -> Label {mapped_label} ({class_name}): {count} points\n")
+            else:
+                f.write(f"  Class {cls}: {count} points\n")
         f.write(f"\nInstances detected: {len(results['detected_objects'])}\n")
         for obj in results['detected_objects']:
             f.write(f"  Instance {obj['instance_id']}: Class {obj['class_id']}, "
@@ -432,8 +493,9 @@ def save_results_semantickitti(results, output_dir, filename_base, save_pointclo
 @click.option('--dataset', default='kitti', help='Dataset type: kitti or nuscenes')
 @click.option('--batch_process', is_flag=True, help='Process all .bin files in directory')
 @click.option('--save_pointcloud', is_flag=True, help='Save point cloud .bin file (default: False)')
+@click.option('--config', type=click.Path(exists=True), help='Path to semantic-kitti.yaml or nuscenes.yaml')
 def main(onnx_model, pointcloud_path, max_points, confidence, num_classes, output_dir, device, 
-         dataset, batch_process, save_pointcloud):
+         dataset, batch_process, save_pointcloud, config):
     """
     Test ONNX model inference on point cloud files and save in SemanticKITTI format
     
@@ -469,7 +531,9 @@ def main(onnx_model, pointcloud_path, max_points, confidence, num_classes, outpu
         onnx_model_path=onnx_model,
         max_points=max_points,
         coordinate_bounds=coordinate_bounds,
-        device=device
+        device=device,
+        dataset=dataset,
+        config_path=config
     )
     
     pointcloud_path = Path(pointcloud_path)
@@ -489,7 +553,9 @@ def main(onnx_model, pointcloud_path, max_points, confidence, num_classes, outpu
                     results = processor.process_pointcloud(
                         bin_file, confidence, num_classes
                     )
-                    save_results_semantickitti(results, output_dir, bin_file.stem, save_pointcloud)
+                    save_results_semantickitti(results, output_dir, bin_file.stem, save_pointcloud, 
+                                              processor.learning_map_inv if dataset.lower() == 'kitti' else None,
+                                              processor.class_strings if hasattr(processor, 'class_strings') else None)
                 except Exception as e:
                     print(f"Error processing {bin_file}: {e}")
                     import traceback
@@ -505,7 +571,9 @@ def main(onnx_model, pointcloud_path, max_points, confidence, num_classes, outpu
         results = processor.process_pointcloud(
             pointcloud_path, confidence, num_classes
         )
-        save_results_semantickitti(results, output_dir, pointcloud_path.stem, save_pointcloud)
+        save_results_semantickitti(results, output_dir, pointcloud_path.stem, save_pointcloud,
+                                  processor.learning_map_inv if dataset.lower() == 'kitti' else None,
+                                  processor.class_strings if hasattr(processor, 'class_strings') else None)
     
     print(f"\n{'='*60}")
     print("Processing complete! Files saved in SemanticKITTI format.")
