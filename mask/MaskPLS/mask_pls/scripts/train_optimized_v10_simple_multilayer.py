@@ -647,15 +647,51 @@ class JITFixedOptimizedMaskPLS(LightningModule):
                     print(f"Debug - pred_logits shape: {pred_logits.shape}")
                     print(f"Debug - pred_masks shape: {pred_masks.shape}")
                 
-                # Use voxel grids as encoded features (they're already processed)
-                B, C, D, H, W = voxel_grids.shape
+                # CORRECT APPROACH: Use actual point features, not full voxel grid
+                # The original model works with actual point coordinates and their features
+                B = len(points)
                 
-                # Reshape voxel grid to sequence format for transformer
-                # Flatten spatial dims: [B, C, D*H*W] -> [B, D*H*W, C]
-                spatial_features = voxel_grids.view(B, C, -1).permute(0, 2, 1)  # [B, spatial_pts, C]
+                # Use the prepared batch coordinates (these are the actual points)
+                # batch_coords has shape [B, num_points, 3]
+                actual_num_points = batch_coords.shape[1]  # This should match pred_masks.shape[1]
                 
-                # Use full resolution - this is key for quality
-                print(f"Using full spatial resolution: {spatial_features.shape}")
+                # SAFETY: Limit points to prevent OOM in extreme cases
+                max_safe_points = 30000  # Reasonable limit
+                if actual_num_points > max_safe_points:
+                    print(f"WARNING: Too many points ({actual_num_points}), limiting to {max_safe_points}")
+                    # Truncate batch_coords and padding_masks
+                    batch_coords = batch_coords[:, :max_safe_points, :]
+                    padding_masks = padding_masks[:, :max_safe_points]
+                    actual_num_points = max_safe_points
+                
+                print(f"Using actual point coordinates: {batch_coords.shape}")
+                print(f"Expected mask shape: [B={B}, points={actual_num_points}, queries=100]")
+                
+                # Create point features by sampling from voxel grid at point locations
+                # This is the correct way - map voxel features to actual point locations
+                point_features_list = []
+                
+                C, D, H, W = voxel_grids.shape[1:]  # Get voxel grid dimensions
+                
+                for b in range(B):
+                    # Get the voxel grid for this batch
+                    voxel_grid_b = voxel_grids[b]  # [C, D, H, W]
+                    coords_b = batch_coords[b]  # [num_points, 3]
+                    
+                    # Sample features from voxel grid at point locations
+                    # coords_b are normalized [0, 1], convert to voxel indices
+                    voxel_coords = coords_b * torch.tensor([D-1, H-1, W-1], device=coords_b.device)
+                    voxel_coords = voxel_coords.long().clamp(0, torch.tensor([D-1, H-1, W-1], device=coords_b.device))
+                    
+                    # Extract features at these voxel locations
+                    point_feats = voxel_grid_b[:, voxel_coords[:, 0], voxel_coords[:, 1], voxel_coords[:, 2]]  # [C, num_points]
+                    point_feats = point_feats.transpose(0, 1)  # [num_points, C]
+                    
+                    point_features_list.append(point_feats)
+                
+                # Stack all batch features
+                spatial_features = torch.stack(point_features_list)  # [B, num_points, C]
+                print(f"Point features shape: {spatial_features.shape}")
                 
                 # Initialize feature projection dynamically if needed
                 if self.feature_proj is None:
