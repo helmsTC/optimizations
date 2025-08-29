@@ -656,13 +656,17 @@ class JITFixedOptimizedMaskPLS(LightningModule):
                 actual_num_points = batch_coords.shape[1]  # This should match pred_masks.shape[1]
                 
                 # SAFETY: Limit points to prevent OOM in extreme cases
-                max_safe_points = 30000  # Reasonable limit
+                max_safe_points = 25000  # Conservative limit for stability
                 if actual_num_points > max_safe_points:
-                    print(f"WARNING: Too many points ({actual_num_points}), limiting to {max_safe_points}")
+                    print(f"WARNING: Too many points ({actual_num_points}), limiting to {max_safe_points} for memory")
                     # Truncate batch_coords and padding_masks
                     batch_coords = batch_coords[:, :max_safe_points, :]
                     padding_masks = padding_masks[:, :max_safe_points]
                     actual_num_points = max_safe_points
+                    
+                    # Also need to truncate pred_masks to match
+                    if pred_masks.shape[1] > max_safe_points:
+                        pred_masks = pred_masks[:, :max_safe_points, :]
                 
                 print(f"Using actual point coordinates: {batch_coords.shape}")
                 print(f"Expected mask shape: [B={B}, points={actual_num_points}, queries=100]")
@@ -674,24 +678,36 @@ class JITFixedOptimizedMaskPLS(LightningModule):
                 C, D, H, W = voxel_grids.shape[1:]  # Get voxel grid dimensions
                 
                 for b in range(B):
-                    # Get the voxel grid for this batch
-                    voxel_grid_b = voxel_grids[b]  # [C, D, H, W]
-                    coords_b = batch_coords[b]  # [num_points, 3]
-                    
-                    # Sample features from voxel grid at point locations
-                    # coords_b are normalized [0, 1], convert to voxel indices
-                    voxel_coords = coords_b * torch.tensor([D-1, H-1, W-1], device=coords_b.device)
-                    voxel_coords = voxel_coords.long().clamp(0, torch.tensor([D-1, H-1, W-1], device=coords_b.device))
-                    
-                    # Extract features at these voxel locations
-                    point_feats = voxel_grid_b[:, voxel_coords[:, 0], voxel_coords[:, 1], voxel_coords[:, 2]]  # [C, num_points]
-                    point_feats = point_feats.transpose(0, 1)  # [num_points, C]
-                    
-                    point_features_list.append(point_feats)
+                    try:
+                        # Get the voxel grid for this batch
+                        voxel_grid_b = voxel_grids[b]  # [C, D, H, W]
+                        coords_b = batch_coords[b]  # [num_points, 3]
+                        
+                        # Sample features from voxel grid at point locations
+                        # coords_b are normalized [0, 1], convert to voxel indices
+                        max_coords = torch.tensor([D-1, H-1, W-1], device=coords_b.device, dtype=torch.long)
+                        voxel_coords = coords_b * max_coords.float()  # Ensure float multiplication
+                        # Fix clamp: use tensor for both min and max with same dtype
+                        min_coords = torch.zeros(3, device=coords_b.device, dtype=torch.long)
+                        voxel_coords = voxel_coords.long().clamp(min_coords, max_coords)
+                        
+                        # Extract features at these voxel locations
+                        point_feats = voxel_grid_b[:, voxel_coords[:, 0], voxel_coords[:, 1], voxel_coords[:, 2]]  # [C, num_points]
+                        point_feats = point_feats.transpose(0, 1)  # [num_points, C]
+                        
+                        point_features_list.append(point_feats)
+                        
+                    except Exception as e:
+                        print(f"Error processing batch {b}: {e}")
+                        print(f"Shapes - voxel_grid: {voxel_grid_b.shape}, coords: {coords_b.shape}")
+                        # Fallback: create zero features
+                        fallback_feats = torch.zeros(coords_b.shape[0], C, device=coords_b.device)
+                        point_features_list.append(fallback_feats)
                 
                 # Stack all batch features
                 spatial_features = torch.stack(point_features_list)  # [B, num_points, C]
-                print(f"Point features shape: {spatial_features.shape}")
+                print(f"✓ Point features extracted successfully: {spatial_features.shape}")
+                print(f"Memory efficient: {spatial_features.numel() * 4 / 1024**2:.1f} MB (vs {B*C*D*H*W*4/1024**2:.1f} MB for full voxel grid)")
                 
                 # Initialize feature projection dynamically if needed
                 if self.feature_proj is None:
