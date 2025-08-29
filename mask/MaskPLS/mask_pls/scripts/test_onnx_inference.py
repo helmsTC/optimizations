@@ -1,6 +1,7 @@
 """
 Test script for ONNX model inference on .bin point cloud files
 Processes point clouds using the exported ONNX model
+Saves results in SemanticKITTI format for API viewer
 """
 
 import os
@@ -95,6 +96,7 @@ class ONNXPointCloudProcessor:
             voxel_features: numpy array [1, 4, D, H, W]
             point_coords: numpy array [1, max_points, 3]
             valid_mask: boolean mask for valid points
+            original_indices: mapping from processed points to original points
         """
         print("Preprocessing point cloud...")
         
@@ -105,6 +107,7 @@ class ONNXPointCloudProcessor:
         valid_mask = np.all((xyz >= self.bounds_min) & (xyz < self.bounds_max), axis=1)
         valid_points = xyz[valid_mask]
         valid_intensity = intensity[valid_mask]
+        valid_indices = np.where(valid_mask)[0]
         
         print(f"  Points within bounds: {valid_points.shape[0]}/{points.shape[0]}")
         
@@ -112,12 +115,14 @@ class ONNXPointCloudProcessor:
             print("  Warning: No points within bounds!")
             valid_points = xyz[:1]  # Use first point as fallback
             valid_intensity = intensity[:1]
+            valid_indices = np.array([0])
         
         # Step 2: Subsample if too many points
         if len(valid_points) > self.max_points:
             indices = np.random.choice(len(valid_points), self.max_points, replace=False)
             valid_points = valid_points[indices]
             valid_intensity = valid_intensity[indices]
+            valid_indices = valid_indices[indices]
             print(f"  Subsampled to: {len(valid_points)} points")
         
         # Step 3: Normalize coordinates to [0, 1]
@@ -163,7 +168,7 @@ class ONNXPointCloudProcessor:
         padded_coords = padded_coords[np.newaxis, ...]    # [1, max_points, 3]
         
         print("  Preprocessing complete")
-        return voxel_features, padded_coords, point_mask
+        return voxel_features, padded_coords, point_mask, valid_indices
     
     def run_inference(self, voxel_features, point_coords):
         """
@@ -271,13 +276,7 @@ class ONNXPointCloudProcessor:
         print(f"  Detected instances: {len(detected_objects)}")
         print(f"  Semantic classes found: {len(np.unique(semantic_labels))}")
         
-        # Extend to full point cloud size (pad with zeros)
-        full_semantic = np.zeros(self.max_points, dtype=np.int32)
-        full_instance = np.zeros(self.max_points, dtype=np.int32)
-        full_semantic[:valid_points] = semantic_labels
-        full_instance[:valid_points] = instance_labels
-        
-        return full_semantic, full_instance, detected_objects
+        return semantic_labels[:valid_points], instance_labels[:valid_points], detected_objects
     
     def process_pointcloud(self, bin_path, confidence_threshold=0.5, num_classes=20):
         """
@@ -299,7 +298,7 @@ class ONNXPointCloudProcessor:
         points = self.load_bin_pointcloud(bin_path)
         
         # Preprocess
-        voxel_features, point_coords, point_mask = self.preprocess_pointcloud(points)
+        voxel_features, point_coords, point_mask, valid_indices = self.preprocess_pointcloud(points)
         
         # Run inference
         pred_logits, pred_masks, sem_logits = self.run_inference(voxel_features, point_coords)
@@ -309,12 +308,23 @@ class ONNXPointCloudProcessor:
             pred_logits, pred_masks, sem_logits, point_mask, confidence_threshold, num_classes
         )
         
+        # Create full labels array (same size as original point cloud)
+        full_semantic_labels = np.zeros(len(points), dtype=np.uint16)
+        full_instance_labels = np.zeros(len(points), dtype=np.uint16)
+        
+        # Map predictions back to original indices
+        num_valid = len(semantic_labels)
+        if num_valid > 0 and len(valid_indices) >= num_valid:
+            full_semantic_labels[valid_indices[:num_valid]] = semantic_labels
+            full_instance_labels[valid_indices[:num_valid]] = instance_labels
+        
         results = {
             'original_points': points,
-            'semantic_labels': semantic_labels,
-            'instance_labels': instance_labels,
+            'semantic_labels': full_semantic_labels,
+            'instance_labels': full_instance_labels,
             'detected_objects': detected_objects,
             'point_mask': point_mask,
+            'valid_indices': valid_indices,
             'inference_outputs': {
                 'pred_logits': pred_logits,
                 'pred_masks': pred_masks,
@@ -326,45 +336,89 @@ class ONNXPointCloudProcessor:
         return results
 
 
-def save_results(results, output_dir, filename_base):
-    """Save results to files"""
+def encode_semantickitti_label(semantic, instance):
+    """
+    Encode semantic and instance labels into SemanticKITTI format
+    
+    SemanticKITTI uses 32-bit integers where:
+    - Lower 16 bits: semantic label
+    - Upper 16 bits: instance label
+    
+    Args:
+        semantic: Semantic class label (0-255)
+        instance: Instance ID (0-65535)
+    
+    Returns:
+        label: 32-bit encoded label
+    """
+    return (instance << 16) | (semantic & 0xFFFF)
+
+
+def save_results_semantickitti(results, output_dir, filename_base, save_pointcloud=True):
+    """Save results in SemanticKITTI format"""
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     
-    # Save semantic labels
-    semantic_path = output_dir / f"{filename_base}_semantic.npy"
-    np.save(semantic_path, results['semantic_labels'])
+    # Get labels
+    semantic_labels = results['semantic_labels']
+    instance_labels = results['instance_labels']
     
-    # Save instance labels
-    instance_path = output_dir / f"{filename_base}_instance.npy"
-    np.save(instance_path, results['instance_labels'])
+    # Encode labels in SemanticKITTI format
+    encoded_labels = np.zeros(len(semantic_labels), dtype=np.uint32)
+    for i in range(len(semantic_labels)):
+        encoded_labels[i] = encode_semantickitti_label(
+            semantic_labels[i], 
+            instance_labels[i]
+        )
     
-    # Save detected objects info
+    # Save label file
+    label_path = output_dir / f"{filename_base}.label"
+    encoded_labels.astype(np.uint32).tofile(label_path)
+    print(f"\nSaved label file: {label_path}")
+    print(f"  Shape: {encoded_labels.shape}")
+    print(f"  Unique semantic classes: {len(np.unique(semantic_labels))}")
+    print(f"  Unique instances: {len(np.unique(instance_labels[instance_labels > 0]))}")
+    
+    # Save point cloud (optional - usually you'd use the original)
+    if save_pointcloud:
+        pointcloud_path = output_dir / f"{filename_base}.bin"
+        results['original_points'].astype(np.float32).tofile(pointcloud_path)
+        print(f"Saved point cloud: {pointcloud_path}")
+    
+    # Save detected objects info as text file for reference
     import json
     objects_info = []
     for obj in results['detected_objects']:
         info = {k: v for k, v in obj.items() if k != 'mask'}  # Don't save mask array
-        info['confidence'] = float(info['confidence'])  # Convert to JSON serializable
+        # Convert numpy types to Python native types
+        info['confidence'] = float(info['confidence'])
+        info['instance_id'] = int(info['instance_id'])
+        info['class_id'] = int(info['class_id'])
+        info['num_points'] = int(info['num_points'])
         objects_info.append(info)
     
     objects_path = output_dir / f"{filename_base}_objects.json"
     with open(objects_path, 'w') as f:
         json.dump(objects_info, f, indent=2)
+    print(f"Saved object detections: {objects_path}")
     
-    # Save colored point cloud (if requested)
-    colored_points = np.column_stack([
-        results['original_points'][:len(results['semantic_labels'])],
-        results['semantic_labels'][:len(results['original_points'])],
-        results['instance_labels'][:len(results['original_points'])]
-    ])
-    colored_path = output_dir / f"{filename_base}_colored.npy"
-    np.save(colored_path, colored_points)
-    
-    print(f"\nResults saved to {output_dir}:")
-    print(f"  - Semantic labels: {semantic_path}")
-    print(f"  - Instance labels: {instance_path}")
-    print(f"  - Object detections: {objects_path}")
-    print(f"  - Colored point cloud: {colored_path}")
+    # Create a simple statistics file
+    stats_path = output_dir / f"{filename_base}_stats.txt"
+    with open(stats_path, 'w') as f:
+        f.write(f"Point cloud statistics for {filename_base}\n")
+        f.write(f"{'='*50}\n")
+        f.write(f"Total points: {len(results['original_points'])}\n")
+        f.write(f"Labeled points: {np.sum(semantic_labels > 0)}\n")
+        f.write(f"Unlabeled points: {np.sum(semantic_labels == 0)}\n")
+        f.write(f"\nSemantic classes:\n")
+        unique_classes, counts = np.unique(semantic_labels, return_counts=True)
+        for cls, count in zip(unique_classes, counts):
+            f.write(f"  Class {cls}: {count} points\n")
+        f.write(f"\nInstances detected: {len(results['detected_objects'])}\n")
+        for obj in results['detected_objects']:
+            f.write(f"  Instance {obj['instance_id']}: Class {obj['class_id']}, "
+                   f"{obj['num_points']} points, confidence {obj['confidence']:.3f}\n")
+    print(f"Saved statistics: {stats_path}")
 
 
 @click.command()
@@ -377,9 +431,11 @@ def save_results(results, output_dir, filename_base):
 @click.option('--device', default='cpu', help='Device to use: cpu or cuda')
 @click.option('--dataset', default='kitti', help='Dataset type: kitti or nuscenes')
 @click.option('--batch_process', is_flag=True, help='Process all .bin files in directory')
-def main(onnx_model, pointcloud_path, max_points, confidence, num_classes, output_dir, device, dataset, batch_process):
+@click.option('--save_pointcloud', is_flag=True, help='Save point cloud .bin file (default: False)')
+def main(onnx_model, pointcloud_path, max_points, confidence, num_classes, output_dir, device, 
+         dataset, batch_process, save_pointcloud):
     """
-    Test ONNX model inference on point cloud files
+    Test ONNX model inference on point cloud files and save in SemanticKITTI format
     
     Examples:
         # Process single file
@@ -390,6 +446,15 @@ def main(onnx_model, pointcloud_path, max_points, confidence, num_classes, outpu
         
         # Process all .bin files in directory
         python test_onnx_inference.py model.onnx /path/to/bin/files/ --batch_process
+        
+        # Save point cloud along with labels
+        python test_onnx_inference.py model.onnx pointcloud.bin --save_pointcloud
+    
+    Output format:
+        - *.label: SemanticKITTI format labels (32-bit: upper 16 bits = instance, lower 16 bits = semantic)
+        - *.bin: Original point cloud (if --save_pointcloud is set)
+        - *_objects.json: Detected objects metadata
+        - *_stats.txt: Processing statistics
     """
     
     # Set coordinate bounds based on dataset
@@ -424,7 +489,7 @@ def main(onnx_model, pointcloud_path, max_points, confidence, num_classes, outpu
                     results = processor.process_pointcloud(
                         bin_file, confidence, num_classes
                     )
-                    save_results(results, output_dir, bin_file.stem)
+                    save_results_semantickitti(results, output_dir, bin_file.stem, save_pointcloud)
                 except Exception as e:
                     print(f"Error processing {bin_file}: {e}")
                     import traceback
@@ -440,7 +505,12 @@ def main(onnx_model, pointcloud_path, max_points, confidence, num_classes, outpu
         results = processor.process_pointcloud(
             pointcloud_path, confidence, num_classes
         )
-        save_results(results, output_dir, pointcloud_path.stem)
+        save_results_semantickitti(results, output_dir, pointcloud_path.stem, save_pointcloud)
+    
+    print(f"\n{'='*60}")
+    print("Processing complete! Files saved in SemanticKITTI format.")
+    print(f"Output directory: {output_dir}")
+    print(f"{'='*60}")
 
 
 if __name__ == "__main__":
