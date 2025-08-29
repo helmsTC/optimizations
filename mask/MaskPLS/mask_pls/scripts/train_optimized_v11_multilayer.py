@@ -64,11 +64,6 @@ class MultiHeadAttention(torch.nn.Module):
         self.dropout = torch.nn.Dropout(dropout)
         
     def forward(self, query, key, value, attn_mask=None):
-        # Ensure all inputs are float32
-        query = query.float()
-        key = key.float()  
-        value = value.float()
-        
         B, N, _ = query.size()
         
         # Linear projections
@@ -239,37 +234,40 @@ class HighResVoxelizer:
                     valid_indices.append(torch.empty(0, dtype=torch.bool, device=self.device))
                     continue
                 
-                # Normalize to [0, 1] - ensure consistent dtypes
-                normalized = (pts.float() - self.bounds_min.float()) / self.bounds_range.float()
-                normalized = torch.clamp(normalized.float(), 0.0, 1.0)
-                normalized_coords.append(normalized)
-                
-                # Convert to voxel coordinates - ensure consistent types
-                voxel_coords = (normalized.float() * self.spatial_dims_int.float()).long()
-                voxel_coords = torch.clamp(voxel_coords.long(), 0, self.spatial_dims_int.long())
-                
-                valid_mask = (
-                    (voxel_coords >= 0).all(dim=1) & 
-                    (voxel_coords < self.spatial_dims_int).all(dim=1)
-                )
-                valid_indices.append(valid_mask)
+                # Use working v10 approach - bounds check first
+                valid_mask = ((pts >= self.bounds_min) & (pts < self.bounds_max)).all(dim=1)
                 
                 if valid_mask.sum() == 0:
+                    normalized_coords.append(torch.zeros(0, 3, device=self.device))
+                    valid_indices.append(torch.zeros(0, dtype=torch.long, device=self.device))
                     continue
                 
-                valid_coords = voxel_coords[valid_mask].long()
-                valid_feats = feat[valid_mask].float()
+                valid_idx = torch.where(valid_mask)[0]
+                valid_pts = pts[valid_mask]
+                valid_feat = feat[valid_mask]
                 
-                # Scatter features - ensure all tensors are consistent types
-                linear_indices = (
-                    valid_coords[:, 0].long() * H * W + 
-                    valid_coords[:, 1].long() * W + 
-                    valid_coords[:, 2].long()
-                ).long()
+                # HIGH-PRECISION normalization (from v10)
+                norm_coords = (valid_pts - self.bounds_min) / self.bounds_range
+                norm_coords = torch.clamp(norm_coords, 0.0, 0.999999)
+                normalized_coords.append(norm_coords)
+                valid_indices.append(valid_idx)
                 
+                # High-res voxel indices
+                voxel_coords_float = norm_coords * self.spatial_dims
+                voxel_indices = voxel_coords_float.long()
+                voxel_indices = torch.clamp(voxel_indices, torch.zeros(3, device=self.device, dtype=torch.long), self.spatial_dims_int)
+                
+                # Flat indexing
+                flat_indices = (voxel_indices[:, 0] * (H * W) + 
+                              voxel_indices[:, 1] * W + 
+                              voxel_indices[:, 2]).long()
+                max_idx = D * H * W - 1
+                flat_indices = torch.clamp(flat_indices, 0, max_idx)
+                
+                # Feature accumulation
                 for c in range(C):
-                    voxel_grids[b, c].view(-1).scatter_add_(0, linear_indices, valid_feats[:, c].float())
-                voxel_counts[b, 0].view(-1).scatter_add_(0, linear_indices, torch.ones_like(linear_indices, dtype=torch.float32, device=self.device))
+                    voxel_grids[b, c].view(-1).scatter_add_(0, flat_indices, valid_feat[:, c])
+                voxel_counts[b, 0].view(-1).scatter_add_(0, flat_indices, torch.ones_like(flat_indices, dtype=torch.float32))
                 
             except Exception as e:
                 print(f"Voxelization error batch {b}: {e}")
@@ -291,8 +289,7 @@ class EnhancedMaskPLSModel(LightningModule):
         self.config = config
         self.save_hyperparameters()
         
-        # Ensure model uses float32 precision
-        self.to(torch.float32)
+        # Remove explicit dtype forcing to avoid conflicts
         
         # High-res voxelizer - fix bounds from config
         bounds = config.get('KITTI', {}).get('SPACE', [[-50.0,50.0],[-50.0,50.0],[-5.0,3.0]])
@@ -375,14 +372,12 @@ class EnhancedMaskPLSModel(LightningModule):
             points_batch, features_batch
         )
         
-        # CNN encoding - ensure consistent tensor types
-        voxel_grids = voxel_grids.float()  # Ensure float32 for model compatibility
+        # CNN encoding
         encoded_features = self.encoder(voxel_grids)  # [B, 128, 30, 30, 15]
         
         # Reshape and project features for transformer
         B, C, D, H, W = encoded_features.shape
         point_features = encoded_features.view(B, C, -1).permute(0, 2, 1)  # [B, N, 128]
-        point_features = point_features.float()  # Ensure float32
         point_features = self.feature_proj(point_features)  # [B, N, 256]
         
         # Multi-layer decoder with progressive refinement
