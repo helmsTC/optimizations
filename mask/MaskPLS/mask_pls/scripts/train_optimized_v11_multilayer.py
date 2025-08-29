@@ -345,8 +345,9 @@ class EnhancedMaskPLSModel(LightningModule):
             })
     
     def forward(self, batch):
-        points_batch = [item['coordinates'] for item in batch]
-        features_batch = [item['features'] for item in batch]
+        # Fix batch structure - use same format as v10
+        points_batch = batch['pt_coord']
+        features_batch = batch['feats']
         
         # High-res voxelization
         voxel_grids, normalized_coords, valid_indices = self.voxelizer.voxelize_batch_highres(
@@ -469,13 +470,15 @@ class EnhancedMaskPLSModel(LightningModule):
         try:
             outputs, normalized_coords, valid_indices = self(batch)
             
-            # Prepare targets
+            # Prepare targets - fix batch structure like v10
             targets = []
-            for item in batch:
-                if 'instance_labels' in item and 'instance_masks' in item:
+            batch_size = len(batch['pt_coord'])
+            
+            for b in range(batch_size):
+                if 'instance_labels' in batch and 'instance_masks' in batch:
                     targets.append({
-                        'labels': item['instance_labels'].long(),
-                        'masks': item['instance_masks'].float()
+                        'labels': batch['instance_labels'][b].long(),
+                        'masks': batch['instance_masks'][b].float()
                     })
                 else:
                     # Fallback for missing targets
@@ -602,11 +605,11 @@ def train(config, batch_size, epochs, lr, max_batches):
         max_epochs=epochs,
         callbacks=callbacks,
         logger=pl_loggers.TensorBoardLogger('logs/', name='v11_multilayer'),
-        limit_train_batches=max_batches,
-        limit_val_batches=max_batches,
+        limit_train_batches=int(max_batches) if max_batches is not None else 1.0,
+        limit_val_batches=int(max_batches) if max_batches is not None else 1.0,
         gradient_clip_val=0.1,
         accumulate_grad_batches=1,
-        precision='16-mixed'
+        precision=16
     )
     
     print(f"\nStarting multi-layer training...")
