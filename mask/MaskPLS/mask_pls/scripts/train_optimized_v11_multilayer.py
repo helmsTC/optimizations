@@ -324,10 +324,8 @@ class EnhancedMaskPLSModel(LightningModule):
         loss_weights = config.get('LOSS', {}).get('WEIGHTS', [2.0, 5.0, 5.0])
         
         self.matcher = HungarianMatcher(
-            cost_class=1.0,  # Fixed values
-            cost_mask=5.0, 
-            cost_dice=5.0,
-            num_points=config.get('LOSS', {}).get('NUM_POINTS', 70000)
+            costs=[1.0, 5.0, 5.0],  # [class, mask, dice] weights
+            p_ratio=config.get('LOSS', {}).get('P_RATIO', 0.4)
         )
         
         # Loss weights from config
