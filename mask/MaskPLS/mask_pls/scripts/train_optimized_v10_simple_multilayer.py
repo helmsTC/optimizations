@@ -1066,7 +1066,7 @@ class JITFixedOptimizedMaskPLS(LightningModule):
             
             self._last_loss = total_loss.item()
             
-            # Enhanced logging with learning indicators
+            # Enhanced logging with learning indicators  
             if batch_idx % 10 == 0:
                 self.log("train_loss", total_loss, batch_size=self.cfg.TRAIN.BATCH_SIZE)
                 for k, v in mask_losses.items():
@@ -1075,11 +1075,27 @@ class JITFixedOptimizedMaskPLS(LightningModule):
                 if torch.isfinite(sem_loss_value):
                     self.log("train/sem_loss", sem_loss_value, batch_size=self.cfg.TRAIN.BATCH_SIZE)
                 
-                # Show learning progress indicators
-                if hasattr(self, '_prev_loss'):
-                    loss_trend = "↓" if total_loss < self._prev_loss else "↑" if total_loss > self._prev_loss else "="
-                    print(f"Loss trend: {self._prev_loss:.3f} -> {total_loss.item():.3f} {loss_trend}")
-                self._prev_loss = total_loss.item()
+                # Show learning progress indicators with more detail
+                if hasattr(self, '_prev_batch_loss'):
+                    loss_change = total_loss.item() - self._prev_batch_loss
+                    loss_trend = "↓" if loss_change < -0.01 else "↑" if loss_change > 0.01 else "≈"
+                    print(f"\n📊 LEARNING PROGRESS:")
+                    print(f"Loss: {self._prev_batch_loss:.3f} -> {total_loss.item():.3f} {loss_trend} (Δ{loss_change:+.3f})")
+                    
+                    # Component-wise loss analysis
+                    if 'loss_mask' in mask_losses:
+                        mask_loss_val = mask_losses['loss_mask'].item()
+                        if hasattr(self, '_prev_mask_loss'):
+                            mask_change = mask_loss_val - self._prev_mask_loss
+                            print(f"Mask Loss: {self._prev_mask_loss:.3f} -> {mask_loss_val:.3f} (Δ{mask_change:+.3f})")
+                        self._prev_mask_loss = mask_loss_val
+                        
+                    if abs(loss_change) < 0.001:
+                        print("⚠️  Loss plateau detected - may need LR adjustment or longer training")
+                    elif loss_change < -0.1:
+                        print("✅ Good learning progress!")
+                        
+                self._prev_batch_loss = total_loss.item()
                 
                 # Update EMA model for stability (every few batches)
                 if batch_idx % 5 == 0:
@@ -1103,21 +1119,58 @@ class JITFixedOptimizedMaskPLS(LightningModule):
                 else:
                     print(f"Batch {batch_idx}: {step_time:.2f}s (avg: {avg_time:.2f}s), loss: {total_loss:.4f}")
             
-            # MONITOR gradients before returning loss
-            if batch_idx % 20 == 0:  # Check every 20 batches
+            # ENHANCED gradient and parameter monitoring
+            if batch_idx % 10 == 0:  # Check more frequently
                 total_grad_norm = 0.0
                 max_grad = 0.0
+                grad_components = {}
+                
                 for name, param in self.named_parameters():
                     if param.grad is not None:
                         param_norm = param.grad.data.norm(2)
                         total_grad_norm += param_norm.item() ** 2
                         max_grad = max(max_grad, param_norm.item())
+                        
+                        # Track gradients by component
+                        if 'multi_decoder' in name:
+                            grad_components['decoder'] = grad_components.get('decoder', 0) + param_norm.item() ** 2
+                        elif 'model' in name:
+                            grad_components['backbone'] = grad_components.get('backbone', 0) + param_norm.item() ** 2
+                        elif 'mask_loss' in name:
+                            grad_components['loss'] = grad_components.get('loss', 0) + param_norm.item() ** 2
                 
                 total_grad_norm = total_grad_norm ** (1. / 2)
-                print(f"DEBUG: Gradient norms - Total: {total_grad_norm:.4f}, Max: {max_grad:.4f}")
                 
-                if total_grad_norm > 10.0 or max_grad > 5.0:
-                    print("WARNING: Large gradients detected - potential instability")
+                print(f"\n=== GRADIENT ANALYSIS ===")
+                print(f"Total gradient norm: {total_grad_norm:.4f}")
+                print(f"Max gradient: {max_grad:.4f}")
+                for comp, val in grad_components.items():
+                    print(f"{comp} gradients: {(val ** 0.5):.4f}")
+                
+                # Check if parameters are actually changing
+                if hasattr(self, '_prev_params'):
+                    param_change = 0.0
+                    for name, param in self.named_parameters():
+                        if name in self._prev_params:
+                            change = (param.data - self._prev_params[name]).norm().item()
+                            param_change += change ** 2
+                    param_change = param_change ** 0.5
+                    print(f"Parameter change since last batch: {param_change:.6f}")
+                    if param_change < 1e-6:
+                        print("⚠️ WARNING: Very small parameter changes - learning might be stuck")
+                    else:
+                        print(f"✓ Parameters updating normally")
+                
+                # Store current parameters for next comparison
+                self._prev_params = {name: param.data.clone() for name, param in self.named_parameters()}
+                
+                if total_grad_norm < 1e-6:
+                    print("⚠️ WARNING: Extremely small gradients - vanishing gradient problem")
+                elif total_grad_norm > 10.0:
+                    print("⚠️ WARNING: Large gradients detected - potential exploding gradients")
+                else:
+                    print(f"✓ Gradient norms look healthy")
+                print(f"=== END GRADIENT ANALYSIS ===\n")
             
             # Clear cache periodically to prevent OOM
             if batch_idx % 20 == 0 and torch.cuda.is_available():
@@ -1461,17 +1514,25 @@ class JITFixedOptimizedMaskPLS(LightningModule):
     
     def configure_optimizers(self):
         """ULTRA-STABILIZED optimizer settings for fixing loss instability"""
-        # MODERATE learning rate - not too conservative
-        stable_lr = self.cfg.TRAIN.LR * 0.1  # 10x reduction (back to previous)
-        print(f"DEBUG: Using ultra-conservative LR {stable_lr:.6f} for stability (was {self.cfg.TRAIN.LR})")
+        # DEBUGGING-FOCUSED learning rate
+        base_lr = self.cfg.TRAIN.LR
+        stable_lr = base_lr * 0.2  # Less conservative - 5x reduction instead of 10x
+        print(f"\n=== OPTIMIZER CONFIGURATION ===")
+        print(f"Base LR: {base_lr:.6f}")
+        print(f"Using LR: {stable_lr:.6f} (20% of base - increased for better learning)")
+        print(f"Expected gradient scale: ~{stable_lr * 1000:.3f}")
         
         optimizer = torch.optim.AdamW(
             self.parameters(),
             lr=stable_lr,
-            weight_decay=1e-6,  # Even lower weight decay
+            weight_decay=1e-5,  # Slightly higher for regularization
             eps=1e-8,
             betas=(0.9, 0.999)  # Default stable betas
         )
+        
+        print(f"Optimizer: AdamW with weight_decay={1e-5:.1e}")
+        print(f"Scheduler: Warmup over 50 steps")
+        print(f"=== END OPTIMIZER CONFIG ===\n")
         
         # Warmup scheduler for gradual learning
         def warmup_lambda(step):

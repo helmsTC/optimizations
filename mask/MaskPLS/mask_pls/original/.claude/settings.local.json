@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(C:\\Users\\freer\\OneDrive\\Desktop\\New folder (5)\\optimizations\\mask\\MaskPLS\\mask_pls/**)",
+      "Read(C:\\Users\\freer\\OneDrive\\Desktop\\New folder (5)\\optimizations\\mask\\MaskPLS\\mask_pls\\scripts/**)",
+      "Read(C:\\Users\\freer\\OneDrive\\Desktop\\New folder (5)\\optimizations\\mask\\MaskPLS\\mask_pls\\scripts/**)",
+      "Read(C:\\Users\\freer\\OneDrive\\Desktop\\New folder (5)\\optimizations\\mask\\MaskPLS\\mask_pls\\models\\onnx/**)",
+      "Read(C:\\Users\\freer\\OneDrive\\Desktop\\New folder (5)\\optimizations\\mask\\MaskPLS\\mask_pls\\models\\onnx/**)",
+      "Read(C:\\Users\\freer\\OneDrive\\Desktop\\New folder (5)\\optimizations\\mask\\MaskPLS\\mask_pls\\config/**)",
+      "Read(C:\\Users\\freer\\OneDrive\\Desktop\\New folder (5)\\optimizations\\mask\\MaskPLS\\mask_pls\\config/**)",
+      "Read(C:\\Users\\freer\\OneDrive\\Desktop\\New folder (5)\\optimizations\\mask\\MaskPLS\\mask_pls\\scripts/**)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
