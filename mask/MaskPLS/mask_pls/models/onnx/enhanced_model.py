@@ -37,16 +37,17 @@ class MultiScaleEncoder(nn.Module):
         
         # Decoder stages with skip connections
         self.decoder_stages = nn.ModuleList()
-        decoder_channels = [cs[-1], cs[-2], cs[-3], cs[-4]]
-        for i in range(len(decoder_channels) - 1):
-            in_ch = decoder_channels[i]
-            out_ch = decoder_channels[i+1]
-            skip_ch = cs[-(i+2)]  # Skip connection from encoder
+        # Decoder goes from deep to shallow: 512 -> 256 -> 128 -> 64
+        decoder_in_channels = [cs[-1], cs[-2], cs[-3]]  # [512, 256, 128]
+        decoder_out_channels = [cs[-2], cs[-3], cs[-4]]  # [256, 128, 64]
+        skip_channels = [cs[-2], cs[-3], cs[-4]]  # [256, 128, 64]
+        
+        for in_ch, out_ch, skip_ch in zip(decoder_in_channels, decoder_out_channels, skip_channels):
             self.decoder_stages.append(
-                DecoderStage(in_ch + skip_ch, out_ch)
+                DecoderStage(in_ch, out_ch, skip_ch)
             )
         
-        self.output_channels = decoder_channels
+        self.output_channels = decoder_out_channels
         
     def forward(self, x):
         # Encoder with skip connections
@@ -64,7 +65,6 @@ class MultiScaleEncoder(nn.Module):
         
         # Start from the deepest features
         x = encoder_features[-1]
-        decoder_features.append(x)
         
         # Upsample and merge with skip connections
         for i, stage in enumerate(self.decoder_stages):
@@ -73,8 +73,8 @@ class MultiScaleEncoder(nn.Module):
             decoder_features.append(x)
         
         # Return multi-scale features for the transformer decoder
-        # Use the last 3 decoder features
-        return decoder_features[-3:]
+        # Return all decoder features (they are already at different scales)
+        return decoder_features
 
 
 class EncoderStage(nn.Module):
@@ -115,7 +115,7 @@ class EncoderStage(nn.Module):
 
 class DecoderStage(nn.Module):
     """Decoder stage with skip connection"""
-    def __init__(self, in_channels, out_channels):
+    def __init__(self, in_channels, out_channels, skip_channels):
         super().__init__()
         
         self.upsample = nn.ConvTranspose3d(
@@ -124,7 +124,8 @@ class DecoderStage(nn.Module):
         )
         self.norm = nn.InstanceNorm3d(out_channels)
         
-        self.conv = nn.Conv3d(out_channels, out_channels,
+        # Handle skip connection
+        self.conv = nn.Conv3d(out_channels + skip_channels, out_channels,
                              kernel_size=3, padding=1, bias=False)
         self.norm2 = nn.InstanceNorm3d(out_channels)
         
@@ -356,13 +357,15 @@ class EnhancedMaskPLSONNX(nn.Module):
         self.num_classes = cfg[dataset].NUM_CLASSES
         
         # Better channel progression for features
+        # Ensure we use the channels from config
         cfg.BACKBONE.CHANNELS = [32, 64, 128, 256, 512]
         
         # Multi-scale encoder
         self.encoder = MultiScaleEncoder(cfg.BACKBONE)
         
         # Point decoder with multi-scale fusion
-        feat_dims = self.encoder.output_channels[-3:]  # Last 3 scales
+        # Get the actual output channels from encoder
+        feat_dims = [128, 256, 512]  # Last 3 encoder stages
         self.point_decoder = EnhancedPointDecoder(
             feat_dims,
             cfg.DECODER.HIDDEN_DIM
