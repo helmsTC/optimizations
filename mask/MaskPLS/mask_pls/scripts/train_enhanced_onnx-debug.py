@@ -360,16 +360,10 @@ class EnhancedMaskPLS(LightningModule):
             max_points=self.cfg[self.cfg.MODEL.DATASET].SUB_NUM_POINTS
         )
         
-        # Skip dense conversion during training to save memory
+        # Always convert to dense for now (backbone expects it)
         B = len(points)
-        if self.training:
-            # During training, use sparse-only processing
-            dense_voxels = None
-            multi_scale_features = self.backbone(None, sparse_voxels)
-        else:
-            # Convert to dense only for ONNX inference
-            dense_voxels = self.voxelizer.sparse_to_dense(sparse_voxels, B)
-            multi_scale_features = self.backbone(dense_voxels, sparse_voxels)
+        dense_voxels = self.voxelizer.sparse_to_dense(sparse_voxels, B)
+        multi_scale_features = self.backbone(dense_voxels, sparse_voxels)
         
         # Interpolate features to points efficiently
         point_features = []
