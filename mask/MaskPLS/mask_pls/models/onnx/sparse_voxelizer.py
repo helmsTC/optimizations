@@ -168,7 +168,9 @@ class SparseVoxelizer:
                 features = sparse['features']
                 
                 # Clamp indices to grid bounds for safety
-                indices = torch.clamp(indices, min=0, max=torch.tensor([D-1, H-1, W-1], device=self.device))
+                indices[:, 0] = torch.clamp(indices[:, 0], 0, D-1)
+                indices[:, 1] = torch.clamp(indices[:, 1], 0, H-1) 
+                indices[:, 2] = torch.clamp(indices[:, 2], 0, W-1)
                 
                 # Efficient dense assignment
                 dense_grid[b, :, indices[:, 0], indices[:, 1], indices[:, 2]] = features.T
