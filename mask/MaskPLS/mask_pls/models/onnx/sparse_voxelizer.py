@@ -35,7 +35,12 @@ class SparseVoxelizer:
         self.bounds_range = self.bounds_max - self.bounds_min
         
         # Precompute voxel grid dimensions based on resolution
-        self.grid_size = (self.bounds_range / resolution).long()
+        # Limit grid size to prevent memory explosion
+        raw_grid_size = (self.bounds_range / resolution).long()
+        max_grid_size = 512  # Reasonable limit for dense grids
+        self.grid_size = torch.clamp(raw_grid_size, max=max_grid_size)
+        
+        print(f"Grid size limited to: {self.grid_size.tolist()} (raw would be: {raw_grid_size.tolist()})")
         
     def voxelize_batch(self, points_list, features_list, max_points=80000):
         """
@@ -135,12 +140,22 @@ class SparseVoxelizer:
     def sparse_to_dense(self, sparse_voxels, batch_size):
         """
         Convert sparse voxels to dense grid for ONNX compatibility
-        Only create dense grid when necessary
+        Only create dense grid when necessary - with memory safety
         """
         D, H, W = self.grid_size.tolist()
+        
+        # Safety check for memory usage
+        total_voxels = D * H * W
+        if total_voxels > 134217728:  # 512^3 voxels max
+            print(f"Warning: Grid too large ({D}x{H}x{W} = {total_voxels:,} voxels), using smaller grid")
+            # Use a smaller, reasonable grid size
+            D = min(D, 256)
+            H = min(H, 256) 
+            W = min(W, 256)
+            
         C = sparse_voxels[0]['features'].shape[1] if sparse_voxels[0]['features'].shape[0] > 0 else 4
         
-        # Create dense grid only for occupied regions
+        # Create dense grid with safety bounds
         dense_grid = torch.zeros(
             (batch_size, C, D, H, W), 
             device=self.device, 
@@ -151,6 +166,9 @@ class SparseVoxelizer:
             if sparse['indices'].shape[0] > 0:
                 indices = sparse['indices']
                 features = sparse['features']
+                
+                # Clamp indices to grid bounds for safety
+                indices = torch.clamp(indices, min=0, max=torch.tensor([D-1, H-1, W-1], device=self.device))
                 
                 # Efficient dense assignment
                 dense_grid[b, :, indices[:, 0], indices[:, 1], indices[:, 2]] = features.T
