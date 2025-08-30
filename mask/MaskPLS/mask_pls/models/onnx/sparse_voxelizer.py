@@ -4,6 +4,7 @@ Sparse voxelizer that mimics MinkowskiEngine efficiency
 """
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from typing import List, Tuple, Dict, Optional
@@ -153,7 +154,7 @@ class SparseVoxelizer:
         return dense_grid
 
 
-class EfficientSparseBackbone(torch.nn.Module):
+class EfficientSparseBackbone(nn.Module):
     """
     Backbone that processes sparse voxels efficiently
     Mimics the original MinkowskiEngine backbone
@@ -247,6 +248,9 @@ class EfficientSparseBackbone(torch.nn.Module):
         self.out_bnorm = nn.ModuleList([
             nn.BatchNorm1d(ch) for ch in self.out_channels
         ])
+        
+        # Semantic head
+        self.sem_head = nn.Linear(cs[-1], 20)
         
     def forward(self, dense_voxels, sparse_info=None):
         """

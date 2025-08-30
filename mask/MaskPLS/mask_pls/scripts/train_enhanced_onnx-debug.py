@@ -1,6 +1,6 @@
 # mask/MaskPLS/mask_pls/scripts/train_enhanced_onnx_debug.py
 """
-Enhanced training script with debugging and NaN/Inf handling
+Enhanced training script with debugging and NaN/Inf handling - COMPLETE FIXED VERSION
 """
 
 import os
@@ -20,21 +20,61 @@ from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
 from pytorch_lightning.core.lightning import LightningModule
 import torch.nn.functional as F
 
-# Import components - FIXED IMPORTS
-from mask_pls.models.onnx.enhanced_model_fixed import (
-    EnhancedMaskPLSONNX, 
-    EfficientPointInterpolation  # This is in enhanced_model.py
-)
+# Import components
 from mask_pls.models.onnx.sparse_voxelizer import (
     SparseVoxelizer, 
     EfficientSparseBackbone
 )
-from mask_pls.models.decoder import MaskedTransformerDecoder  # Import the original decoder
+from mask_pls.models.decoder import MaskedTransformerDecoder
 from mask_pls.datasets.semantic_dataset import SemanticDatasetModule
-from mask_pls.models.loss import MaskLoss, SemLoss
+from mask_pls.models.loss import SemLoss
 from mask_pls.models.matcher import HungarianMatcher
 from mask_pls.utils.evaluate_panoptic import PanopticEvaluator
 from mask_pls.utils.misc import sample_points, pad_stack
+
+
+class EfficientPointInterpolation(torch.nn.Module):
+    """
+    Efficient point feature interpolation from voxel features
+    Mimics the original KNN interpolation
+    """
+    def __init__(self, k=3):
+        super().__init__()
+        self.k = k
+        
+    def forward(self, voxel_features, voxel_coords, point_coords):
+        """
+        Efficiently interpolate features from voxels to points
+        Uses trilinear interpolation instead of KNN for ONNX compatibility
+        """
+        B, C, D, H, W = voxel_features.shape
+        B_p, N, _ = point_coords.shape
+        
+        # Use grid_sample for efficient interpolation
+        # Convert point coords to grid coordinates [-1, 1]
+        grid_coords = point_coords * 2.0 - 1.0
+        grid_coords = grid_coords.view(B, N, 1, 1, 3)
+        
+        # Reorder for grid_sample (expects z, y, x)
+        grid_coords = torch.stack([
+            grid_coords[..., 2],  # z
+            grid_coords[..., 1],  # y  
+            grid_coords[..., 0]   # x
+        ], dim=-1)
+        
+        # Sample features
+        sampled = F.grid_sample(
+            voxel_features, 
+            grid_coords,
+            mode='bilinear',
+            padding_mode='border',
+            align_corners=True
+        )
+        
+        # Reshape to [B, N, C]
+        sampled = sampled.squeeze(-1).squeeze(-1).permute(0, 2, 1)
+        
+        return sampled
 
 
 class EnhancedMaskLoss(torch.nn.Module):
@@ -321,7 +361,7 @@ class EnhancedMaskPLS(LightningModule):
         # Efficient sparse backbone
         self.backbone = EfficientSparseBackbone(cfg.BACKBONE)
         
-        # Efficient point interpolation - use the one from enhanced_model.py
+        # Efficient point interpolation
         self.interpolator = EfficientPointInterpolation(k=cfg.BACKBONE.KNN_UP)
         
         # Keep original decoder
@@ -431,7 +471,7 @@ class EnhancedMaskPLS(LightningModule):
                     if isinstance(mask, torch.Tensor):
                         mask = mask.float()
                     else:
-                        mask = torch.from_numpy(mask).float()
+                        mask = torch.from_numpy(mask).float() if isinstance(mask, np.ndarray) else mask.float()
                     
                     # Create remapped mask
                     remapped_mask = torch.zeros(max_points, device='cuda')
@@ -748,18 +788,17 @@ class EnhancedMaskPLS(LightningModule):
                     print(f"Warning: NaN/Inf gradient in {name}")
                     param.grad = torch.nan_to_num(param.grad, nan=0.0, posinf=1.0, neginf=-1.0)
         
-        # Clip gradients - access from trainer
-        if hasattr(self.trainer, 'gradient_clip_val') and self.trainer.gradient_clip_val is not None:
-            torch.nn.utils.clip_grad_norm_(self.parameters(), self.trainer.gradient_clip_val)
+        # Gradient clipping
+        torch.nn.utils.clip_grad_norm_(self.parameters(), max_norm=1.0)
 
 
 @click.command()
 @click.option("--config", type=str, default="config/model.yaml")
 @click.option("--epochs", type=int, default=100)
-@click.option("--batch_size", type=int, default=1)  # Start with batch size 1
-@click.option("--lr", type=float, default=0.00005)  # Lower learning rate
+@click.option("--batch_size", type=int, default=1)
+@click.option("--lr", type=float, default=0.00005)
 @click.option("--gpus", type=int, default=1)
-@click.option("--num_workers", type=int, default=2)  # Fewer workers initially
+@click.option("--num_workers", type=int, default=2)
 @click.option("--checkpoint", type=str, default=None)
 @click.option("--nuscenes", is_flag=True)
 def main(config, epochs, batch_size, lr, gpus, num_workers, checkpoint, nuscenes):
@@ -830,7 +869,7 @@ def main(config, epochs, batch_size, lr, gpus, num_workers, checkpoint, nuscenes
     lr_monitor = LearningRateMonitor(logging_interval="step")
     
     checkpoint_callback = ModelCheckpoint(
-        monitor="metrics/iou",  # Monitor IoU instead of PQ initially
+        monitor="metrics/iou",
         filename=cfg.EXPERIMENT.ID + "_debug_epoch{epoch:02d}_iou{metrics/iou:.3f}",
         auto_insert_metric_name=False,
         mode="max",
@@ -840,20 +879,19 @@ def main(config, epochs, batch_size, lr, gpus, num_workers, checkpoint, nuscenes
     
     # Create trainer with debugging settings
     trainer = Trainer(
-        gpus=gpus,
-        accelerator="gpu" if gpus > 0 else None,
-        strategy="ddp" if gpus > 1 else None,
+        devices=gpus,
+        accelerator="gpu" if gpus > 0 else "cpu",
+        strategy="ddp" if gpus > 1 else "auto",
         logger=tb_logger,
         max_epochs=epochs,
         callbacks=[lr_monitor, checkpoint_callback],
         log_every_n_steps=1,
-        gradient_clip_val=1.0,  # Gradient clipping
+        gradient_clip_val=1.0,
         accumulate_grad_batches=cfg.TRAIN.BATCH_ACC,
         precision=32,  # Use full precision initially for stability
-        check_val_every_n_epoch=5,  # Validate less frequently initially
+        check_val_every_n_epoch=5,
         num_sanity_val_steps=0,
         detect_anomaly=True,  # Enable anomaly detection
-        track_grad_norm=2,  # Track gradient norms
     )
     
     # Train
