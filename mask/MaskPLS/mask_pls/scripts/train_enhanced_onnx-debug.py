@@ -293,7 +293,7 @@ class EnhancedMaskLoss(torch.nn.Module):
 
 
 class EnhancedMaskPLS(LightningModule):
-    """Enhanced MaskPLS with debugging and NaN handling"""
+    """Enhanced MaskPLS with efficient sparse processing"""
     def __init__(self, cfg):
         super().__init__()
         self.save_hyperparameters(dict(cfg))
@@ -303,17 +303,28 @@ class EnhancedMaskPLS(LightningModule):
         self.num_classes = cfg[dataset].NUM_CLASSES
         self.ignore_label = cfg[dataset].IGNORE_LABEL
         
-        # High-resolution voxelizer - use lower resolution initially for stability
-        self.voxelizer = HighResVoxelizer(
-            spatial_shape=(64, 64, 32),  # Reduced from (128, 128, 64)
+        # Use sparse voxelizer matching original resolution
+        self.voxelizer = SparseVoxelizer(
+            resolution=cfg.BACKBONE.RESOLUTION,  # 0.05 like original
+            spatial_shape=None,  # Computed from resolution
             coordinate_bounds=cfg[dataset].SPACE,
             device='cuda'
         )
         
-        # Enhanced model
-        self.model = EnhancedMaskPLSONNX(cfg)
+        # Efficient sparse backbone
+        self.backbone = EfficientSparseBackbone(cfg.BACKBONE)
         
-        # Fixed loss functions
+        # Efficient point interpolation
+        self.interpolator = EfficientPointInterpolation(k=cfg.BACKBONE.KNN_UP)
+        
+        # Keep original decoder
+        self.decoder = MaskedTransformerDecoder(
+            cfg.DECODER,
+            cfg.BACKBONE,
+            cfg[dataset]
+        )
+        
+        # Loss functions
         self.mask_loss = EnhancedMaskLoss(cfg.LOSS, cfg[dataset])
         self.sem_loss = SemLoss(cfg.LOSS.SEM.WEIGHTS)
         
@@ -325,94 +336,68 @@ class EnhancedMaskPLS(LightningModule):
         data.setup()
         self.things_ids = data.things_ids
         
-        # Performance tracking
-        self.validation_step_outputs = []
-        
-        # Add gradient clipping value
-        self.gradient_clip_val = 1.0
-        
     def forward(self, batch):
-        """Forward with NaN detection"""
+        """Forward with sparse processing"""
         points = batch['pt_coord']
         features = batch['feats']
         
-        # High-resolution voxelization
-        voxel_grids, norm_coords, valid_indices = self.voxelizer.voxelize_batch(
-            points, features, max_points=self.cfg[self.cfg.MODEL.DATASET].SUB_NUM_POINTS
+        # Sparse voxelization (much faster)
+        sparse_voxels, norm_coords, valid_indices = self.voxelizer.voxelize_batch(
+            points, features, 
+            max_points=self.cfg[self.cfg.MODEL.DATASET].SUB_NUM_POINTS
         )
         
-        # Check for NaN in voxel grids
-        if torch.isnan(voxel_grids).any() or torch.isinf(voxel_grids).any():
-            print("Warning: NaN/Inf in voxel_grids")
-            voxel_grids = torch.nan_to_num(voxel_grids, nan=0.0, posinf=1.0, neginf=-1.0)
+        # Convert to dense only when needed for ONNX
+        B = len(points)
+        dense_voxels = self.voxelizer.sparse_to_dense(sparse_voxels, B)
         
-        # Pad coordinates for batch processing
-        max_pts = max(c.shape[0] for c in norm_coords) if norm_coords else 1000
-        max_pts = max(max_pts, 100)  # Ensure minimum size
+        # Process through backbone
+        multi_scale_features = self.backbone(dense_voxels, sparse_voxels)
         
-        padded_coords = []
+        # Interpolate features to points efficiently
+        point_features = []
+        for feat_level in multi_scale_features:
+            # Downsample coordinates for each level
+            scale = 2 ** (4 - len(point_features))  # Adjust based on level
+            level_coords = [c / scale for c in norm_coords]
+            
+            # Pad coordinates
+            max_pts = max(c.shape[0] for c in level_coords) if level_coords else 1000
+            padded_coords = []
+            
+            for coords in level_coords:
+                if coords.shape[0] < max_pts:
+                    coords = F.pad(coords, (0, 0, 0, max_pts - coords.shape[0]))
+                padded_coords.append(coords)
+            
+            batch_coords = torch.stack(padded_coords)
+            
+            # Interpolate
+            interp_features = self.interpolator(feat_level, None, batch_coords)
+            point_features.append(interp_features)
+        
+        # Stack features
+        feats = point_features
+        coors = [batch_coords for _ in range(len(feats))]
+        
+        # Create padding masks
         padding_masks = []
-        
         for coords in norm_coords:
             n_pts = coords.shape[0]
-            if n_pts == 0:
-                coords = torch.zeros(max_pts, 3, device='cuda')
-                mask = torch.ones(max_pts, dtype=torch.bool, device='cuda')
-            elif n_pts < max_pts:
-                coords = F.pad(coords, (0, 0, 0, max_pts - n_pts))
-                mask = torch.zeros(max_pts, dtype=torch.bool, device='cuda')
+            mask = torch.zeros(max_pts, dtype=torch.bool, device='cuda')
+            if n_pts < max_pts:
                 mask[n_pts:] = True
-            else:
-                mask = torch.zeros(max_pts, dtype=torch.bool, device='cuda')
-            
-            padded_coords.append(coords)
             padding_masks.append(mask)
         
-        batch_coords = torch.stack(padded_coords)
-        padding_masks = torch.stack(padding_masks)
+        padding_masks = [torch.stack(padding_masks) for _ in range(len(feats))]
         
-        # Check for NaN in coordinates
-        if torch.isnan(batch_coords).any() or torch.isinf(batch_coords).any():
-            print("Warning: NaN/Inf in batch_coords")
-            batch_coords = torch.nan_to_num(batch_coords, nan=0.5, posinf=1.0, neginf=0.0)
-            batch_coords = torch.clamp(batch_coords, 0, 1)
+        # Decoder
+        outputs, last_pad = self.decoder(feats, coors, padding_masks)
         
-        # Model forward with try-catch
-        try:
-            pred_logits, pred_masks, sem_logits = self.model(voxel_grids, batch_coords)
-            
-            # Check outputs for NaN
-            if torch.isnan(pred_logits).any() or torch.isinf(pred_logits).any():
-                print("Warning: NaN/Inf in pred_logits output")
-                pred_logits = torch.nan_to_num(pred_logits, nan=0.0, posinf=10.0, neginf=-10.0)
-            
-            if torch.isnan(pred_masks).any() or torch.isinf(pred_masks).any():
-                print("Warning: NaN/Inf in pred_masks output")
-                pred_masks = torch.nan_to_num(pred_masks, nan=0.0, posinf=10.0, neginf=-10.0)
-            
-            if torch.isnan(sem_logits).any() or torch.isinf(sem_logits).any():
-                print("Warning: NaN/Inf in sem_logits output")
-                sem_logits = torch.nan_to_num(sem_logits, nan=0.0, posinf=10.0, neginf=-10.0)
-            
-        except RuntimeError as e:
-            print(f"Runtime error in forward: {e}")
-            # Return zero outputs
-            B = voxel_grids.shape[0]
-            N = batch_coords.shape[1]
-            Q = self.cfg.DECODER.NUM_QUERIES
-            C = self.num_classes
-            
-            pred_logits = torch.zeros(B, Q, C+1, device='cuda')
-            pred_masks = torch.zeros(B, N, Q, device='cuda')
-            sem_logits = torch.zeros(B, N, C, device='cuda')
+        # Semantic head
+        sem_logits = self.backbone.sem_head(feats[-1])
         
-        outputs = {
-            'pred_logits': pred_logits,
-            'pred_masks': pred_masks,
-            'aux_outputs': []
-        }
-        
-        return outputs, padding_masks, sem_logits, valid_indices
+        return outputs, padding_masks[-1], sem_logits, valid_indices
     
     def prepare_targets(self, batch, max_points, valid_indices):
         """Prepare targets with proper remapping and NaN prevention"""
