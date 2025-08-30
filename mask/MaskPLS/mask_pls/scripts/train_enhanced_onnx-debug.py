@@ -314,7 +314,7 @@ class EnhancedMaskLoss(torch.nn.Module):
             
             # Dice loss with NaN prevention
             pred_sigmoid = torch.sigmoid(point_logits)
-            pred_sigmoid = torch.clamp(pred_sigmoid, min=1e-7, max=1-1e-7)  # Prevent 0/1
+            pred_sigmoid = torch.clamp(pred_sigmoid, min=1e-7, max=0.9999999)  # Prevent 0/1
             
             numerator = 2 * (pred_sigmoid * point_labels).sum(-1)
             denominator = pred_sigmoid.sum(-1) + point_labels.sum(-1)
@@ -557,7 +557,7 @@ class EnhancedMaskPLS(LightningModule):
             # Lovasz loss with try-catch
             try:
                 probs = F.softmax(combined_logits, dim=1)
-                probs = torch.clamp(probs, min=1e-7, max=1-1e-7)
+                probs = torch.clamp(probs, min=1e-7, max=0.9999999)
                 lovasz_loss = self.sem_loss.lovasz_softmax(probs, combined_labels)
                 
                 if torch.isnan(lovasz_loss) or torch.isinf(lovasz_loss):

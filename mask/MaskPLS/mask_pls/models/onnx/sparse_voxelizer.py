@@ -79,7 +79,11 @@ class SparseVoxelizer:
             
             # Quantize points to voxel indices
             voxel_coords = ((valid_pts - self.bounds_min) / self.resolution).long()
-            voxel_coords = torch.clamp(voxel_coords, 0, self.grid_size - 1)
+            # Convert tensor to individual scalars for clamp
+            max_x, max_y, max_z = (self.grid_size - 1).tolist()
+            voxel_coords[:, 0] = torch.clamp(voxel_coords[:, 0], 0, max_x)
+            voxel_coords[:, 1] = torch.clamp(voxel_coords[:, 1], 0, max_y)  
+            voxel_coords[:, 2] = torch.clamp(voxel_coords[:, 2], 0, max_z)
             
             # Create unique voxel indices and aggregate features
             # This is the key optimization - only store occupied voxels
