@@ -171,6 +171,7 @@ class DecoderStage(nn.Module):
             
             if D_s != D_x or H_s != H_x or W_s != W_x:
                 # Crop or pad skip to match x
+                # Use 'trilinear' for F.interpolate (different from grid_sample)
                 skip = F.interpolate(skip, size=(D_x, H_x, W_x), mode='trilinear', align_corners=False)
         
         # Concatenate skip connection
@@ -252,8 +253,9 @@ class EnhancedPointDecoder(nn.Module):
         ], dim=-1)
         
         # Sample features: [B, C, N, 1, 1]
+        # For 5D tensors (3D spatial), use 'bilinear' mode (which does trilinear for 3D)
         sampled = F.grid_sample(features, grid_coords, 
-                               mode='trilinear', 
+                               mode='bilinear',  # 'bilinear' for 3D data
                                padding_mode='border',
                                align_corners=True)
         
