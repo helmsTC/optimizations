@@ -20,9 +20,16 @@ from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
 from pytorch_lightning.core.lightning import LightningModule
 import torch.nn.functional as F
 
-# Import components
-from mask_pls.models.onnx.enhanced_model_fixed import EnhancedMaskPLSONNX
-from mask_pls.models.onnx.voxelizer import HighResVoxelizer
+# Import components - FIXED IMPORTS
+from mask_pls.models.onnx.enhanced_model_fixed import (
+    EnhancedMaskPLSONNX, 
+    EfficientPointInterpolation  # This is in enhanced_model.py
+)
+from mask_pls.models.onnx.sparse_voxelizer import (
+    SparseVoxelizer, 
+    EfficientSparseBackbone
+)
+from mask_pls.models.decoder import MaskedTransformerDecoder  # Import the original decoder
 from mask_pls.datasets.semantic_dataset import SemanticDatasetModule
 from mask_pls.models.loss import MaskLoss, SemLoss
 from mask_pls.models.matcher import HungarianMatcher
@@ -314,7 +321,7 @@ class EnhancedMaskPLS(LightningModule):
         # Efficient sparse backbone
         self.backbone = EfficientSparseBackbone(cfg.BACKBONE)
         
-        # Efficient point interpolation
+        # Efficient point interpolation - use the one from enhanced_model.py
         self.interpolator = EfficientPointInterpolation(k=cfg.BACKBONE.KNN_UP)
         
         # Keep original decoder
@@ -330,6 +337,9 @@ class EnhancedMaskPLS(LightningModule):
         
         # Evaluator
         self.evaluator = PanopticEvaluator(cfg[dataset], dataset)
+        
+        # Initialize for validation tracking
+        self.validation_step_outputs = []
         
         # Get things IDs
         data = SemanticDatasetModule(cfg)
@@ -738,8 +748,9 @@ class EnhancedMaskPLS(LightningModule):
                     print(f"Warning: NaN/Inf gradient in {name}")
                     param.grad = torch.nan_to_num(param.grad, nan=0.0, posinf=1.0, neginf=-1.0)
         
-        # Clip gradients
-        torch.nn.utils.clip_grad_norm_(self.parameters(), self.gradient_clip_val)
+        # Clip gradients - access from trainer
+        if hasattr(self.trainer, 'gradient_clip_val') and self.trainer.gradient_clip_val is not None:
+            torch.nn.utils.clip_grad_norm_(self.parameters(), self.trainer.gradient_clip_val)
 
 
 @click.command()
@@ -789,7 +800,7 @@ def main(config, epochs, batch_size, lr, gpus, num_workers, checkpoint, nuscenes
     print(f"  Dataset: {dataset}")
     print(f"  Batch Size: {batch_size}")
     print(f"  Learning Rate: {lr}")
-    print(f"  Voxel Resolution: 64x64x32 (reduced for stability)")
+    print(f"  Voxel Resolution: 0.05 (matching original)")
     print(f"  Point Sampling: {cfg[dataset].SUB_NUM_POINTS}")
     print(f"  Gradient Clipping: Enabled")
     print(f"  NaN Detection: Enabled")
