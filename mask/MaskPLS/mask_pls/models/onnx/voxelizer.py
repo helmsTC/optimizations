@@ -175,39 +175,4 @@ class HighResVoxelizer:
             weight_to_add = weight.squeeze().to(voxel_count.dtype)
             voxel_count.view(-1).scatter_add_(
                 0, flat_idx, weight_to_add
-            ) D*H*W]
-        
-        # Vectorized coordinate conversion (all batches at once)
-        spatial_dims = torch.tensor([D, H, W], device=point_coords.device, dtype=point_coords.dtype)
-        voxel_coords = point_coords * spatial_dims.unsqueeze(0).unsqueeze(0)
-        
-        # Efficient clamping - clamp each dimension separately
-        voxel_coords[..., 0] = torch.clamp(voxel_coords[..., 0], 0, D - 1)
-        voxel_coords[..., 1] = torch.clamp(voxel_coords[..., 1], 0, H - 1)
-        voxel_coords[..., 2] = torch.clamp(voxel_coords[..., 2], 0, W - 1)
-        voxel_coords = voxel_coords.long()
-        
-        # Vectorized flat indexing
-        flat_indices = (voxel_coords[..., 0] * H * W + 
-                       voxel_coords[..., 1] * W + 
-                       voxel_coords[..., 2])
-        
-        # Efficient gather operation
-        flat_indices_expanded = flat_indices.unsqueeze(1).expand(-1, C_out, -1)
-        point_features = torch.gather(voxel_flat, 2, flat_indices_expanded)
-        point_features = point_features.transpose(1, 2)  # [B, N, C]
-        
-        # Efficient MLP with chunking for large inputs
-        if N > 10000:
-            # Process in chunks to avoid memory issues
-            chunk_size = 5000
-            output_chunks = []
-            for i in range(0, N, chunk_size):
-                end_idx = min(i + chunk_size, N)
-                chunk = self.mlp(point_features[:, i:end_idx])
-                output_chunks.append(chunk)
-            point_features = torch.cat(output_chunks, dim=1)
-        else:
-            point_features = self.mlp(point_features)
-        
-        return point_features
+            )
