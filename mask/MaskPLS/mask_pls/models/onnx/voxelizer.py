@@ -164,48 +164,18 @@ class HighResVoxelizer:
             
             # Accumulate weighted features
             for c in range(features.shape[1]):
+                # Ensure dtypes match
+                weighted_features = (features[:, c] * weight.squeeze()).to(voxel_grid.dtype)
                 voxel_grid[c].view(-1).scatter_add_(
-                    0, flat_idx, features[:, c] * weight.squeeze()
+                    0, flat_idx, weighted_features
                 )
             
             # Accumulate weights
+            # Ensure weight dtype matches voxel_count dtype
+            weight_to_add = weight.squeeze().to(voxel_count.dtype)
             voxel_count.view(-1).scatter_add_(
-                0, flat_idx, weight.squeeze()
-            )
-
-
-class FastPointDecoder(nn.Module):
-    """
-    Optimized point decoder with efficient feature sampling
-    """
-    def __init__(self, in_channels, out_channels):
-        super().__init__()
-        
-        # Efficient feature projection
-        self.feature_proj = nn.Conv3d(in_channels, out_channels, kernel_size=1, bias=False)
-        self.bn = nn.BatchNorm3d(out_channels)
-        
-        # Lightweight MLP
-        self.mlp = nn.Sequential(
-            nn.Linear(out_channels, out_channels // 2),
-            nn.ReLU(inplace=True),
-            nn.Linear(out_channels // 2, out_channels),
-        )
-        
-        # Cache for spatial dimensions
-        self.spatial_cache = {}
-        
-    def forward(self, voxel_features, point_coords):
-        """Optimized forward with caching and vectorization"""
-        B, C, D, H, W = voxel_features.shape
-        B_p, N, _ = point_coords.shape
-        
-        # Project features efficiently
-        voxel_features = self.bn(self.feature_proj(voxel_features))
-        C_out = voxel_features.shape[1]
-        
-        # Flatten for efficient indexing
-        voxel_flat = voxel_features.view(B, C_out, -1)  # [B, C, D*H*W]
+                0, flat_idx, weight_to_add
+            ) D*H*W]
         
         # Vectorized coordinate conversion (all batches at once)
         spatial_dims = torch.tensor([D, H, W], device=point_coords.device, dtype=point_coords.dtype)
