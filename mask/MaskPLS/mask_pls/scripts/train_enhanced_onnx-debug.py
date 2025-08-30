@@ -285,7 +285,7 @@ class EnhancedMaskLoss(torch.nn.Module):
                 sample_idx = sampled_indices[b_idx].to(pred_masks.device)
                 
                 # Ensure indices are within bounds
-                max_idx = batch_pred_masks.shape[1] - 1
+                max_idx = int(batch_pred_masks.shape[1] - 1)
                 sample_idx = torch.clamp(sample_idx, 0, max_idx)
                 
                 sampled_pred = batch_pred_masks[:, sample_idx]
@@ -347,8 +347,8 @@ class EnhancedMaskPLS(LightningModule):
         self.cfg = cfg
         
         dataset = cfg.MODEL.DATASET
-        self.num_classes = cfg[dataset].NUM_CLASSES
-        self.ignore_label = cfg[dataset].IGNORE_LABEL
+        self.num_classes = int(cfg[dataset].NUM_CLASSES)
+        self.ignore_label = int(cfg[dataset].IGNORE_LABEL)
         
         # Use sparse voxelizer matching original resolution
         self.voxelizer = SparseVoxelizer(
@@ -462,7 +462,7 @@ class EnhancedMaskPLS(LightningModule):
                     device='cuda'
                 )
                 # Clamp classes to valid range
-                classes = torch.clamp(classes, 0, self.num_classes - 1)
+                classes = torch.clamp(classes, 0, int(self.num_classes) - 1)
                 targets['classes'].append(classes)
                 
                 # Remap masks to valid points
@@ -535,7 +535,7 @@ class EnhancedMaskPLS(LightningModule):
                     dtype=torch.long, 
                     device='cuda'
                 )
-                labels_tensor = torch.clamp(labels_tensor, 0, self.num_classes - 1)
+                labels_tensor = torch.clamp(labels_tensor, 0, int(self.num_classes) - 1)
                 
                 # Match dimensions
                 min_len = min(len(batch_logits), len(labels_tensor))
@@ -881,7 +881,7 @@ def main(config, epochs, batch_size, lr, gpus, num_workers, checkpoint, nuscenes
     trainer = Trainer(
         devices=gpus,
         accelerator="gpu" if gpus > 0 else "cpu",
-        strategy="ddp" if gpus > 1 else "auto",
+        strategy="ddp" if gpus > 1 else None,
         logger=tb_logger,
         max_epochs=epochs,
         callbacks=[lr_monitor, checkpoint_callback],
