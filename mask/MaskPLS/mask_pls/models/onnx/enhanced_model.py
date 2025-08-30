@@ -1,6 +1,6 @@
-# mask/MaskPLS/mask_pls/models/onnx/enhanced_model.py
+# mask/MaskPLS/mask_pls/models/onnx/enhanced_model_fixed.py
 """
-Enhanced MaskPLS ONNX model with multi-scale features and better spatial resolution
+Fixed Enhanced MaskPLS ONNX model with correct channel dimensions
 """
 
 import torch
@@ -16,38 +16,46 @@ class MultiScaleEncoder(nn.Module):
         super().__init__()
         
         input_dim = cfg.INPUT_DIM
-        cs = cfg.CHANNELS  # [32, 64, 128, 256, 512]
+        # Use the actual channel configuration from backbone
+        cs = cfg.CHANNELS  # [32, 32, 64, 128, 256, 256, 128, 96, 96]
+        
+        # For simplified architecture, use fewer stages
+        # We'll use: 32 -> 64 -> 128 -> 256 -> 512
+        self.channels = [32, 64, 128, 256, 512]
         
         # Initial feature extraction
         self.stem = nn.Sequential(
-            nn.Conv3d(input_dim, cs[0], kernel_size=3, padding=1, bias=False),
-            nn.InstanceNorm3d(cs[0]),  # More stable than BatchNorm for varying sizes
+            nn.Conv3d(input_dim, self.channels[0], kernel_size=3, padding=1, bias=False),
+            nn.InstanceNorm3d(self.channels[0]),
             nn.ReLU(inplace=True),
-            nn.Conv3d(cs[0], cs[0], kernel_size=3, padding=1, bias=False),
-            nn.InstanceNorm3d(cs[0]),
+            nn.Conv3d(self.channels[0], self.channels[0], kernel_size=3, padding=1, bias=False),
+            nn.InstanceNorm3d(self.channels[0]),
             nn.ReLU(inplace=True),
         )
         
         # Encoder stages with residual connections
         self.encoder_stages = nn.ModuleList()
-        for i in range(len(cs) - 1):
+        for i in range(len(self.channels) - 1):
             self.encoder_stages.append(
-                EncoderStage(cs[i], cs[i+1], stride=2)
+                EncoderStage(self.channels[i], self.channels[i+1], stride=2)
             )
         
         # Decoder stages with skip connections
         self.decoder_stages = nn.ModuleList()
-        # Decoder goes from deep to shallow: 512 -> 256 -> 128 -> 64
-        decoder_in_channels = [cs[-1], cs[-2], cs[-3]]  # [512, 256, 128]
-        decoder_out_channels = [cs[-2], cs[-3], cs[-4]]  # [256, 128, 64]
-        skip_channels = [cs[-2], cs[-3], cs[-4]]  # [256, 128, 64]
+        # Decoder goes from deep to shallow: 512 -> 256 -> 128
+        decoder_configs = [
+            (512, 256, 256),  # (in_channels, out_channels, skip_channels)
+            (256, 128, 128),
+            (128, 64, 64),
+        ]
         
-        for in_ch, out_ch, skip_ch in zip(decoder_in_channels, decoder_out_channels, skip_channels):
+        for in_ch, out_ch, skip_ch in decoder_configs:
             self.decoder_stages.append(
                 DecoderStage(in_ch, out_ch, skip_ch)
             )
         
-        self.output_channels = decoder_out_channels
+        # Store output channels for point decoder
+        self.output_channels = [256, 128, 64]
         
     def forward(self, x):
         # Encoder with skip connections
@@ -64,16 +72,24 @@ class MultiScaleEncoder(nn.Module):
         decoder_features = []
         
         # Start from the deepest features
-        x = encoder_features[-1]
+        x = encoder_features[-1]  # 512 channels
         
         # Upsample and merge with skip connections
         for i, stage in enumerate(self.decoder_stages):
-            skip = encoder_features[-(i+2)]
+            # Get the corresponding encoder feature for skip connection
+            # encoder_features[-2] = 256 channels (for first decoder stage)
+            # encoder_features[-3] = 128 channels (for second decoder stage)
+            # encoder_features[-4] = 64 channels (for third decoder stage)
+            skip_idx = -(i+2)
+            if abs(skip_idx) <= len(encoder_features):
+                skip = encoder_features[skip_idx]
+            else:
+                # If we don't have enough encoder features, use zero skip
+                skip = torch.zeros_like(x)
             x = stage(x, skip)
             decoder_features.append(x)
         
         # Return multi-scale features for the transformer decoder
-        # Return all decoder features (they are already at different scales)
         return decoder_features
 
 
@@ -114,26 +130,48 @@ class EncoderStage(nn.Module):
 
 
 class DecoderStage(nn.Module):
-    """Decoder stage with skip connection"""
+    """Decoder stage with skip connection - FIXED"""
     def __init__(self, in_channels, out_channels, skip_channels):
         super().__init__()
         
+        # First upsample to out_channels
         self.upsample = nn.ConvTranspose3d(
             in_channels, out_channels,
             kernel_size=2, stride=2, bias=False
         )
-        self.norm = nn.InstanceNorm3d(out_channels)
+        self.norm1 = nn.InstanceNorm3d(out_channels)
         
-        # Handle skip connection
-        self.conv = nn.Conv3d(out_channels + skip_channels, out_channels,
+        # Skip connection processing
+        # Make sure skip has same channels as upsampled features
+        if skip_channels != out_channels:
+            self.skip_conv = nn.Conv3d(skip_channels, out_channels, kernel_size=1, bias=False)
+        else:
+            self.skip_conv = nn.Identity()
+        
+        # Process concatenated features
+        # After concatenation we have out_channels + out_channels = 2*out_channels
+        self.conv = nn.Conv3d(out_channels * 2, out_channels,
                              kernel_size=3, padding=1, bias=False)
         self.norm2 = nn.InstanceNorm3d(out_channels)
         
     def forward(self, x, skip):
         # Upsample
         x = self.upsample(x)
-        x = self.norm(x)
+        x = self.norm1(x)
         x = F.relu(x, inplace=True)
+        
+        # Process skip connection to match channels
+        skip = self.skip_conv(skip)
+        
+        # Handle size mismatch by cropping or padding
+        if x.shape != skip.shape:
+            # Ensure spatial dimensions match
+            _, _, D_x, H_x, W_x = x.shape
+            _, _, D_s, H_s, W_s = skip.shape
+            
+            if D_s != D_x or H_s != H_x or W_s != W_x:
+                # Crop or pad skip to match x
+                skip = F.interpolate(skip, size=(D_x, H_x, W_x), mode='trilinear', align_corners=False)
         
         # Concatenate skip connection
         x = torch.cat([x, skip], dim=1)
@@ -147,7 +185,7 @@ class DecoderStage(nn.Module):
 
 
 class EnhancedPointDecoder(nn.Module):
-    """Point decoder with multi-scale feature fusion and trilinear interpolation"""
+    """Point decoder with multi-scale feature fusion and trilinear interpolation - FIXED"""
     def __init__(self, feat_dims, hidden_dim):
         super().__init__()
         
@@ -160,9 +198,10 @@ class EnhancedPointDecoder(nn.Module):
             for dim in feat_dims
         ])
         
-        # Feature fusion
+        # Feature fusion - fixed input dimension calculation
+        total_features = hidden_dim * len(feat_dims)
         self.fusion = nn.Sequential(
-            nn.Linear(hidden_dim * len(feat_dims), hidden_dim * 2),
+            nn.Linear(total_features, hidden_dim * 2),
             nn.ReLU(inplace=True),
             nn.Linear(hidden_dim * 2, hidden_dim),
             nn.LayerNorm(hidden_dim)
@@ -174,7 +213,7 @@ class EnhancedPointDecoder(nn.Module):
         all_features = []
         
         for features, proj in zip(multi_scale_features, self.scale_projs):
-            # Project features
+            # Project features to hidden_dim
             features = proj(features)
             
             # Trilinear interpolation for smooth feature sampling
@@ -237,6 +276,10 @@ class ImprovedTransformerDecoder(nn.Module):
         # Learnable query embeddings
         self.query_embed = nn.Parameter(torch.randn(1, self.num_queries, hidden_dim))
         self.query_pos = nn.Parameter(torch.randn(1, self.num_queries, hidden_dim))
+        
+        # Initialize properly
+        nn.init.normal_(self.query_embed, std=0.02)
+        nn.init.normal_(self.query_pos, std=0.02)
         
         # Transformer layers
         self.transformer_layers = nn.ModuleList([
@@ -322,25 +365,25 @@ class TransformerDecoderLayer(nn.Module):
         self.norm3 = nn.LayerNorm(d_model)
         
     def forward(self, tgt, memory, query_pos=None, memory_key_padding_mask=None):
-        # Self-attention
-        q = k = self._with_pos_embed(tgt, query_pos)
-        tgt2 = self.self_attn(q, k, tgt)[0]
+        # Self-attention with pre-norm
+        tgt_norm = self.norm1(tgt)
+        q = k = self._with_pos_embed(tgt_norm, query_pos)
+        tgt2 = self.self_attn(q, k, tgt_norm)[0]
         tgt = tgt + self.dropout1(tgt2)
-        tgt = self.norm1(tgt)
         
-        # Cross-attention
-        q = self._with_pos_embed(tgt, query_pos)
+        # Cross-attention with pre-norm
+        tgt_norm = self.norm2(tgt)
+        q = self._with_pos_embed(tgt_norm, query_pos)
         tgt2 = self.cross_attn(
             q, memory, memory,
             key_padding_mask=memory_key_padding_mask
         )[0]
         tgt = tgt + self.dropout2(tgt2)
-        tgt = self.norm2(tgt)
         
-        # FFN
-        tgt2 = self.linear2(self.dropout(F.relu(self.linear1(tgt))))
+        # FFN with pre-norm
+        tgt_norm = self.norm3(tgt)
+        tgt2 = self.linear2(self.dropout(F.relu(self.linear1(tgt_norm))))
         tgt = tgt + self.dropout3(tgt2)
-        tgt = self.norm3(tgt)
         
         return tgt
     
@@ -349,23 +392,19 @@ class TransformerDecoderLayer(nn.Module):
 
 
 class EnhancedMaskPLSONNX(nn.Module):
-    """Complete enhanced MaskPLS model for ONNX export"""
+    """Complete enhanced MaskPLS model for ONNX export - FIXED"""
     def __init__(self, cfg):
         super().__init__()
         
         dataset = cfg.MODEL.DATASET
         self.num_classes = cfg[dataset].NUM_CLASSES
         
-        # Better channel progression for features
-        # Ensure we use the channels from config
-        cfg.BACKBONE.CHANNELS = [32, 64, 128, 256, 512]
-        
-        # Multi-scale encoder
+        # Multi-scale encoder with fixed channels
         self.encoder = MultiScaleEncoder(cfg.BACKBONE)
         
         # Point decoder with multi-scale fusion
-        # Get the actual output channels from encoder
-        feat_dims = [128, 256, 512]  # Last 3 encoder stages
+        # Use the actual output channels from encoder
+        feat_dims = self.encoder.output_channels  # [256, 128, 64]
         self.point_decoder = EnhancedPointDecoder(
             feat_dims,
             cfg.DECODER.HIDDEN_DIM
