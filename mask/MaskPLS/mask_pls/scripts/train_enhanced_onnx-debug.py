@@ -397,12 +397,16 @@ class EnhancedMaskPLS(LightningModule):
             max_points=self.cfg[self.cfg.MODEL.DATASET].SUB_NUM_POINTS
         )
         
-        # Convert to dense only when needed for ONNX
+        # Skip dense conversion during training to save memory
         B = len(points)
-        dense_voxels = self.voxelizer.sparse_to_dense(sparse_voxels, B)
-        
-        # Process through backbone
-        multi_scale_features = self.backbone(dense_voxels, sparse_voxels)
+        if self.training:
+            # During training, use sparse-only processing
+            dense_voxels = None
+            multi_scale_features = self.backbone(None, sparse_voxels)
+        else:
+            # Convert to dense only for ONNX inference
+            dense_voxels = self.voxelizer.sparse_to_dense(sparse_voxels, B)
+            multi_scale_features = self.backbone(dense_voxels, sparse_voxels)
         
         # Interpolate features to points efficiently
         point_features = []
@@ -830,10 +834,10 @@ def main(config, epochs, batch_size, lr, gpus, num_workers, checkpoint, nuscenes
     
     dataset = cfg.MODEL.DATASET
     
-    # Use smaller values initially for debugging
-    cfg[dataset].SUB_NUM_POINTS = 40000  # Reduced from 80000
-    cfg.LOSS.NUM_POINTS = 25000  # Reduced from 50000
-    cfg.LOSS.NUM_MASK_PTS = 250  # Reduced from 500
+    # Use much smaller values for memory efficiency
+    cfg[dataset].SUB_NUM_POINTS = 20000  # Reduced further for memory
+    cfg.LOSS.NUM_POINTS = 12000  # Reduced further for memory  
+    cfg.LOSS.NUM_MASK_PTS = 150  # Reduced further for memory
     
     print(f"Configuration:")
     print(f"  Dataset: {dataset}")
