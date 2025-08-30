@@ -35,12 +35,16 @@ class SparseVoxelizer:
         self.bounds_range = self.bounds_max - self.bounds_min
         
         # Precompute voxel grid dimensions based on resolution
-        # Limit grid size to prevent memory explosion
+        # Limit grid size to prevent memory explosion - more aggressive limits
         raw_grid_size = (self.bounds_range / resolution).long()
-        max_grid_size = 512  # Reasonable limit for dense grids
+        max_grid_size = 128  # More aggressive limit for memory safety
         self.grid_size = torch.clamp(raw_grid_size, max=max_grid_size)
         
         print(f"Grid size limited to: {self.grid_size.tolist()} (raw would be: {raw_grid_size.tolist()})")
+        
+        # Calculate expected memory usage
+        total_voxels = self.grid_size.prod().item()
+        print(f"Total voxels: {total_voxels:,} ({total_voxels * 4 / 1024**3:.2f} GB for float32)")
         
     def voxelize_batch(self, points_list, features_list, max_points=80000):
         """
@@ -144,14 +148,15 @@ class SparseVoxelizer:
         """
         D, H, W = self.grid_size.tolist()
         
-        # Safety check for memory usage
+        # Safety check for memory usage - more aggressive limits
         total_voxels = D * H * W
-        if total_voxels > 134217728:  # 512^3 voxels max
+        if total_voxels > 2097152:  # 128^3 voxels max (~8MB per channel)
             print(f"Warning: Grid too large ({D}x{H}x{W} = {total_voxels:,} voxels), using smaller grid")
             # Use a smaller, reasonable grid size
-            D = min(D, 256)
-            H = min(H, 256) 
-            W = min(W, 256)
+            D = min(D, 128)
+            H = min(H, 128) 
+            W = min(W, 128)
+            print(f"Reduced to: {D}x{H}x{W} = {D*H*W:,} voxels")
             
         C = sparse_voxels[0]['features'].shape[1] if sparse_voxels[0]['features'].shape[0] > 0 else 4
         

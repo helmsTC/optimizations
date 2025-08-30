@@ -25,56 +25,16 @@ from mask_pls.models.onnx.sparse_voxelizer import (
     SparseVoxelizer, 
     EfficientSparseBackbone
 )
+from mask_pls.models.onnx.enhanced_model import (
+    EnhancedMaskPLSONNX,
+    EfficientPointInterpolation
+)
 from mask_pls.models.decoder import MaskedTransformerDecoder
 from mask_pls.datasets.semantic_dataset import SemanticDatasetModule
 from mask_pls.models.loss import SemLoss
 from mask_pls.models.matcher import HungarianMatcher
 from mask_pls.utils.evaluate_panoptic import PanopticEvaluator
 from mask_pls.utils.misc import sample_points, pad_stack
-
-
-class EfficientPointInterpolation(torch.nn.Module):
-    """
-    Efficient point feature interpolation from voxel features
-    Mimics the original KNN interpolation
-    """
-    def __init__(self, k=3):
-        super().__init__()
-        self.k = k
-        
-    def forward(self, voxel_features, voxel_coords, point_coords):
-        """
-        Efficiently interpolate features from voxels to points
-        Uses trilinear interpolation instead of KNN for ONNX compatibility
-        """
-        B, C, D, H, W = voxel_features.shape
-        B_p, N, _ = point_coords.shape
-        
-        # Use grid_sample for efficient interpolation
-        # Convert point coords to grid coordinates [-1, 1]
-        grid_coords = point_coords * 2.0 - 1.0
-        grid_coords = grid_coords.view(B, N, 1, 1, 3)
-        
-        # Reorder for grid_sample (expects z, y, x)
-        grid_coords = torch.stack([
-            grid_coords[..., 2],  # z
-            grid_coords[..., 1],  # y  
-            grid_coords[..., 0]   # x
-        ], dim=-1)
-        
-        # Sample features
-        sampled = F.grid_sample(
-            voxel_features, 
-            grid_coords,
-            mode='bilinear',
-            padding_mode='border',
-            align_corners=True
-        )
-        
-        # Reshape to [B, N, C]
-        sampled = sampled.squeeze(-1).squeeze(-1).permute(0, 2, 1)
-        
-        return sampled
 
 
 class EnhancedMaskLoss(torch.nn.Module):
@@ -345,6 +305,9 @@ class EnhancedMaskPLS(LightningModule):
         super().__init__()
         self.save_hyperparameters(dict(cfg))
         self.cfg = cfg
+        
+        # Add gradient clipping value
+        self.gradient_clip_val = 1.0
         
         dataset = cfg.MODEL.DATASET
         self.num_classes = int(cfg[dataset].NUM_CLASSES)
