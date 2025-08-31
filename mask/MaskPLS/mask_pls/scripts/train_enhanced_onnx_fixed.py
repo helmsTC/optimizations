@@ -171,18 +171,27 @@ class FixedSparseBackbone(nn.Module):
         
         # Decoder with skip connections
         y1 = self.up1[0](x4)
+        # Ensure spatial dimensions match before concatenation
+        if y1.shape[2:] != x3.shape[2:]:
+            y1 = F.interpolate(y1, size=x3.shape[2:], mode='trilinear', align_corners=True)
         y1 = torch.cat([y1, x3], dim=1)
         y1 = self.up1[1](y1)
         
         y2 = self.up2[0](y1)
+        if y2.shape[2:] != x2.shape[2:]:
+            y2 = F.interpolate(y2, size=x2.shape[2:], mode='trilinear', align_corners=True)
         y2 = torch.cat([y2, x2], dim=1)
         y2 = self.up2[1](y2)
         
         y3 = self.up3[0](y2)
+        if y3.shape[2:] != x1.shape[2:]:
+            y3 = F.interpolate(y3, size=x1.shape[2:], mode='trilinear', align_corners=True)
         y3 = torch.cat([y3, x1], dim=1)
         y3 = self.up3[1](y3)
         
         y4 = self.up4[0](y3)
+        if y4.shape[2:] != x0.shape[2:]:
+            y4 = F.interpolate(y4, size=x0.shape[2:], mode='trilinear', align_corners=True)
         y4 = torch.cat([y4, x0], dim=1)
         y4 = self.up4[1](y4)
         
