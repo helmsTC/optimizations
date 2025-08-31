@@ -83,7 +83,7 @@ class SparseVoxelizer:
         # Calculate grid dimensions
         grid_size = ((self.bounds_max - self.bounds_min) / self.resolution).long()
         grid_size = torch.clamp(grid_size, min=1, max=64)  # Limit size for memory
-        D, H, W = grid_size.tolist()
+        D, H, W = grid_size.tolist()  # Convert to Python ints
         
         all_voxel_grids = []
         all_point_coords = []
@@ -117,7 +117,10 @@ class SparseVoxelizer:
             
             # Voxelize
             voxel_coords = ((valid_pts - self.bounds_min) / self.resolution).long()
-            voxel_coords = torch.clamp(voxel_coords, 0, grid_size - 1)
+            # Clamp each dimension separately with scalar values
+            voxel_coords[:, 0] = torch.clamp(voxel_coords[:, 0], min=0, max=D-1)
+            voxel_coords[:, 1] = torch.clamp(voxel_coords[:, 1], min=0, max=H-1)
+            voxel_coords[:, 2] = torch.clamp(voxel_coords[:, 2], min=0, max=W-1)
             
             # Create dense grid
             C = valid_feat.shape[1]
