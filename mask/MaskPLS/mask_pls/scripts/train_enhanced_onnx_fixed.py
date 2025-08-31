@@ -209,7 +209,7 @@ class TrueSparseVoxelizer:
         
         # Compute actual grid dimensions from resolution
         grid_size = ((self.bounds_max - self.bounds_min) / self.resolution).long()
-        grid_size = torch.clamp(grid_size, max=200)  # Safety limit
+        grid_size = torch.clamp(grid_size, min=torch.tensor(1, device=grid_size.device), max=torch.tensor(200, device=grid_size.device))  # Safety limit
         D, H, W = grid_size.tolist()
         
         # Process each point cloud
@@ -245,7 +245,7 @@ class TrueSparseVoxelizer:
             
             # Quantize to voxel indices
             voxel_coords = ((valid_pts - self.bounds_min) / self.resolution).long()
-            voxel_coords = torch.clamp(voxel_coords, 0, grid_size - 1)
+            voxel_coords = torch.clamp(voxel_coords, min=torch.tensor(0, device=voxel_coords.device), max=grid_size - 1)
             
             # Create sparse voxel representation
             voxel_keys = voxel_coords[:, 0] * (H * W) + voxel_coords[:, 1] * W + voxel_coords[:, 2]
@@ -534,7 +534,7 @@ class EnhancedMaskLoss(torch.nn.Module):
                         idx = idx.to(pred_masks.device)
                         # Ensure indices are valid
                         max_idx = batch_pred.shape[1] - 1
-                        idx = torch.clamp(idx, 0, max_idx)
+                        idx = torch.clamp(idx, min=torch.tensor(0, device=idx.device), max=torch.tensor(max_idx, device=idx.device))
                         
                         point_logits.append(batch_pred[:, idx])
                         point_labels.append(batch_tgt[:, idx])
