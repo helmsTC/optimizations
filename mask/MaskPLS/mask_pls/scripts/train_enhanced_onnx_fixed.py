@@ -547,11 +547,21 @@ class EnhancedMaskLoss(torch.nn.Module):
                     if len(idx) > 0:
                         idx = idx.to(pred_masks.device)
                         # Ensure indices are valid
-                        max_idx = batch_pred.shape[1] - 1
+                        if batch_pred.dim() >= 2:
+                            max_idx = batch_pred.shape[1] - 1
+                        else:
+                            max_idx = batch_pred.shape[0] - 1
                         idx = torch.clamp(idx, min=torch.tensor(0, device=idx.device), max=torch.tensor(max_idx, device=idx.device))
                         
-                        point_logits.append(batch_pred[:, idx])
-                        point_labels.append(batch_tgt[:, idx])
+                        if batch_pred.dim() == 2:
+                            point_logits.append(batch_pred[:, idx])
+                            point_labels.append(batch_tgt[:, idx])
+                        elif batch_pred.dim() == 1:
+                            point_logits.append(batch_pred[idx])
+                            point_labels.append(batch_tgt[idx])
+                        else:
+                            point_logits.append(batch_pred.flatten()[idx])
+                            point_labels.append(batch_tgt.flatten()[idx])
         
         if point_logits:
             point_logits = torch.cat(point_logits, dim=0)
