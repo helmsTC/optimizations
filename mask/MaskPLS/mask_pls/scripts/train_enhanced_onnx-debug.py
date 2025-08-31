@@ -589,9 +589,6 @@ class EnhancedMaskPLS(LightningModule):
             if all(len(v) == 0 for v in valid_indices):
                 return
             
-            # Store semantic logits for panoptic inference
-            self.last_sem_logits = sem_logits
-            
             # Compute losses
             targets = self.prepare_targets(batch, padding_masks.shape[1], valid_indices)
             mask_losses = self.mask_loss(outputs, targets, batch['masks_ids'])
@@ -637,16 +634,7 @@ class EnhancedMaskPLS(LightningModule):
             self.log("metrics/iou", iou, batch_size=self.cfg.TRAIN.BATCH_SIZE)
             self.log("metrics/rq", rq, batch_size=self.cfg.TRAIN.BATCH_SIZE)
             
-            # Always print validation metrics at the end of validation epoch
-            print(f"\n{'='*60}")
-            print(f"VALIDATION METRICS - Epoch {self.current_epoch}")
-            print(f"{'='*60}")
-            print(f"Panoptic Quality (PQ): {pq:.4f}")
-            print(f"Mean IoU: {iou:.4f}")
-            print(f"Recognition Quality (RQ): {rq:.4f}")
-            print(f"{'='*60}")
-            print(f"Checkpoint will be saved if IoU > previous best")
-            print(f"{'='*60}\n")
+            print(f"\nValidation Metrics - PQ: {pq:.4f}, IoU: {iou:.4f}, RQ: {rq:.4f}")
             
         except Exception as e:
             print(f"Error computing validation metrics: {e}")
@@ -659,18 +647,6 @@ class EnhancedMaskPLS(LightningModule):
             self.evaluator.reset()
             self.validation_step_outputs.clear()
     
-    def on_train_epoch_end(self):
-        """Print training epoch summary"""
-        # Get the average training loss for the epoch
-        avg_loss = self.trainer.callback_metrics.get('train_loss', 0.0)
-        
-        print(f"\n{'='*60}")
-        print(f"TRAINING EPOCH {self.current_epoch} COMPLETED")
-        print(f"{'='*60}")
-        print(f"Average Training Loss: {avg_loss:.4f}")
-        print(f"Learning Rate: {self.optimizers().param_groups[0]['lr']:.6f}")
-        print(f"{'='*60}\n")
-    
     def panoptic_inference(self, outputs, padding_masks, valid_indices, batch):
         """Panoptic inference with NaN handling"""
         mask_cls = outputs["pred_logits"]
@@ -678,18 +654,6 @@ class EnhancedMaskPLS(LightningModule):
         
         sem_pred = []
         ins_pred = []
-        
-        # Debug: Print first batch stats
-        if hasattr(self, '_debug_counter'):
-            self._debug_counter += 1
-        else:
-            self._debug_counter = 0
-        
-        # Print debug info every 10 batches
-        if self._debug_counter % 10 == 0:
-            scores_sample, labels_sample = mask_cls[0].max(-1)
-            print(f"Debug - Batch {self._debug_counter}: max_score={scores_sample.max():.3f}, "
-                  f"num_non_empty={labels_sample.ne(self.num_classes).sum()}/{len(labels_sample)}")
         
         for b, (cls_b, mask_b, pad_b, valid_idx) in enumerate(
             zip(mask_cls, mask_pred, padding_masks, valid_indices)
@@ -702,26 +666,14 @@ class EnhancedMaskPLS(LightningModule):
             if torch.isnan(valid_pred).any():
                 valid_pred = torch.nan_to_num(valid_pred, nan=0.5)
             
-            # Get predictions - use softmax for better probability distribution
-            cls_probs = cls_b.softmax(-1)  # Apply softmax for proper probabilities
-            scores, labels = cls_probs.max(-1)
+            # Get predictions
+            scores, labels = cls_b.max(-1)
             keep = labels.ne(self.num_classes)
             
             # Create output arrays with original size
             orig_size = batch['sem_label'][b].shape[0]
             sem_out = np.zeros(orig_size, dtype=np.int32)
             ins_out = np.zeros(orig_size, dtype=np.int32)
-            
-            # Also use semantic predictions as fallback
-            if hasattr(self, 'last_sem_logits') and self.last_sem_logits is not None:
-                sem_logits = self.last_sem_logits[b][valid_mask]
-                sem_preds = sem_logits.argmax(-1).cpu().numpy()
-                
-                # Map semantic predictions to original indices
-                valid_idx_cpu = valid_idx.cpu().numpy()
-                for i, v_idx in enumerate(valid_idx_cpu):
-                    if i < len(sem_preds) and v_idx < orig_size:
-                        sem_out[v_idx] = sem_preds[i]
             
             if keep.sum() > 0 and len(valid_idx) > 0:
                 try:
@@ -740,9 +692,9 @@ class EnhancedMaskPLS(LightningModule):
                     segment_id = 0
                     for k in range(cur_classes.shape[0]):
                         pred_class = cur_classes[k].item()
-                        point_mask = (point_mask_ids == k) & (cur_masks[:, k] >= 0.3)  # Lower threshold
+                        point_mask = (point_mask_ids == k) & (cur_masks[:, k] >= 0.5)
                         
-                        if point_mask.sum() > 5:  # Lower minimum mask size
+                        if point_mask.sum() > 10:  # Minimum mask size
                             # Map to original indices
                             mask_indices = point_mask.cpu().numpy()
                             for i, is_mask in enumerate(mask_indices):
@@ -869,28 +821,21 @@ def main(config, epochs, batch_size, lr, gpus, num_workers, checkpoint, nuscenes
             print(f"Warning: Failed to load checkpoint: {e}")
     
     # Setup logging
-    experiment_dir = "experiments/" + cfg.EXPERIMENT.ID + "_enhanced_debug"
     tb_logger = pl_loggers.TensorBoardLogger(
-        experiment_dir,
+        "experiments/" + cfg.EXPERIMENT.ID + "_enhanced_debug",
         default_hp_metric=False
     )
     
     # Callbacks
     lr_monitor = LearningRateMonitor(logging_interval="step")
     
-    # Explicitly set checkpoint directory
-    checkpoint_dir = os.path.join(experiment_dir, "checkpoints")
-    os.makedirs(checkpoint_dir, exist_ok=True)
-    
     checkpoint_callback = ModelCheckpoint(
-        dirpath=checkpoint_dir,  # Explicitly set the directory
         monitor="metrics/iou",
         filename=cfg.EXPERIMENT.ID + "_debug_epoch{epoch:02d}_iou{metrics/iou:.3f}",
         auto_insert_metric_name=False,
         mode="max",
         save_last=True,
-        save_top_k=3,
-        verbose=True  # Add verbose to see when checkpoints are saved
+        save_top_k=3
     )
     
     # Create trainer with debugging settings
@@ -905,7 +850,7 @@ def main(config, epochs, batch_size, lr, gpus, num_workers, checkpoint, nuscenes
         gradient_clip_val=1.0,
         accumulate_grad_batches=cfg.TRAIN.BATCH_ACC,
         precision=32,  # Use full precision initially for stability
-        check_val_every_n_epoch=1,  # Run validation every epoch to see metrics
+        check_val_every_n_epoch=5,
         num_sanity_val_steps=0,
         detect_anomaly=True,  # Enable anomaly detection
     )
