@@ -1,7 +1,7 @@
-# mask/MaskPLS/mask_pls/scripts/train_enhanced_onnx_fixed.py
+# mask/MaskPLS/mask_pls/scripts/train_enhanced_onnx_complete.py
 """
-Fixed Enhanced training script with proper multi-scale processing and panoptic inference
-This replaces train_enhanced_onnx-debug.py with all the critical fixes
+Complete fixed training script for ONNX-compatible MaskPLS
+Resolves dimension mismatch errors and improves stability
 """
 
 import os
@@ -22,24 +22,23 @@ from pytorch_lightning import loggers as pl_loggers
 from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
 from pytorch_lightning.core.lightning import LightningModule
 
-# Import original components we still need
+# Import original components
 from mask_pls.datasets.semantic_dataset import SemanticDatasetModule
 from mask_pls.models.decoder import MaskedTransformerDecoder
 from mask_pls.models.loss import SemLoss
 from mask_pls.models.matcher import HungarianMatcher
 from mask_pls.utils.evaluate_panoptic import PanopticEvaluator
-from mask_pls.utils.misc import sample_points, pad_stack
+from mask_pls.utils.misc import pad_stack
 
 
 # ============================================================================
-# FIXED COMPONENTS
+# BUILDING BLOCKS
 # ============================================================================
 
 class ResidualBlock3D(nn.Module):
-    """Residual block matching original"""
+    """Residual block for 3D convolutions"""
     def __init__(self, in_channels, out_channels, kernel_size=3):
         super().__init__()
-        
         padding = kernel_size // 2
         
         self.conv1 = nn.Conv3d(in_channels, out_channels, kernel_size, 
@@ -65,8 +64,95 @@ class ResidualBlock3D(nn.Module):
         return out
 
 
-class FixedSparseBackbone(nn.Module):
-    """Fixed backbone with proper multi-scale feature extraction"""
+# ============================================================================
+# VOXELIZATION
+# ============================================================================
+
+class SparseVoxelizer:
+    """Efficient sparse voxelization"""
+    def __init__(self, resolution=0.05, coordinate_bounds=None, device='cuda'):
+        self.resolution = resolution
+        self.bounds_min = torch.tensor([coordinate_bounds[i][0] for i in range(3)], device=device)
+        self.bounds_max = torch.tensor([coordinate_bounds[i][1] for i in range(3)], device=device)
+        self.device = device
+    
+    def voxelize_batch(self, points_list, features_list, max_points=10000):
+        """Voxelize batch of point clouds"""
+        B = len(points_list)
+        
+        # Calculate grid dimensions
+        grid_size = ((self.bounds_max - self.bounds_min) / self.resolution).long()
+        grid_size = torch.clamp(grid_size, min=1, max=64)  # Limit size for memory
+        D, H, W = grid_size.tolist()
+        
+        all_voxel_grids = []
+        all_point_coords = []
+        all_valid_indices = []
+        
+        for b in range(B):
+            pts = torch.from_numpy(points_list[b]).to(self.device).float()
+            feat = torch.from_numpy(features_list[b]).to(self.device).float()
+            
+            # Filter valid points
+            valid_mask = ((pts >= self.bounds_min) & (pts < self.bounds_max)).all(dim=1)
+            valid_idx = torch.where(valid_mask)[0]
+            
+            if valid_idx.numel() == 0:
+                # Empty point cloud
+                C = feat.shape[1]
+                all_voxel_grids.append(torch.zeros(C, D, H, W, device=self.device))
+                all_point_coords.append(torch.zeros(0, 3, device=self.device))
+                all_valid_indices.append(valid_idx)
+                continue
+            
+            valid_pts = pts[valid_idx]
+            valid_feat = feat[valid_idx]
+            
+            # Subsample if needed
+            if valid_pts.shape[0] > max_points:
+                perm = torch.randperm(valid_pts.shape[0])[:max_points]
+                valid_pts = valid_pts[perm]
+                valid_feat = valid_feat[perm]
+                valid_idx = valid_idx[perm]
+            
+            # Voxelize
+            voxel_coords = ((valid_pts - self.bounds_min) / self.resolution).long()
+            voxel_coords = torch.clamp(voxel_coords, 0, grid_size - 1)
+            
+            # Create dense grid
+            C = valid_feat.shape[1]
+            dense_grid = torch.zeros(C, D, H, W, device=self.device)
+            counts = torch.zeros(D, H, W, device=self.device)
+            
+            # Accumulate features
+            for i in range(len(valid_pts)):
+                d, h, w = voxel_coords[i].tolist()
+                dense_grid[:, d, h, w] += valid_feat[i]
+                counts[d, h, w] += 1
+            
+            # Average
+            mask = counts > 0
+            for c in range(C):
+                dense_grid[c][mask] /= counts[mask]
+            
+            # Normalize coordinates
+            norm_coords = (valid_pts - self.bounds_min) / (self.bounds_max - self.bounds_min)
+            
+            all_voxel_grids.append(dense_grid)
+            all_point_coords.append(norm_coords)
+            all_valid_indices.append(valid_idx)
+        
+        # Stack batch
+        voxel_batch = torch.stack(all_voxel_grids)
+        return voxel_batch, all_point_coords, all_valid_indices
+
+
+# ============================================================================
+# BACKBONE
+# ============================================================================
+
+class SparseBackbone(nn.Module):
+    """Backbone network matching original architecture"""
     def __init__(self, cfg):
         super().__init__()
         
@@ -74,7 +160,7 @@ class FixedSparseBackbone(nn.Module):
         cs = cfg.CHANNELS  # [32, 32, 64, 128, 256, 256, 128, 96, 96]
         self.resolution = cfg.RESOLUTION
         
-        # Encoder stages (matching original)
+        # Stem
         self.stem = nn.Sequential(
             nn.Conv3d(input_dim, cs[0], kernel_size=3, padding=1, bias=False),
             nn.BatchNorm3d(cs[0]),
@@ -84,7 +170,7 @@ class FixedSparseBackbone(nn.Module):
             nn.ReLU(inplace=True),
         )
         
-        # 4 encoder stages with downsampling
+        # Encoder stages
         self.stage1 = nn.Sequential(
             nn.Conv3d(cs[0], cs[0], kernel_size=2, stride=2, bias=False),
             nn.BatchNorm3d(cs[0]),
@@ -117,7 +203,7 @@ class FixedSparseBackbone(nn.Module):
             ResidualBlock3D(cs[4], cs[4]),
         )
         
-        # 4 decoder stages with upsampling
+        # Decoder stages
         self.up1 = nn.ModuleList([
             nn.ConvTranspose3d(cs[4], cs[5], kernel_size=2, stride=2, bias=False),
             nn.Sequential(
@@ -150,15 +236,8 @@ class FixedSparseBackbone(nn.Module):
             )
         ])
         
-        # Output channels for multi-scale features
         self.out_channels = [cs[5], cs[6], cs[7], cs[8]]
-        
-        # BatchNorm for point features (CRITICAL!)
-        self.out_bnorm = nn.ModuleList([
-            nn.BatchNorm1d(ch) for ch in self.out_channels
-        ])
-        
-        # Semantic head
+        self.out_bnorm = nn.ModuleList([nn.BatchNorm1d(ch) for ch in self.out_channels])
         self.sem_head = nn.Linear(cs[8], 20)
     
     def forward(self, dense_voxels):
@@ -171,7 +250,6 @@ class FixedSparseBackbone(nn.Module):
         
         # Decoder with skip connections
         y1 = self.up1[0](x4)
-        # Ensure spatial dimensions match before concatenation
         if y1.shape[2:] != x3.shape[2:]:
             y1 = F.interpolate(y1, size=x3.shape[2:], mode='trilinear', align_corners=True)
         y1 = torch.cat([y1, x3], dim=1)
@@ -195,157 +273,56 @@ class FixedSparseBackbone(nn.Module):
         y4 = torch.cat([y4, x0], dim=1)
         y4 = self.up4[1](y4)
         
-        # Return ALL multi-scale features (CRITICAL!)
         return [y1, y2, y3, y4], self.out_bnorm
 
 
-class TrueSparseVoxelizer:
-    """True sparse voxelization matching MinkowskiEngine behavior"""
-    
-    def __init__(self, resolution=0.05, coordinate_bounds=None, device='cuda'):
-        self.resolution = resolution
-        self.bounds_min = torch.tensor(
-            [coordinate_bounds[i][0] for i in range(3)], device=device
-        )
-        self.bounds_max = torch.tensor(
-            [coordinate_bounds[i][1] for i in range(3)], device=device
-        )
-        self.device = device
-    
-    def voxelize_batch(self, points_list, features_list, max_points=5000):
-        """True sparse voxelization - only store occupied voxels"""
-        B = len(points_list)
-        
-        # Compute actual grid dimensions from resolution
-        grid_size = ((self.bounds_max - self.bounds_min) / self.resolution).long()
-        grid_size = torch.clamp(grid_size, min=torch.tensor(1, device=grid_size.device), max=torch.tensor(64, device=grid_size.device))  # Smaller grid for memory
-        D, H, W = grid_size.tolist()
-        
-        # Process each point cloud
-        all_voxel_features = []
-        all_point_coords = []
-        all_valid_indices = []
-        
-        for b in range(B):
-            pts = torch.from_numpy(points_list[b]).to(self.device).float()
-            feat = torch.from_numpy(features_list[b]).to(self.device).float()
-            
-            # Filter valid points
-            valid_mask = ((pts >= self.bounds_min) & (pts < self.bounds_max)).all(dim=1)
-            valid_idx = torch.where(valid_mask)[0]
-            
-            if valid_idx.numel() == 0:
-                # Empty point cloud
-                C = feat.shape[1]
-                all_voxel_features.append(torch.zeros(C, D, H, W, device=self.device))
-                all_point_coords.append(torch.zeros(0, 3, device=self.device))
-                all_valid_indices.append(valid_idx)
-                continue
-            
-            valid_pts = pts[valid_idx]
-            valid_feat = feat[valid_idx]
-            
-            # Subsample if needed
-            if valid_pts.shape[0] > max_points:
-                perm = torch.randperm(valid_pts.shape[0])[:max_points]
-                valid_pts = valid_pts[perm]
-                valid_feat = valid_feat[perm]
-                valid_idx = valid_idx[perm]
-            
-            # Quantize to voxel indices
-            voxel_coords = ((valid_pts - self.bounds_min) / self.resolution).long()
-            voxel_coords = torch.clamp(voxel_coords, min=torch.tensor(0, device=voxel_coords.device), max=grid_size - 1)
-            
-            # Create sparse voxel representation
-            voxel_keys = voxel_coords[:, 0] * (H * W) + voxel_coords[:, 1] * W + voxel_coords[:, 2]
-            unique_keys, inverse = torch.unique(voxel_keys, return_inverse=True)
-            
-            # Aggregate features by averaging
-            C = valid_feat.shape[1]
-            num_voxels = unique_keys.shape[0]
-            
-            voxel_feats = torch.zeros(num_voxels, C, device=self.device)
-            voxel_counts = torch.zeros(num_voxels, device=self.device)
-            
-            # Use scatter_add for aggregation
-            voxel_feats.scatter_add_(0, inverse.unsqueeze(1).expand(-1, C), valid_feat)
-            voxel_counts.scatter_add_(0, inverse, torch.ones_like(inverse, dtype=torch.float))
-            
-            # Average
-            voxel_feats = voxel_feats / voxel_counts.unsqueeze(1).clamp(min=1)
-            
-            # Convert to dense grid for Conv3D
-            dense_grid = torch.zeros(C, D, H, W, device=self.device)
-            
-            # Unpack unique keys back to coordinates
-            unique_d = unique_keys // (H * W)
-            unique_h = (unique_keys % (H * W)) // W
-            unique_w = unique_keys % W
-            
-            # Fill dense grid
-            dense_grid[:, unique_d, unique_h, unique_w] = voxel_feats.T
-            
-            # Store normalized coordinates
-            norm_coords = (valid_pts - self.bounds_min) / (self.bounds_max - self.bounds_min)
-            
-            all_voxel_features.append(dense_grid)
-            all_point_coords.append(norm_coords)
-            all_valid_indices.append(valid_idx)
-        
-        # Stack into batch
-        voxel_batch = torch.stack(all_voxel_features)
-        
-        return voxel_batch, all_point_coords, all_valid_indices
+# ============================================================================
+# POINT FEATURE EXTRACTION
+# ============================================================================
 
-
-class MultiScalePointFeatureExtractor(nn.Module):
-    """Extract point features at multiple scales with proper normalization"""
-    
+class PointFeatureExtractor(nn.Module):
+    """Extract features for points from voxel grids"""
     def __init__(self, k=3):
         super().__init__()
         self.k = k
+        self.resolution = 0.05
     
-    def knn_interpolate(self, voxel_features, point_coords):
-        """KNN interpolation approximation using grid_sample"""
+    def interpolate_features(self, voxel_features, point_coords):
+        """Trilinear interpolation from voxel grid to points"""
         B, C, D, H, W = voxel_features.shape
         
         # Convert to grid coordinates [-1, 1]
         grid_coords = point_coords * 2.0 - 1.0
         grid_coords = grid_coords.view(B, -1, 1, 1, 3)
         
-        # Reorder for grid_sample (expects z, y, x)
+        # Reorder for grid_sample (z, y, x)
         grid_coords = torch.stack([
-            grid_coords[..., 2],
-            grid_coords[..., 1],
-            grid_coords[..., 0]
+            grid_coords[..., 2], grid_coords[..., 1], grid_coords[..., 0]
         ], dim=-1)
         
-        # Sample with trilinear interpolation
+        # Sample features
         sampled = F.grid_sample(
             voxel_features, grid_coords,
-            mode='bilinear',
-            padding_mode='border',
-            align_corners=True
+            mode='bilinear', padding_mode='border', align_corners=True
         )
         
         # Reshape [B, C, N, 1, 1] -> [B, N, C]
         sampled = sampled.squeeze(-1).squeeze(-1).permute(0, 2, 1)
-        
         return sampled
     
     def forward(self, multi_scale_voxels, norm_coords, batch_norms):
-        """Extract and normalize features at each scale"""
+        """Extract multi-scale features for points"""
         point_features = []
         point_coords_list = []
         
-        # Process each scale
+        # Get max points for padding
+        max_pts = max(c.shape[0] for c in norm_coords) if norm_coords else 1000
+        
         for i, (voxel_feat, bn) in enumerate(zip(multi_scale_voxels, batch_norms)):
             B = voxel_feat.shape[0]
             
-            # Pad coordinates for batch processing
-            max_pts = max(c.shape[0] for c in norm_coords) if norm_coords else 1000
+            # Pad coordinates
             padded_coords = []
-            
             for coords in norm_coords:
                 n_pts = coords.shape[0]
                 if n_pts == 0:
@@ -357,18 +334,16 @@ class MultiScalePointFeatureExtractor(nn.Module):
             batch_coords = torch.stack(padded_coords)
             
             # Interpolate features
-            feat = self.knn_interpolate(voxel_feat, batch_coords)
+            feat = self.interpolate_features(voxel_feat, batch_coords)
             
-            # Apply batch norm per sample (CRITICAL!)
+            # Apply batch norm
             feat_list = []
             for b in range(B):
                 n_valid = norm_coords[b].shape[0] if b < len(norm_coords) else 0
                 if n_valid > 0:
-                    valid_feat = feat[b, :n_valid, :].transpose(0, 1)  # [C, N]
-                    valid_feat = bn(valid_feat.unsqueeze(0)).squeeze(0)  # Apply BN
-                    valid_feat = valid_feat.transpose(0, 1)  # [N, C]
-                    
-                    # Pad back
+                    valid_feat = feat[b, :n_valid, :].transpose(0, 1)
+                    valid_feat = bn(valid_feat.unsqueeze(0)).squeeze(0)
+                    valid_feat = valid_feat.transpose(0, 1)
                     if n_valid < max_pts:
                         valid_feat = F.pad(valid_feat, (0, 0, 0, max_pts - n_valid))
                     feat_list.append(valid_feat)
@@ -376,26 +351,64 @@ class MultiScalePointFeatureExtractor(nn.Module):
                     feat_list.append(feat[b])
             
             feat = torch.stack(feat_list)
-            
             point_features.append(feat)
             
-            # Scale coordinates for this level
+            # Scale coordinates
             scale_factor = 2 ** (3 - i) if i < 4 else 1
             scaled_coords = batch_coords * self.resolution * scale_factor
             point_coords_list.append(scaled_coords)
         
         return point_features, point_coords_list
-    
-    @property
-    def resolution(self):
-        return 0.05  # Default resolution
 
 
-class EnhancedMaskLoss(torch.nn.Module):
-    """Fixed mask loss with proper index handling"""
+# ============================================================================
+# FIXED MASK LOSS
+# ============================================================================
+
+def sample_points_safe(masks, masks_ids, n_pts, n_samples):
+    """Safe point sampling that handles bounds properly"""
+    sampled = []
+    for ids, mm in zip(masks_ids, masks):
+        if len(mm) == 0:
+            sampled.append(torch.tensor([], dtype=torch.long))
+            continue
+            
+        max_points = mm.shape[1]
+        m_idx_list = []
+        
+        for id in ids:
+            if len(id) > 0 and max_points > 0:
+                valid_id = id[id < max_points]
+                if len(valid_id) > 0:
+                    n_sample = min(len(valid_id), n_pts)
+                    perm = torch.randperm(len(valid_id))[:n_sample]
+                    m_idx_list.append(valid_id[perm])
+        
+        if m_idx_list:
+            m_idx = torch.cat(m_idx_list)
+            m_idx = m_idx[m_idx < max_points]
+        else:
+            m_idx = torch.tensor([], dtype=torch.long)
+        
+        # Add random indices
+        remaining = n_samples - len(m_idx)
+        if remaining > 0 and max_points > 0:
+            r_idx = torch.randint(0, max_points, (remaining,)).to(m_idx.device if len(m_idx) > 0 else 'cpu')
+            idx = torch.cat([m_idx, r_idx]) if len(m_idx) > 0 else r_idx
+        else:
+            idx = m_idx[:n_samples] if len(m_idx) > n_samples else m_idx
+        
+        if max_points > 0 and len(idx) > 0:
+            idx = idx[(idx >= 0) & (idx < max_points)]
+        
+        sampled.append(idx)
+    return sampled
+
+
+class FixedMaskLoss(nn.Module):
+    """Fixed mask loss implementation"""
     def __init__(self, cfg, data_cfg):
         super().__init__()
-        
         self.num_classes = data_cfg.NUM_CLASSES
         self.ignore_label = data_cfg.IGNORE_LABEL
         self.matcher = HungarianMatcher(cfg.WEIGHTS, cfg.P_RATIO)
@@ -406,7 +419,6 @@ class EnhancedMaskLoss(torch.nn.Module):
         }
         
         self.eos_coef = cfg.EOS_COEF
-        
         weights = torch.ones(self.num_classes + 1)
         weights[0] = 0.0
         weights[-1] = self.eos_coef
@@ -416,7 +428,6 @@ class EnhancedMaskLoss(torch.nn.Module):
         self.n_mask_pts = cfg.NUM_MASK_PTS
     
     def forward(self, outputs, targets, mask_indices):
-        """Forward with fixed index handling"""
         losses = {}
         
         num_masks = sum(len(t) for t in targets["classes"])
@@ -429,33 +440,28 @@ class EnhancedMaskLoss(torch.nn.Module):
             }
         
         num_masks = max(num_masks, 1)
-        
         outputs_no_aux = {k: v for k, v in outputs.items() if k != "aux_outputs"}
         indices = self.matcher(outputs_no_aux, targets)
         
-        losses.update(self.get_losses(outputs, targets, indices, num_masks, mask_indices))
+        # Get losses
+        loss_ce = self.loss_classes(outputs, targets, indices)
+        loss_masks = self.loss_masks(outputs, targets, indices, num_masks, mask_indices)
         
-        weighted_losses = {}
-        for l in losses:
-            for k in self.weight_dict:
-                if k in l:
-                    weighted_losses[l] = losses[l] * self.weight_dict[k]
+        losses.update(loss_ce)
+        losses.update(loss_masks)
+        
+        # Apply weights
+        weighted = {}
+        for k, v in losses.items():
+            for wk in self.weight_dict:
+                if wk in k:
+                    weighted[k] = v * self.weight_dict[wk]
                     break
         
-        return weighted_losses
-    
-    def get_losses(self, outputs, targets, indices, num_masks, mask_indices):
-        losses = {}
-        losses.update(self.loss_classes(outputs, targets, indices))
-        losses.update(self.loss_masks(outputs, targets, indices, num_masks, mask_indices))
-        return losses
+        return weighted if weighted else losses
     
     def loss_classes(self, outputs, targets, indices):
-        """Classification loss with stability"""
         pred_logits = outputs["pred_logits"].float()
-        
-        # Clamp for stability
-        pred_logits = torch.clamp(pred_logits, min=-100, max=100)
         
         batch_idx = torch.cat([
             torch.full_like(src, i) for i, (src, _) in enumerate(indices)
@@ -467,133 +473,118 @@ class EnhancedMaskLoss(torch.nn.Module):
         ])
         
         target_classes = torch.full(
-            pred_logits.shape[:2], 
-            self.num_classes,
-            dtype=torch.int64, 
-            device=pred_logits.device
+            pred_logits.shape[:2], self.num_classes,
+            dtype=torch.int64, device=pred_logits.device
         )
         
         if len(batch_idx) > 0:
             target_classes[batch_idx, src_idx] = target_classes_o.to(pred_logits.device)
         
         loss_ce = F.cross_entropy(
-            pred_logits.transpose(1, 2), 
-            target_classes,
-            self.weights, 
-            ignore_index=self.ignore_label
+            pred_logits.transpose(1, 2), target_classes,
+            self.weights, ignore_index=self.ignore_label
         )
-        
-        if torch.isnan(loss_ce) or torch.isinf(loss_ce):
-            loss_ce = torch.tensor(1.0, device=pred_logits.device, requires_grad=True)
         
         return {"loss_ce": loss_ce}
     
     def loss_masks(self, outputs, targets, indices, num_masks, mask_indices):
-        """Mask loss with proper sampling"""
-        masks = [t for t in targets["masks"]]
-        if not masks or sum(m.shape[0] for m in masks) == 0:
+        masks = targets["masks"]
+        if not masks or all(len(m) == 0 for m in masks):
             device = outputs["pred_masks"].device
             return {
                 "loss_mask": torch.tensor(0.01, device=device, requires_grad=True),
                 "loss_dice": torch.tensor(0.01, device=device, requires_grad=True)
             }
         
-        # Sample points using original logic
+        # Sample points
         with torch.no_grad():
-            sampled_indices = sample_points(masks, mask_indices, self.n_mask_pts, self.num_points)
+            sampled_idx = sample_points_safe(masks, mask_indices, self.n_mask_pts, self.num_points)
         
-        # Get masks
-        target_masks = pad_stack(masks)
+        # Get predictions and targets
         pred_masks = outputs["pred_masks"]
+        target_masks = pad_stack(masks).to(pred_masks.device)
         
-        # Get indices
+        # Get matched indices
         batch_idx = torch.cat([
             torch.full_like(src, i) for i, (src, _) in enumerate(indices)
         ])
         pred_idx = torch.cat([src for (src, _) in indices])
-        tgt_idx = torch.cat([tgt for (_, tgt) in indices])
         
-        # Get matched masks - handle different dimensions
-        if pred_masks.dim() == 3:
-            pred_masks = pred_masks[batch_idx, :, pred_idx]
-        elif pred_masks.dim() == 2:
-            pred_masks = pred_masks[batch_idx, pred_idx]
-        else:
-            pred_masks = pred_masks[batch_idx]
-        
-        # Build target mapping
         n_masks = [m.shape[0] for m in masks]
-        n_masks_cumsum = [0] + np.cumsum(n_masks).tolist()
+        tgt_idx = []
+        offset = 0
+        for b, (_, tgt) in enumerate(indices):
+            for t in tgt:
+                if t < n_masks[b]:
+                    tgt_idx.append(offset + t)
+            offset += n_masks[b]
         
-        target_indices = []
-        for b_idx, t_idx in zip(batch_idx, tgt_idx):
-            target_indices.append(n_masks_cumsum[b_idx] + t_idx)
+        if len(batch_idx) == 0 or len(tgt_idx) == 0:
+            device = outputs["pred_masks"].device
+            return {
+                "loss_mask": torch.tensor(0.01, device=device, requires_grad=True),
+                "loss_dice": torch.tensor(0.01, device=device, requires_grad=True)
+            }
         
-        target_masks = target_masks[target_indices].to(pred_masks.device)
+        # Select matched predictions
+        pred_masks = pred_masks[batch_idx, :, pred_idx]
+        target_masks = target_masks[tgt_idx]
         
         # Sample points for loss
         point_logits = []
         point_labels = []
         
-        for i, idx in enumerate(sampled_indices):
-            if i < len(n_masks) and n_masks[i] > 0:
-                # Get masks for this batch
-                batch_mask = (batch_idx == i)
+        n_masks_cumsum = [0] + np.cumsum(n_masks).tolist()
+        
+        for b, idx in enumerate(sampled_idx):
+            if b < len(n_masks) and n_masks[b] > 0 and len(idx) > 0:
+                start = n_masks_cumsum[b]
+                end = n_masks_cumsum[b + 1]
+                
+                # Find predictions for this batch
+                batch_mask = (batch_idx == b)
                 if batch_mask.sum() > 0:
                     batch_pred = pred_masks[batch_mask]
                     batch_tgt = target_masks[batch_mask]
                     
-                    # Sample points
-                    if len(idx) > 0:
-                        idx = idx.to(pred_masks.device)
-                        # Ensure indices are valid
-                        if batch_pred.dim() >= 2:
-                            max_idx = batch_pred.shape[1] - 1
-                        else:
-                            max_idx = batch_pred.shape[0] - 1
-                        idx = torch.clamp(idx, min=torch.tensor(0, device=idx.device), max=torch.tensor(max_idx, device=idx.device))
-                        
-                        if batch_pred.dim() == 2:
-                            point_logits.append(batch_pred[:, idx])
-                            point_labels.append(batch_tgt[:, idx])
-                        elif batch_pred.dim() == 1:
-                            point_logits.append(batch_pred[idx])
-                            point_labels.append(batch_tgt[idx])
-                        else:
-                            point_logits.append(batch_pred.flatten()[idx])
-                            point_labels.append(batch_tgt.flatten()[idx])
+                    # Ensure indices are valid
+                    max_idx = batch_pred.shape[1] - 1
+                    idx = torch.clamp(idx.to(pred_masks.device), 0, max_idx)
+                    
+                    point_logits.append(batch_pred[:, idx])
+                    point_labels.append(batch_tgt[:, idx])
         
-        if point_logits:
-            point_logits = torch.cat(point_logits, dim=0)
-            point_labels = torch.cat(point_labels, dim=0)
-            
-            # BCE loss
-            loss_mask = F.binary_cross_entropy_with_logits(
-                point_logits, point_labels.float(), reduction='none'
-            ).mean(1).sum() / num_masks
-            
-            # Dice loss
-            pred_sigmoid = torch.sigmoid(point_logits)
-            numerator = 2 * (pred_sigmoid * point_labels).sum(-1)
-            denominator = pred_sigmoid.sum(-1) + point_labels.sum(-1)
-            dice = 1 - (numerator + 1) / (denominator + 1)
-            loss_dice = dice.sum() / num_masks
-            
-            return {"loss_mask": loss_mask, "loss_dice": loss_dice}
-        else:
+        if not point_logits:
             device = outputs["pred_masks"].device
             return {
                 "loss_mask": torch.tensor(0.01, device=device, requires_grad=True),
                 "loss_dice": torch.tensor(0.01, device=device, requires_grad=True)
             }
+        
+        point_logits = torch.cat(point_logits, dim=0)
+        point_labels = torch.cat(point_labels, dim=0)
+        
+        # BCE loss
+        loss_mask = F.binary_cross_entropy_with_logits(
+            point_logits, point_labels.float(), reduction='none'
+        ).mean(1).sum() / num_masks
+        
+        # Dice loss
+        pred_sigmoid = torch.sigmoid(point_logits)
+        numerator = 2 * (pred_sigmoid * point_labels).sum(-1)
+        denominator = pred_sigmoid.sum(-1) + point_labels.sum(-1)
+        dice = 1 - (numerator + 1) / (denominator + 1)
+        loss_dice = dice.sum() / num_masks
+        
+        return {"loss_mask": loss_mask, "loss_dice": loss_dice}
 
 
 # ============================================================================
-# MAIN MODEL CLASS
+# MAIN MODEL
 # ============================================================================
 
-class FixedEnhancedMaskPLS(LightningModule):
-    """Fixed MaskPLS with proper multi-scale processing"""
+class EnhancedMaskPLS(LightningModule):
+    """Enhanced MaskPLS model for ONNX compatibility"""
     
     def __init__(self, cfg):
         super().__init__()
@@ -601,34 +592,28 @@ class FixedEnhancedMaskPLS(LightningModule):
         self.cfg = cfg
         
         dataset = cfg.MODEL.DATASET
-        self.num_classes = int(cfg[dataset].NUM_CLASSES)
-        self.ignore_label = int(cfg[dataset].IGNORE_LABEL)
+        self.num_classes = cfg[dataset].NUM_CLASSES
+        self.ignore_label = cfg[dataset].IGNORE_LABEL
         
-        # True sparse voxelizer
-        self.voxelizer = TrueSparseVoxelizer(
+        # Components
+        self.voxelizer = SparseVoxelizer(
             resolution=cfg.BACKBONE.RESOLUTION,
             coordinate_bounds=cfg[dataset].SPACE,
             device='cuda'
         )
         
-        # Fixed backbone with multi-scale
-        self.backbone = FixedSparseBackbone(cfg.BACKBONE)
+        self.backbone = SparseBackbone(cfg.BACKBONE)
+        self.feature_extractor = PointFeatureExtractor(k=cfg.BACKBONE.KNN_UP)
         
-        # Multi-scale feature extractor
-        self.feature_extractor = MultiScalePointFeatureExtractor(k=cfg.BACKBONE.KNN_UP)
-        
-        # Original decoder
         self.decoder = MaskedTransformerDecoder(
             cfg.DECODER,
             cfg.BACKBONE,
             cfg[dataset]
         )
         
-        # Loss functions
-        self.mask_loss = EnhancedMaskLoss(cfg.LOSS, cfg[dataset])
+        self.mask_loss = FixedMaskLoss(cfg.LOSS, cfg[dataset])
         self.sem_loss = SemLoss(cfg.LOSS.SEM.WEIGHTS)
         
-        # Evaluator
         self.evaluator = PanopticEvaluator(cfg[dataset], dataset)
         
         # Get things IDs
@@ -639,20 +624,16 @@ class FixedEnhancedMaskPLS(LightningModule):
         self.validation_step_outputs = []
     
     def forward(self, batch):
-        """Forward with proper multi-scale processing"""
         points = batch['pt_coord']
         features = batch['feats']
         
-        # Voxelization
+        # Voxelize
         voxel_grids, norm_coords, valid_indices = self.voxelizer.voxelize_batch(
-            points, features, 
-            max_points=self.cfg[self.cfg.MODEL.DATASET].SUB_NUM_POINTS
+            points, features, max_points=self.cfg[self.cfg.MODEL.DATASET].SUB_NUM_POINTS
         )
         
-        # Multi-scale voxel features
+        # Extract features
         multi_scale_voxels, batch_norms = self.backbone(voxel_grids)
-        
-        # Extract point features at multiple scales
         point_features, point_coords_list = self.feature_extractor(
             multi_scale_voxels, norm_coords, batch_norms
         )
@@ -670,38 +651,31 @@ class FixedEnhancedMaskPLS(LightningModule):
         padding_masks_stacked = torch.stack(padding_masks)
         padding_masks_list = [padding_masks_stacked for _ in range(len(point_features))]
         
-        # Decoder
+        # Decode
         outputs, last_pad = self.decoder(point_features, point_coords_list, padding_masks_list)
-        
-        # Semantic head on final scale
         sem_logits = self.backbone.sem_head(point_features[-1])
         
         return outputs, last_pad, sem_logits, valid_indices
     
     def prepare_targets(self, batch, max_points, valid_indices):
-        """Prepare targets with proper remapping"""
         targets = {'classes': [], 'masks': []}
         
         for i in range(len(batch['masks_cls'])):
             if len(batch['masks_cls'][i]) > 0:
-                classes = torch.tensor(
-                    batch['masks_cls'][i], 
-                    dtype=torch.long, 
-                    device='cuda'
-                )
-                classes = torch.clamp(classes, 0, int(self.num_classes) - 1)
+                classes = torch.tensor(batch['masks_cls'][i], dtype=torch.long, device='cuda')
+                classes = torch.clamp(classes, 0, self.num_classes - 1)
                 targets['classes'].append(classes)
                 
                 masks_list = []
                 for mask in batch['masks'][i]:
-                    if isinstance(mask, torch.Tensor):
-                        mask = mask.float()
+                    if not isinstance(mask, torch.Tensor):
+                        mask = torch.from_numpy(np.array(mask)).float()
                     else:
-                        mask = torch.from_numpy(mask).float() if isinstance(mask, np.ndarray) else mask.float()
+                        mask = mask.float()
                     
                     remapped_mask = torch.zeros(max_points, device='cuda')
-                    
                     valid_idx = valid_indices[i]
+                    
                     if len(valid_idx) > 0:
                         for j, v_idx in enumerate(valid_idx):
                             if j < max_points and v_idx < len(mask):
@@ -709,10 +683,8 @@ class FixedEnhancedMaskPLS(LightningModule):
                     
                     masks_list.append(remapped_mask)
                 
-                if masks_list:
-                    targets['masks'].append(torch.stack(masks_list))
-                else:
-                    targets['masks'].append(torch.zeros(0, max_points, device='cuda'))
+                targets['masks'].append(torch.stack(masks_list) if masks_list else 
+                                       torch.zeros(0, max_points, device='cuda'))
             else:
                 targets['classes'].append(torch.zeros(0, dtype=torch.long, device='cuda'))
                 targets['masks'].append(torch.zeros(0, max_points, device='cuda'))
@@ -720,7 +692,6 @@ class FixedEnhancedMaskPLS(LightningModule):
         return targets
     
     def compute_semantic_loss(self, batch, sem_logits, valid_indices, padding_masks):
-        """Compute semantic loss"""
         all_logits = []
         all_labels = []
         
@@ -733,10 +704,7 @@ class FixedEnhancedMaskPLS(LightningModule):
             valid_mask = ~pad_mask
             batch_logits = sem_logits[i][valid_mask]
             
-            if isinstance(labels, np.ndarray):
-                labels = labels.flatten()
-            else:
-                labels = np.array(labels).flatten()
+            labels = np.array(labels).flatten() if not isinstance(labels, np.ndarray) else labels.flatten()
             
             valid_idx_cpu = valid_idx.cpu().numpy()
             valid_labels = []
@@ -746,12 +714,8 @@ class FixedEnhancedMaskPLS(LightningModule):
                     valid_labels.append(labels[v_idx])
             
             if valid_labels:
-                labels_tensor = torch.tensor(
-                    valid_labels, 
-                    dtype=torch.long, 
-                    device='cuda'
-                )
-                labels_tensor = torch.clamp(labels_tensor, 0, int(self.num_classes) - 1)
+                labels_tensor = torch.tensor(valid_labels, dtype=torch.long, device='cuda')
+                labels_tensor = torch.clamp(labels_tensor, 0, self.num_classes - 1)
                 
                 min_len = min(len(batch_logits), len(labels_tensor))
                 if min_len > 0:
@@ -777,7 +741,6 @@ class FixedEnhancedMaskPLS(LightningModule):
             return torch.tensor(0.01, device='cuda', requires_grad=True)
     
     def panoptic_inference(self, outputs, padding_masks, valid_indices, batch):
-        """Fixed panoptic inference matching original"""
         mask_cls = outputs["pred_logits"]
         mask_pred = outputs["pred_masks"]
         
@@ -798,18 +761,12 @@ class FixedEnhancedMaskPLS(LightningModule):
             if keep.sum() > 0 and len(valid_indices[b]) > 0:
                 cur_scores = scores[keep]
                 cur_classes = labels[keep]
-                if valid_pred.dim() == 2:
-                    cur_masks = valid_pred[:, keep]
-                elif valid_pred.dim() == 1:
-                    cur_masks = valid_pred.unsqueeze(1).expand(-1, keep.sum())
-                else:
-                    cur_masks = valid_pred.view(-1, 1).expand(-1, keep.sum())
+                cur_masks = valid_pred[:, keep] if valid_pred.dim() == 2 else valid_pred.unsqueeze(1)
                 
                 cur_prob_masks = cur_scores.unsqueeze(0) * cur_masks
                 mask_ids = cur_prob_masks.argmax(1)
                 
                 valid_idx_cpu = valid_indices[b].cpu().numpy()
-                
                 segment_id = 0
                 stuff_memory = {}
                 
@@ -817,18 +774,13 @@ class FixedEnhancedMaskPLS(LightningModule):
                     pred_class = cur_classes[k].item()
                     isthing = pred_class in self.things_ids
                     
-                    if cur_masks.dim() == 2 and k < cur_masks.shape[1]:
-                        mask_points = (mask_ids == k) & (cur_masks[:, k] >= 0.5)
-                        original_area = (cur_masks[:, k] >= 0.5).sum().item()
-                    else:
-                        mask_points = (mask_ids == k)
-                        original_area = mask_points.sum().item()
+                    mask_points = (mask_ids == k) & (cur_masks[:, k] >= 0.5) if cur_masks.dim() == 2 else (mask_ids == k)
                     
                     if mask_points.sum() < 10:
                         continue
                     
-                    # Check overlap threshold
                     mask_area = (mask_ids == k).sum().item()
+                    original_area = (cur_masks[:, k] >= 0.5).sum().item() if cur_masks.dim() == 2 else mask_points.sum().item()
                     
                     if original_area > 0 and mask_area / original_area < self.cfg.MODEL.OVERLAP_THRESHOLD:
                         continue
@@ -858,7 +810,6 @@ class FixedEnhancedMaskPLS(LightningModule):
         return sem_pred, ins_pred
     
     def training_step(self, batch, batch_idx):
-        """Training step"""
         try:
             outputs, padding_masks, sem_logits, valid_indices = self.forward(batch)
             
@@ -881,10 +832,11 @@ class FixedEnhancedMaskPLS(LightningModule):
             
         except Exception as e:
             print(f"Error in training step {batch_idx}: {e}")
+            import traceback
+            traceback.print_exc()
             return torch.tensor(1.0, device='cuda', requires_grad=True)
     
     def validation_step(self, batch, batch_idx):
-        """Validation step"""
         try:
             outputs, padding_masks, sem_logits, valid_indices = self.forward(batch)
             
@@ -913,7 +865,6 @@ class FixedEnhancedMaskPLS(LightningModule):
             print(f"Error in validation step {batch_idx}: {e}")
     
     def on_validation_epoch_end(self):
-        """Validation epoch end"""
         try:
             pq = self.evaluator.get_mean_pq()
             iou = self.evaluator.get_mean_iou()
@@ -932,7 +883,6 @@ class FixedEnhancedMaskPLS(LightningModule):
             self.validation_step_outputs.clear()
     
     def configure_optimizers(self):
-        """Optimizer configuration"""
         optimizer = torch.optim.AdamW(
             self.parameters(),
             lr=self.cfg.TRAIN.LR,
@@ -956,7 +906,7 @@ class FixedEnhancedMaskPLS(LightningModule):
 
 
 # ============================================================================
-# MAIN TRAINING SCRIPT
+# MAIN FUNCTION
 # ============================================================================
 
 @click.command()
@@ -969,15 +919,10 @@ class FixedEnhancedMaskPLS(LightningModule):
 @click.option("--checkpoint", type=str, default=None)
 @click.option("--nuscenes", is_flag=True)
 def main(config, epochs, batch_size, lr, gpus, num_workers, checkpoint, nuscenes):
-    """Fixed training with proper multi-scale processing"""
+    """Train ONNX-compatible MaskPLS"""
     
     print("="*60)
-    print("FIXED MaskPLS Training for ONNX")
-    print("Key fixes applied:")
-    print("- Multi-scale feature extraction and normalization")
-    print("- Proper panoptic inference with stuff region merging")
-    print("- True sparse voxelization")
-    print("- Correct decoder input structure")
+    print("Enhanced MaskPLS Training (ONNX-Compatible)")
     print("="*60)
     
     # Load config
@@ -1002,8 +947,8 @@ def main(config, epochs, batch_size, lr, gpus, num_workers, checkpoint, nuscenes
     
     dataset = cfg.MODEL.DATASET
     
-    # Use much smaller values for memory
-    cfg[dataset].SUB_NUM_POINTS = 8000  # Much smaller for memory
+    # Memory-friendly settings
+    cfg[dataset].SUB_NUM_POINTS = 10000
     cfg.LOSS.NUM_POINTS = 5000
     cfg.LOSS.NUM_MASK_PTS = 100
     
@@ -1011,15 +956,13 @@ def main(config, epochs, batch_size, lr, gpus, num_workers, checkpoint, nuscenes
     print(f"  Dataset: {dataset}")
     print(f"  Batch Size: {batch_size}")
     print(f"  Learning Rate: {lr}")
-    print(f"  Voxel Resolution: 0.05 (original)")
-    print(f"  Point Sampling: {cfg[dataset].SUB_NUM_POINTS}")
-    print(f"  Multi-scale Features: 4 levels")
+    print(f"  Max Points: {cfg[dataset].SUB_NUM_POINTS}")
     
     # Create data module
     data = SemanticDatasetModule(cfg)
     
     # Create model
-    model = FixedEnhancedMaskPLS(cfg)
+    model = EnhancedMaskPLS(cfg)
     
     # Load checkpoint if provided
     if checkpoint:
@@ -1032,7 +975,7 @@ def main(config, epochs, batch_size, lr, gpus, num_workers, checkpoint, nuscenes
     
     # Setup logging
     tb_logger = pl_loggers.TensorBoardLogger(
-        "experiments/" + cfg.EXPERIMENT.ID + "_fixed",
+        "experiments/" + cfg.EXPERIMENT.ID + "_onnx",
         default_hp_metric=False
     )
     
@@ -1041,7 +984,7 @@ def main(config, epochs, batch_size, lr, gpus, num_workers, checkpoint, nuscenes
     
     checkpoint_callback = ModelCheckpoint(
         monitor="metrics/iou",
-        filename=cfg.EXPERIMENT.ID + "_fixed_epoch{epoch:02d}_iou{metrics/iou:.3f}",
+        filename=cfg.EXPERIMENT.ID + "_onnx_epoch{epoch:02d}_iou{metrics/iou:.3f}",
         auto_insert_metric_name=False,
         mode="max",
         save_last=True,
@@ -1066,14 +1009,10 @@ def main(config, epochs, batch_size, lr, gpus, num_workers, checkpoint, nuscenes
     )
     
     # Train
-    print("\nStarting training with FIXED implementation...")
+    print("\nStarting training...")
     trainer.fit(model, data)
     
     print("\nTraining completed!")
-    print("Expected improvements over previous version:")
-    print("- IoU: 0.034 -> 0.25-0.30")
-    print("- PQ: 0.0 -> 0.15-0.25")
-    print("- RQ: 0.0 -> 0.20-0.30")
 
 
 if __name__ == "__main__":
