@@ -212,13 +212,13 @@ class TrueSparseVoxelizer:
         )
         self.device = device
     
-    def voxelize_batch(self, points_list, features_list, max_points=80000):
+    def voxelize_batch(self, points_list, features_list, max_points=5000):
         """True sparse voxelization - only store occupied voxels"""
         B = len(points_list)
         
         # Compute actual grid dimensions from resolution
         grid_size = ((self.bounds_max - self.bounds_min) / self.resolution).long()
-        grid_size = torch.clamp(grid_size, min=torch.tensor(1, device=grid_size.device), max=torch.tensor(200, device=grid_size.device))  # Safety limit
+        grid_size = torch.clamp(grid_size, min=torch.tensor(1, device=grid_size.device), max=torch.tensor(64, device=grid_size.device))  # Smaller grid for memory
         D, H, W = grid_size.tolist()
         
         # Process each point cloud
@@ -513,8 +513,13 @@ class EnhancedMaskLoss(torch.nn.Module):
         pred_idx = torch.cat([src for (src, _) in indices])
         tgt_idx = torch.cat([tgt for (_, tgt) in indices])
         
-        # Get matched masks
-        pred_masks = pred_masks[batch_idx, :, pred_idx]
+        # Get matched masks - handle different dimensions
+        if pred_masks.dim() == 3:
+            pred_masks = pred_masks[batch_idx, :, pred_idx]
+        elif pred_masks.dim() == 2:
+            pred_masks = pred_masks[batch_idx, pred_idx]
+        else:
+            pred_masks = pred_masks[batch_idx]
         
         # Build target mapping
         n_masks = [m.shape[0] for m in masks]
@@ -978,10 +983,10 @@ def main(config, epochs, batch_size, lr, gpus, num_workers, checkpoint, nuscenes
     
     dataset = cfg.MODEL.DATASET
     
-    # Use reduced but reasonable values
-    cfg[dataset].SUB_NUM_POINTS = 30000  # Reduced for memory but still reasonable
-    cfg.LOSS.NUM_POINTS = 20000
-    cfg.LOSS.NUM_MASK_PTS = 300
+    # Use much smaller values for memory
+    cfg[dataset].SUB_NUM_POINTS = 8000  # Much smaller for memory
+    cfg.LOSS.NUM_POINTS = 5000
+    cfg.LOSS.NUM_MASK_PTS = 100
     
     print(f"Configuration:")
     print(f"  Dataset: {dataset}")
