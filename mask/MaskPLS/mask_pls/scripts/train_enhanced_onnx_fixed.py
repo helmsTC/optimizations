@@ -529,9 +529,16 @@ class FixedMaskLoss(nn.Module):
                 "loss_dice": torch.tensor(0.01, device=device, requires_grad=True)
             }
         
-        # Select matched predictions
-        pred_masks = pred_masks[batch_idx, :, pred_idx]
-        target_masks = target_masks[tgt_idx]
+        # Select matched predictions and targets properly
+        if len(pred_masks.shape) == 3:  # [B, N, Q]
+            pred_masks = pred_masks[batch_idx, :, pred_idx]
+        else:
+            pred_masks = pred_masks[batch_idx, pred_idx]
+        
+        # Handle target_masks indexing properly
+        if len(tgt_idx) > 0:
+            tgt_idx_tensor = torch.tensor(tgt_idx, dtype=torch.long, device=target_masks.device)
+            target_masks = target_masks[tgt_idx_tensor]
         
         # Sample points for loss
         point_logits = []
@@ -541,21 +548,32 @@ class FixedMaskLoss(nn.Module):
         
         for b, idx in enumerate(sampled_idx):
             if b < len(n_masks) and n_masks[b] > 0 and len(idx) > 0:
-                start = n_masks_cumsum[b]
-                end = n_masks_cumsum[b + 1]
-                
                 # Find predictions for this batch
                 batch_mask = (batch_idx == b)
                 if batch_mask.sum() > 0:
-                    batch_pred = pred_masks[batch_mask]
-                    batch_tgt = target_masks[batch_mask]
+                    # Get the indices of predictions for this batch
+                    batch_pred_indices = torch.where(batch_mask)[0]
                     
                     # Ensure indices are valid
-                    max_idx = batch_pred.shape[1] - 1
-                    idx = torch.clamp(idx.to(pred_masks.device), 0, max_idx)
-                    
-                    point_logits.append(batch_pred[:, idx])
-                    point_labels.append(batch_tgt[:, idx])
+                    if len(batch_pred_indices) > 0 and len(pred_masks) > 0:
+                        batch_pred = pred_masks[batch_pred_indices]
+                        batch_tgt = target_masks[batch_pred_indices]
+                        
+                        # Ensure idx is on the right device and within bounds
+                        idx = idx.to(pred_masks.device)
+                        max_idx = batch_pred.shape[1] - 1 if len(batch_pred.shape) > 1 else 0
+                        
+                        if max_idx > 0:
+                            idx = torch.clamp(idx, 0, max_idx)
+                            
+                            # Sample points based on tensor dimensions
+                            if len(batch_pred.shape) == 2:
+                                point_logits.append(batch_pred[:, idx])
+                                point_labels.append(batch_tgt[:, idx])
+                            elif len(batch_pred.shape) == 1:
+                                # Handle 1D case
+                                point_logits.append(batch_pred[idx % len(batch_pred)].unsqueeze(0))
+                                point_labels.append(batch_tgt[idx % len(batch_tgt)].unsqueeze(0))
         
         if not point_logits:
             device = outputs["pred_masks"].device
