@@ -589,6 +589,9 @@ class EnhancedMaskPLS(LightningModule):
             if all(len(v) == 0 for v in valid_indices):
                 return
             
+            # Store semantic logits for panoptic inference
+            self.last_sem_logits = sem_logits
+            
             # Compute losses
             targets = self.prepare_targets(batch, padding_masks.shape[1], valid_indices)
             mask_losses = self.mask_loss(outputs, targets, batch['masks_ids'])
@@ -676,6 +679,18 @@ class EnhancedMaskPLS(LightningModule):
         sem_pred = []
         ins_pred = []
         
+        # Debug: Print first batch stats
+        if hasattr(self, '_debug_counter'):
+            self._debug_counter += 1
+        else:
+            self._debug_counter = 0
+        
+        # Print debug info every 10 batches
+        if self._debug_counter % 10 == 0:
+            scores_sample, labels_sample = mask_cls[0].max(-1)
+            print(f"Debug - Batch {self._debug_counter}: max_score={scores_sample.max():.3f}, "
+                  f"num_non_empty={labels_sample.ne(self.num_classes).sum()}/{len(labels_sample)}")
+        
         for b, (cls_b, mask_b, pad_b, valid_idx) in enumerate(
             zip(mask_cls, mask_pred, padding_masks, valid_indices)
         ):
@@ -687,14 +702,26 @@ class EnhancedMaskPLS(LightningModule):
             if torch.isnan(valid_pred).any():
                 valid_pred = torch.nan_to_num(valid_pred, nan=0.5)
             
-            # Get predictions
-            scores, labels = cls_b.max(-1)
+            # Get predictions - use softmax for better probability distribution
+            cls_probs = cls_b.softmax(-1)  # Apply softmax for proper probabilities
+            scores, labels = cls_probs.max(-1)
             keep = labels.ne(self.num_classes)
             
             # Create output arrays with original size
             orig_size = batch['sem_label'][b].shape[0]
             sem_out = np.zeros(orig_size, dtype=np.int32)
             ins_out = np.zeros(orig_size, dtype=np.int32)
+            
+            # Also use semantic predictions as fallback
+            if hasattr(self, 'last_sem_logits') and self.last_sem_logits is not None:
+                sem_logits = self.last_sem_logits[b][valid_mask]
+                sem_preds = sem_logits.argmax(-1).cpu().numpy()
+                
+                # Map semantic predictions to original indices
+                valid_idx_cpu = valid_idx.cpu().numpy()
+                for i, v_idx in enumerate(valid_idx_cpu):
+                    if i < len(sem_preds) and v_idx < orig_size:
+                        sem_out[v_idx] = sem_preds[i]
             
             if keep.sum() > 0 and len(valid_idx) > 0:
                 try:
@@ -713,9 +740,9 @@ class EnhancedMaskPLS(LightningModule):
                     segment_id = 0
                     for k in range(cur_classes.shape[0]):
                         pred_class = cur_classes[k].item()
-                        point_mask = (point_mask_ids == k) & (cur_masks[:, k] >= 0.5)
+                        point_mask = (point_mask_ids == k) & (cur_masks[:, k] >= 0.3)  # Lower threshold
                         
-                        if point_mask.sum() > 10:  # Minimum mask size
+                        if point_mask.sum() > 5:  # Lower minimum mask size
                             # Map to original indices
                             mask_indices = point_mask.cpu().numpy()
                             for i, is_mask in enumerate(mask_indices):
