@@ -634,7 +634,16 @@ class EnhancedMaskPLS(LightningModule):
             self.log("metrics/iou", iou, batch_size=self.cfg.TRAIN.BATCH_SIZE)
             self.log("metrics/rq", rq, batch_size=self.cfg.TRAIN.BATCH_SIZE)
             
-            print(f"\nValidation Metrics - PQ: {pq:.4f}, IoU: {iou:.4f}, RQ: {rq:.4f}")
+            # Always print validation metrics at the end of validation epoch
+            print(f"\n{'='*60}")
+            print(f"VALIDATION METRICS - Epoch {self.current_epoch}")
+            print(f"{'='*60}")
+            print(f"Panoptic Quality (PQ): {pq:.4f}")
+            print(f"Mean IoU: {iou:.4f}")
+            print(f"Recognition Quality (RQ): {rq:.4f}")
+            print(f"{'='*60}")
+            print(f"Checkpoint will be saved if IoU > previous best")
+            print(f"{'='*60}\n")
             
         except Exception as e:
             print(f"Error computing validation metrics: {e}")
@@ -646,6 +655,18 @@ class EnhancedMaskPLS(LightningModule):
             # Reset evaluator
             self.evaluator.reset()
             self.validation_step_outputs.clear()
+    
+    def on_train_epoch_end(self):
+        """Print training epoch summary"""
+        # Get the average training loss for the epoch
+        avg_loss = self.trainer.callback_metrics.get('train_loss', 0.0)
+        
+        print(f"\n{'='*60}")
+        print(f"TRAINING EPOCH {self.current_epoch} COMPLETED")
+        print(f"{'='*60}")
+        print(f"Average Training Loss: {avg_loss:.4f}")
+        print(f"Learning Rate: {self.optimizers().param_groups[0]['lr']:.6f}")
+        print(f"{'='*60}\n")
     
     def panoptic_inference(self, outputs, padding_masks, valid_indices, batch):
         """Panoptic inference with NaN handling"""
@@ -821,21 +842,28 @@ def main(config, epochs, batch_size, lr, gpus, num_workers, checkpoint, nuscenes
             print(f"Warning: Failed to load checkpoint: {e}")
     
     # Setup logging
+    experiment_dir = "experiments/" + cfg.EXPERIMENT.ID + "_enhanced_debug"
     tb_logger = pl_loggers.TensorBoardLogger(
-        "experiments/" + cfg.EXPERIMENT.ID + "_enhanced_debug",
+        experiment_dir,
         default_hp_metric=False
     )
     
     # Callbacks
     lr_monitor = LearningRateMonitor(logging_interval="step")
     
+    # Explicitly set checkpoint directory
+    checkpoint_dir = os.path.join(experiment_dir, "checkpoints")
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    
     checkpoint_callback = ModelCheckpoint(
+        dirpath=checkpoint_dir,  # Explicitly set the directory
         monitor="metrics/iou",
         filename=cfg.EXPERIMENT.ID + "_debug_epoch{epoch:02d}_iou{metrics/iou:.3f}",
         auto_insert_metric_name=False,
         mode="max",
         save_last=True,
-        save_top_k=3
+        save_top_k=3,
+        verbose=True  # Add verbose to see when checkpoints are saved
     )
     
     # Create trainer with debugging settings
@@ -850,7 +878,7 @@ def main(config, epochs, batch_size, lr, gpus, num_workers, checkpoint, nuscenes
         gradient_clip_val=1.0,
         accumulate_grad_batches=cfg.TRAIN.BATCH_ACC,
         precision=32,  # Use full precision initially for stability
-        check_val_every_n_epoch=5,
+        check_val_every_n_epoch=1,  # Run validation every epoch to see metrics
         num_sanity_val_steps=0,
         detect_anomaly=True,  # Enable anomaly detection
     )
