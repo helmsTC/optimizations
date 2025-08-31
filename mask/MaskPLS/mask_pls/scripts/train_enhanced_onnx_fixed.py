@@ -798,7 +798,12 @@ class FixedEnhancedMaskPLS(LightningModule):
             if keep.sum() > 0 and len(valid_indices[b]) > 0:
                 cur_scores = scores[keep]
                 cur_classes = labels[keep]
-                cur_masks = valid_pred[:, keep]
+                if valid_pred.dim() == 2:
+                    cur_masks = valid_pred[:, keep]
+                elif valid_pred.dim() == 1:
+                    cur_masks = valid_pred.unsqueeze(1).expand(-1, keep.sum())
+                else:
+                    cur_masks = valid_pred.view(-1, 1).expand(-1, keep.sum())
                 
                 cur_prob_masks = cur_scores.unsqueeze(0) * cur_masks
                 mask_ids = cur_prob_masks.argmax(1)
@@ -812,14 +817,18 @@ class FixedEnhancedMaskPLS(LightningModule):
                     pred_class = cur_classes[k].item()
                     isthing = pred_class in self.things_ids
                     
-                    mask_points = (mask_ids == k) & (cur_masks[:, k] >= 0.5)
+                    if cur_masks.dim() == 2 and k < cur_masks.shape[1]:
+                        mask_points = (mask_ids == k) & (cur_masks[:, k] >= 0.5)
+                        original_area = (cur_masks[:, k] >= 0.5).sum().item()
+                    else:
+                        mask_points = (mask_ids == k)
+                        original_area = mask_points.sum().item()
                     
                     if mask_points.sum() < 10:
                         continue
                     
                     # Check overlap threshold
                     mask_area = (mask_ids == k).sum().item()
-                    original_area = (cur_masks[:, k] >= 0.5).sum().item()
                     
                     if original_area > 0 and mask_area / original_area < self.cfg.MODEL.OVERLAP_THRESHOLD:
                         continue
