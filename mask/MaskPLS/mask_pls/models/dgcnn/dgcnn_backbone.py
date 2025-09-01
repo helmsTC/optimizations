@@ -146,18 +146,32 @@ class DGCNNBackbone(nn.Module):
         feats_list = x['feats']
         
         batch_size = len(coords_list)
+        device = 'cuda' if torch.cuda.is_available() else 'cpu'
         
         # Process each point cloud
         all_features = []
         all_coords = []
         all_masks = []
+        max_points = 0
         
         for b in range(batch_size):
-            coords = torch.from_numpy(coords_list[b]).float().cuda()
-            feats = torch.from_numpy(feats_list[b]).float().cuda()
+            # Handle both numpy arrays and tensors
+            if isinstance(coords_list[b], np.ndarray):
+                coords = torch.from_numpy(coords_list[b]).float().to(device)
+            else:
+                coords = coords_list[b].float().to(device)
+                
+            if isinstance(feats_list[b], np.ndarray):
+                feats = torch.from_numpy(feats_list[b]).float().to(device)
+            else:
+                feats = feats_list[b].float().to(device)
             
-            # Combine coordinates and features
-            x_in = torch.cat([coords, feats[:, 3:]], dim=1).transpose(0, 1).unsqueeze(0)
+            # Update max points
+            max_points = max(max_points, coords.shape[0])
+            
+            # DGCNN expects [B, C, N] format
+            # Combine coordinates and intensity for input
+            x_in = feats.transpose(0, 1).unsqueeze(0)  # [1, C, N]
             
             # DGCNN forward
             x1 = self.conv1(x_in)
@@ -166,16 +180,16 @@ class DGCNNBackbone(nn.Module):
             x4 = self.conv4(x3)
             
             # Concatenate all edge conv outputs
-            x = torch.cat((x1, x2, x3, x4), dim=1)
+            x = torch.cat((x1, x2, x3, x4), dim=1)  # [1, 512, N]
             x = self.conv5(x)
             
-            # Global features
-            x_global = F.adaptive_max_pool1d(x, 1).expand(-1, -1, x.size(2))
-            x = torch.cat((x, x_global), dim=1)
+            # Global features (optional, can be disabled for point-wise tasks)
+            # x_global = F.adaptive_max_pool1d(x, 1).expand(-1, -1, x.size(2))
+            # x = torch.cat((x, x_global), dim=1)
             
             all_features.append(x)
             all_coords.append(coords)
-            all_masks.append(torch.zeros(coords.shape[0], dtype=torch.bool).cuda())
+            all_masks.append(torch.zeros(coords.shape[0], dtype=torch.bool, device=device))
         
         # Generate multi-scale features
         ms_features = []
@@ -188,51 +202,48 @@ class DGCNNBackbone(nn.Module):
             level_masks = []
             
             for b in range(batch_size):
-                feat = feat_layer(all_features[b]).squeeze(0).transpose(0, 1)
-                feat = bn_layer(feat.transpose(0, 1)).transpose(0, 1)
+                # Apply feature layer and batch norm
+                feat = feat_layer(all_features[b])  # [1, C_out, N]
+                feat = bn_layer(feat)
+                feat = feat.squeeze(0).transpose(0, 1)  # [N, C_out]
                 
-                level_features.append(feat)
-                level_coords.append(all_coords[b])
-                level_masks.append(all_masks[b])
-            
-            # Pad to same size
-            max_points = max(f.shape[0] for f in level_features)
-            padded_features = []
-            padded_coords = []
-            padded_masks = []
-            
-            for feat, coord, mask in zip(level_features, level_coords, level_masks):
+                # Pad to max points
                 n_points = feat.shape[0]
                 if n_points < max_points:
                     pad_size = max_points - n_points
                     feat = F.pad(feat, (0, 0, 0, pad_size))
-                    coord = F.pad(coord, (0, 0, 0, pad_size))
-                    mask = F.pad(mask, (0, pad_size), value=True)
+                    coord = F.pad(all_coords[b], (0, 0, 0, pad_size))
+                    mask = F.pad(all_masks[b], (0, pad_size), value=True)
+                else:
+                    coord = all_coords[b]
+                    mask = all_masks[b]
                 
-                padded_features.append(feat)
-                padded_coords.append(coord)
-                padded_masks.append(mask)
+                level_features.append(feat)
+                level_coords.append(coord)
+                level_masks.append(mask)
             
-            ms_features.append(torch.stack(padded_features))
-            ms_coords.append(torch.stack(padded_coords))
-            ms_masks.append(torch.stack(padded_masks))
+            ms_features.append(torch.stack(level_features))
+            ms_coords.append(torch.stack(level_coords))
+            ms_masks.append(torch.stack(level_masks))
         
         # Semantic predictions
-        sem_features = ms_features[-1]
+        sem_features = ms_features[-1]  # Use last level features
         sem_logits = []
         
         for b in range(batch_size):
             valid_mask = ~ms_masks[-1][b]
             valid_features = sem_features[b][valid_mask]
-            sem_logit = self.sem_head(valid_features)
             
-            # Pad back
-            if valid_mask.sum() < sem_features.shape[1]:
-                full_logit = torch.zeros(sem_features.shape[1], 20).cuda()
+            if valid_features.shape[0] > 0:
+                sem_logit = self.sem_head(valid_features)
+                
+                # Pad back to full size
+                full_logit = torch.zeros(max_points, 20, device=device)
                 full_logit[valid_mask] = sem_logit
-                sem_logit = full_logit
-            
-            sem_logits.append(sem_logit)
+                sem_logits.append(full_logit)
+            else:
+                # Empty point cloud
+                sem_logits.append(torch.zeros(max_points, 20, device=device))
         
         sem_logits = torch.stack(sem_logits)
         
