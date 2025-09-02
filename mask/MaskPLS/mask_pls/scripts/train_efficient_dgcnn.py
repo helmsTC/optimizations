@@ -39,9 +39,18 @@ class MaskPLSDGCNNOptimized(LightningModule):
         self.num_classes = cfg[dataset].NUM_CLASSES
         self.things_ids = []
         
-        # Import and create DGCNN backbone
-        from mask_pls.models.dgcnn.dgcnn_backbone import DGCNNBackbone
-        self.backbone = DGCNNBackbone(cfg.BACKBONE)
+        # Import and create DGCNN backbone with pretrained support
+        from mask_pls.models.dgcnn.dgcnn_backbone import DGCNNPretrainedBackbone, DGCNNBackbone
+        
+        # Use pretrained backbone if path provided
+        pretrained_path = cfg.get('PRETRAINED_PATH', None)
+        if pretrained_path and Path(pretrained_path).exists():
+            print(f"Loading pretrained DGCNN from: {pretrained_path}")
+            self.backbone = DGCNNPretrainedBackbone(cfg.BACKBONE, pretrained_path)
+        else:
+            if pretrained_path:
+                print(f"Warning: Pretrained path {pretrained_path} not found, using random init")
+            self.backbone = DGCNNBackbone(cfg.BACKBONE)
         
         # Create decoder
         from mask_pls.models.decoder import MaskedTransformerDecoder
@@ -183,8 +192,21 @@ class MaskPLSDGCNNOptimized(LightningModule):
         self.validation_step_outputs.clear()
     
     def configure_optimizers(self):
-        # Separate parameters for backbone and decoder
-        optimizer = torch.optim.AdamW(self.parameters(), lr=self.cfg.TRAIN.LR, weight_decay=1e-4)
+        # Separate parameters for backbone and decoder with different LRs
+        backbone_params = []
+        decoder_params = []
+        
+        for name, param in self.named_parameters():
+            if 'backbone' in name:
+                backbone_params.append(param)
+            else:
+                decoder_params.append(param)
+        
+        # Different learning rates for pretrained backbone
+        optimizer = torch.optim.AdamW([
+            {'params': backbone_params, 'lr': self.cfg.TRAIN.LR * 0.1},  # Lower LR for pretrained
+            {'params': decoder_params, 'lr': self.cfg.TRAIN.LR}
+        ], weight_decay=1e-4)
         
         # Cosine annealing scheduler
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -198,7 +220,7 @@ class MaskPLSDGCNNOptimized(LightningModule):
         if self.current_step < self.warmup_steps:
             lr_scale = min(1.0, float(self.current_step) / float(self.warmup_steps))
             for pg in self.optimizers().param_groups:
-                pg['lr'] = lr_scale * self.cfg.TRAIN.LR
+                pg['lr'] = lr_scale * pg['initial_lr'] if 'initial_lr' in pg else lr_scale * self.cfg.TRAIN.LR
         
         super().optimizer_step(*args, **kwargs)
     
@@ -265,12 +287,14 @@ def get_config():
     cfg.TRAIN.BATCH_SIZE = 1
     cfg.TRAIN.WARMUP_STEPS = 500
     cfg.TRAIN.GRADIENT_CLIP = 1.0
+    cfg.TRAIN.MIXED_PRECISION = True
     
     return cfg
 
 
 @click.command()
-@click.option("--checkpoint", type=str, default=None)
+@click.option("--checkpoint", type=str, default=None, help="Resume from checkpoint")
+@click.option("--pretrained", type=str, default=None, help="Pre-trained DGCNN weights")
 @click.option("--epochs", type=int, default=50)
 @click.option("--batch_size", type=int, default=1)
 @click.option("--lr", type=float, default=0.0005)
@@ -278,11 +302,14 @@ def get_config():
 @click.option("--num_workers", type=int, default=2)
 @click.option("--nuscenes", is_flag=True)
 @click.option("--experiment_name", type=str, default="maskpls_efficient")
-def main(checkpoint, epochs, batch_size, lr, gpus, num_workers, nuscenes, experiment_name):
+@click.option("--mixed_precision", is_flag=True, default=True, help="Use mixed precision training")
+def main(checkpoint, pretrained, epochs, batch_size, lr, gpus, num_workers, 
+         nuscenes, experiment_name, mixed_precision):
     """Train efficient MaskPLS with DGCNN backbone"""
     
     print("="*60)
     print("Efficient MaskPLS-DGCNN Training")
+    print("Memory Optimized Version")
     print("="*60)
     
     # Clear memory
@@ -297,7 +324,13 @@ def main(checkpoint, epochs, batch_size, lr, gpus, num_workers, nuscenes, experi
     cfg.TRAIN.LR = lr
     cfg.TRAIN.N_GPUS = gpus
     cfg.TRAIN.NUM_WORKERS = num_workers
+    cfg.TRAIN.MIXED_PRECISION = mixed_precision
     cfg.EXPERIMENT.ID = experiment_name
+    
+    # Add pretrained path to config
+    if pretrained:
+        cfg.PRETRAINED_PATH = pretrained
+        print(f"  Using pretrained weights: {pretrained}")
     
     if nuscenes:
         cfg.MODEL.DATASET = "NUSCENES"
@@ -307,6 +340,8 @@ def main(checkpoint, epochs, batch_size, lr, gpus, num_workers, nuscenes, experi
     print(f"  Epochs: {epochs}")
     print(f"  Batch Size: 1 (fixed)")
     print(f"  Learning Rate: {lr}")
+    print(f"  Mixed Precision: {mixed_precision}")
+    print(f"  Pretrained: {pretrained if pretrained else 'None'}")
     
     # Create data module
     data = SemanticDatasetModule(cfg)
@@ -336,6 +371,11 @@ def main(checkpoint, epochs, batch_size, lr, gpus, num_workers, nuscenes, experi
             mode="min",
             save_last=True,
             save_top_k=2
+        ),
+        EarlyStopping(
+            monitor="val_loss",
+            patience=10,
+            mode="min"
         )
     ]
     
@@ -348,7 +388,7 @@ def main(checkpoint, epochs, batch_size, lr, gpus, num_workers, nuscenes, experi
         callbacks=callbacks,
         log_every_n_steps=10,
         gradient_clip_val=1.0,
-        precision=16,  # Mixed precision
+        precision=16 if mixed_precision else 32,
         check_val_every_n_epoch=5,
         limit_val_batches=10,  # Only 10 validation batches
         num_sanity_val_steps=0,
@@ -358,8 +398,24 @@ def main(checkpoint, epochs, batch_size, lr, gpus, num_workers, nuscenes, experi
     
     # Train
     print("\nStarting training...")
-    trainer.fit(model, data)
-    print("\nTraining completed!")
+    print("Note: Validation uses subsampled points and runs less frequently")
+    
+    try:
+        trainer.fit(model, data)
+        print("\nTraining completed successfully!")
+    except RuntimeError as e:
+        if "out of memory" in str(e):
+            print("\n" + "="*60)
+            print("CUDA OUT OF MEMORY ERROR!")
+            print("Try these steps:")
+            print("  1. Reduce SUB_NUM_POINTS further")
+            print("  2. Reduce NUM_QUERIES to 25")
+            print("  3. Set limit_val_batches=5")
+            print("  4. Use --num_workers 0")
+            print("="*60)
+            raise
+    
+    print(f"\nBest checkpoints saved in: experiments/{experiment_name}")
 
 
 if __name__ == "__main__":
