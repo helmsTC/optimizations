@@ -1,7 +1,7 @@
-# Save this as: mask/MaskPLS/mask_pls/models/dgcnn/dgcnn_backbone_efficient.py
+# mask_pls/models/dgcnn/dgcnn_backbone_efficient.py
 """
-Memory-efficient DGCNN backbone for point cloud feature extraction
-Optimized for large point clouds without OOM errors
+Efficient DGCNN backbone for point cloud feature extraction
+Optimized for memory usage and ONNX compatibility
 """
 
 import torch
@@ -11,107 +11,61 @@ import numpy as np
 from typing import List, Tuple, Optional
 
 
-def knn_chunked(x, k, chunk_size=10000):
+def knn(x, k):
     """
-    Memory-efficient k-nearest neighbors using chunked processing
+    Get k nearest neighbors index
     Args:
         x: [B, C, N] input features
         k: number of neighbors
-        chunk_size: points to process at once
     Returns:
         idx: [B, N, k] indices of k nearest neighbors
     """
-    batch_size, channels, num_points = x.shape
-    device = x.device
+    inner = -2 * torch.matmul(x.transpose(2, 1), x)
+    xx = torch.sum(x**2, dim=1, keepdim=True)
+    pairwise_distance = -xx - inner - xx.transpose(2, 1)
     
-    # Process in chunks to avoid OOM
-    idx_list = []
-    
-    for b in range(batch_size):
-        x_b = x[b:b+1]  # [1, C, N]
-        idx_b_list = []
-        
-        # Process query points in chunks
-        for i in range(0, num_points, chunk_size):
-            end_i = min(i + chunk_size, num_points)
-            x_chunk = x_b[:, :, i:end_i]  # [1, C, chunk]
-            
-            # Compute distances to all points
-            inner = -2 * torch.matmul(x_chunk.transpose(2, 1), x_b)
-            xx_chunk = torch.sum(x_chunk**2, dim=1, keepdim=True)
-            xx = torch.sum(x_b**2, dim=1, keepdim=True)
-            pairwise_distance = -xx_chunk - inner - xx.transpose(2, 1)
-            
-            # Get k nearest neighbors for this chunk
-            idx_chunk = pairwise_distance.topk(k=k, dim=-1)[1]
-            idx_b_list.append(idx_chunk.squeeze(0))
-            
-            # Clear intermediate tensors
-            del inner, xx_chunk, pairwise_distance
-            
-        idx_b = torch.cat(idx_b_list, dim=0)
-        idx_list.append(idx_b)
-    
-    idx = torch.stack(idx_list, dim=0)
+    idx = pairwise_distance.topk(k=k, dim=-1)[1]
     return idx
 
 
-def get_graph_feature_efficient(x, k=20, idx=None, chunk_size=10000):
+def get_graph_feature(x, k=20, idx=None):
     """
-    Memory-efficient edge feature construction
+    Construct edge features for each point
+    Args:
+        x: [B, C, N]
+        k: number of neighbors
+        idx: pre-computed indices
+    Returns:
+        edge features: [B, 2*C, N, k]
     """
-    batch_size, num_dims, num_points = x.shape
-    device = x.device
+    batch_size = x.size(0)
+    num_points = x.size(2)
+    x = x.view(batch_size, -1, num_points)
     
     if idx is None:
-        if num_points > chunk_size:
-            idx = knn_chunked(x, k=k, chunk_size=chunk_size)
-        else:
-            # Original implementation for small point clouds
-            inner = -2 * torch.matmul(x.transpose(2, 1), x)
-            xx = torch.sum(x**2, dim=1, keepdim=True)
-            pairwise_distance = -xx - inner - xx.transpose(2, 1)
-            idx = pairwise_distance.topk(k=k, dim=-1)[1]
+        idx = knn(x, k=k)
     
-    # Process features in chunks
-    x = x.transpose(2, 1).contiguous()  # [B, N, C]
+    device = x.device
     
-    feature_list = []
-    for b in range(batch_size):
-        x_b = x[b]  # [N, C]
-        idx_b = idx[b]  # [N, k]
-        
-        # Process in chunks
-        feat_chunks = []
-        for i in range(0, num_points, chunk_size):
-            end_i = min(i + chunk_size, num_points)
-            
-            # Get features for this chunk
-            idx_chunk = idx_b[i:end_i]  # [chunk, k]
-            x_chunk = x_b[i:end_i].unsqueeze(1).repeat(1, k, 1)  # [chunk, k, C]
-            
-            # Gather neighbor features
-            idx_flat = idx_chunk.reshape(-1)
-            neighbors = x_b[idx_flat].reshape(end_i - i, k, num_dims)
-            
-            # Compute edge features
-            feat_chunk = torch.cat((neighbors - x_chunk, x_chunk), dim=2)
-            feat_chunks.append(feat_chunk)
-            
-            del neighbors, x_chunk
-        
-        feature_b = torch.cat(feat_chunks, dim=0)
-        feature_list.append(feature_b)
+    idx_base = torch.arange(0, batch_size, device=device).view(-1, 1, 1) * num_points
+    idx = idx + idx_base
+    idx = idx.view(-1)
     
-    feature = torch.stack(feature_list, dim=0)
-    feature = feature.permute(0, 3, 1, 2).contiguous()
+    _, num_dims, _ = x.size()
+    
+    x = x.transpose(2, 1).contiguous()
+    feature = x.view(batch_size * num_points, -1)[idx, :]
+    feature = feature.view(batch_size, num_points, k, num_dims)
+    x = x.view(batch_size, num_points, 1, num_dims).repeat(1, 1, k, 1)
+    
+    feature = torch.cat((feature - x, x), dim=3).permute(0, 3, 1, 2).contiguous()
     
     return feature
 
 
-class EfficientEdgeConv(nn.Module):
+class EdgeConv(nn.Module):
     """
-    Memory-efficient Edge convolution layer
+    Edge convolution layer
     """
     def __init__(self, in_channels, out_channels, k=20):
         super().__init__()
@@ -119,12 +73,11 @@ class EfficientEdgeConv(nn.Module):
         self.conv = nn.Sequential(
             nn.Conv2d(in_channels * 2, out_channels, kernel_size=1, bias=False),
             nn.BatchNorm2d(out_channels),
-            nn.LeakyReLU(negative_slope=0.2, inplace=True)
+            nn.LeakyReLU(negative_slope=0.2)
         )
     
     def forward(self, x, idx=None):
-        # Use efficient graph feature extraction
-        x = get_graph_feature_efficient(x, k=self.k, idx=idx)
+        x = get_graph_feature(x, k=self.k, idx=idx)
         x = self.conv(x)
         x = x.max(dim=-1, keepdim=False)[0]
         return x
@@ -132,35 +85,37 @@ class EfficientEdgeConv(nn.Module):
 
 class EfficientDGCNNBackbone(nn.Module):
     """
-    Memory-efficient DGCNN backbone
+    Efficient DGCNN backbone for point cloud feature extraction
     """
     def __init__(self, cfg):
         super().__init__()
         
         self.k = 20  # number of nearest neighbors
-        self.chunk_size = cfg.get('CHUNK_SIZE', 10000)  # Process points in chunks
         input_dim = cfg.INPUT_DIM
         output_channels = cfg.CHANNELS
         
+        # Ensure all operations use float32
+        self.dtype = torch.float32
+        
         # EdgeConv layers
-        self.conv1 = EfficientEdgeConv(input_dim, 64, k=self.k)
-        self.conv2 = EfficientEdgeConv(64, 64, k=self.k)
-        self.conv3 = EfficientEdgeConv(64, 128, k=self.k)
-        self.conv4 = EfficientEdgeConv(128, 256, k=self.k)
+        self.conv1 = EdgeConv(input_dim, 64, k=self.k)
+        self.conv2 = EdgeConv(64, 64, k=self.k)
+        self.conv3 = EdgeConv(64, 128, k=self.k)
+        self.conv4 = EdgeConv(128, 256, k=self.k)
         
         # Aggregation
         self.conv5 = nn.Sequential(
             nn.Conv1d(512, 512, kernel_size=1, bias=False),
             nn.BatchNorm1d(512),
-            nn.LeakyReLU(negative_slope=0.2, inplace=True)
+            nn.LeakyReLU(negative_slope=0.2)
         )
         
-        # Multi-scale feature extraction - expecting 1024 input channels (512 + 512 global)
+        # Multi-scale feature extraction matching MaskPLS architecture
         self.feat_layers = nn.ModuleList([
-            nn.Conv1d(1024, output_channels[5], kernel_size=1),  # 256
-            nn.Conv1d(1024, output_channels[6], kernel_size=1),  # 128
-            nn.Conv1d(1024, output_channels[7], kernel_size=1),  # 96
-            nn.Conv1d(1024, output_channels[8], kernel_size=1),  # 96
+            nn.Conv1d(512, output_channels[5], kernel_size=1),  # 256
+            nn.Conv1d(512, output_channels[6], kernel_size=1),  # 128
+            nn.Conv1d(512, output_channels[7], kernel_size=1),  # 96
+            nn.Conv1d(512, output_channels[8], kernel_size=1),  # 96
         ])
         
         # Batch normalization for outputs
@@ -173,102 +128,23 @@ class EfficientDGCNNBackbone(nn.Module):
         
         # Initialize weights
         self.init_weights()
+        
+        # Ensure float32
+        self.to(self.dtype)
     
     def init_weights(self):
         for m in self.modules():
             if isinstance(m, nn.Conv2d) or isinstance(m, nn.Conv1d):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='leaky_relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
             elif isinstance(m, nn.BatchNorm2d) or isinstance(m, nn.BatchNorm1d):
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
-    
-    def process_batch_chunked(self, coords_list, feats_list):
-        """Process each point cloud in chunks to avoid OOM"""
-        batch_size = len(coords_list)
-        all_features = []
-        all_coords = []
-        all_masks = []
-        
-        for b in range(batch_size):
-            coords = torch.from_numpy(coords_list[b]).float().cuda()
-            feats = torch.from_numpy(feats_list[b]).float().cuda()
-            
-            # Process large point clouds in chunks
-            if coords.shape[0] > self.chunk_size * 2:
-                # Split into overlapping chunks for better feature extraction
-                chunk_features = []
-                overlap = self.chunk_size // 4
-                
-                for i in range(0, coords.shape[0], self.chunk_size - overlap):
-                    end_i = min(i + self.chunk_size, coords.shape[0])
-                    
-                    # Extract chunk
-                    coords_chunk = coords[i:end_i]
-                    feats_chunk = feats[i:end_i]
-                    
-                    # Process chunk
-                    x_in = torch.cat([coords_chunk, feats_chunk[:, 3:]], dim=1)
-                    x_in = x_in.transpose(0, 1).unsqueeze(0)
-                    
-                    # Extract features for chunk
-                    with torch.cuda.amp.autocast():
-                        chunk_feat = self.forward_chunk(x_in)
-                    
-                    # Only keep non-overlapping part (except for last chunk)
-                    if i > 0 and end_i < coords.shape[0]:
-                        start_idx = overlap // 2
-                        end_idx = -overlap // 2
-                        chunk_feat = chunk_feat[:, :, start_idx:end_idx]
-                    elif i > 0:
-                        start_idx = overlap // 2
-                        chunk_feat = chunk_feat[:, :, start_idx:]
-                    elif end_i < coords.shape[0]:
-                        end_idx = -overlap // 2
-                        chunk_feat = chunk_feat[:, :, :end_idx]
-                    
-                    chunk_features.append(chunk_feat)
-                
-                # Concatenate chunk features
-                x = torch.cat(chunk_features, dim=2)
-            else:
-                # Process normally for smaller point clouds
-                x_in = torch.cat([coords, feats[:, 3:]], dim=1).transpose(0, 1).unsqueeze(0)
-                x = self.forward_chunk(x_in)
-            
-            all_features.append(x)
-            all_coords.append(coords)
-            all_masks.append(torch.zeros(coords.shape[0], dtype=torch.bool).cuda())
-        
-        return all_features, all_coords, all_masks
-    
-    def forward_chunk(self, x_in):
-        """Forward pass for a single chunk"""
-        # DGCNN forward
-        x1 = self.conv1(x_in)
-        x2 = self.conv2(x1)
-        x3 = self.conv3(x2)
-        x4 = self.conv4(x3)
-        
-        # Concatenate all edge conv outputs
-        x = torch.cat((x1, x2, x3, x4), dim=1)  # Should be 64+64+128+256 = 512 channels
-        x = self.conv5(x)  # Still 512 channels after conv5
-        
-        # Global features - use chunked max pooling for very large inputs
-        if x.shape[2] > 50000:
-            # Process global pooling in chunks
-            chunk_size = 25000
-            global_chunks = []
-            for i in range(0, x.shape[2], chunk_size):
-                chunk = x[:, :, i:i+chunk_size]
-                global_chunks.append(F.adaptive_max_pool1d(chunk, 1))
-            x_global = torch.max(torch.cat(global_chunks, dim=2), dim=2, keepdim=True)[0]
-            x_global = x_global.expand(-1, -1, x.size(2))
-        else:
-            x_global = F.adaptive_max_pool1d(x, 1).expand(-1, -1, x.size(2))
-        
-        # Concatenate with global features to get 1024 channels total
-        x = torch.cat((x, x_global), dim=1)  # 512 + 512 = 1024 channels
-        return x
+            elif isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, 0, 0.01)
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
     
     def forward(self, x):
         """
@@ -277,35 +153,82 @@ class EfficientDGCNNBackbone(nn.Module):
         Returns:
             multi-scale features, coordinates, padding masks, semantic logits
         """
+        # Prepare batch
         coords_list = x['pt_coord']
         feats_list = x['feats']
+        
         batch_size = len(coords_list)
         
-        # Process with chunking for memory efficiency
-        all_features, all_coords, all_masks = self.process_batch_chunked(coords_list, feats_list)
+        # Process each point cloud
+        all_features = []
+        all_coords = []
+        all_masks = []
+        original_sizes = []
         
-        # Generate multi-scale features
+        for b in range(batch_size):
+            coords = torch.from_numpy(coords_list[b]).float().cuda()
+            feats = torch.from_numpy(feats_list[b]).float().cuda()
+            
+            # Ensure float32 dtype
+            coords = coords.to(self.dtype)
+            feats = feats.to(self.dtype)
+            
+            # Store original size
+            n_points = coords.shape[0]
+            original_sizes.append(n_points)
+            
+            # DGCNN forward pass
+            point_features = self.process_single_cloud(coords, feats)
+            
+            all_features.append(point_features)
+            all_coords.append(coords)
+            all_masks.append(torch.zeros(n_points, dtype=torch.bool, device=coords.device))
+        
+        # Generate multi-scale features with consistent sizing
         ms_features = []
         ms_coords = []
         ms_masks = []
         
-        # Process each scale level
-        for i, (feat_layer, bn_layer) in enumerate(zip(self.feat_layers, self.out_bn)):
+        for i in range(len(self.feat_layers)):
             level_features = []
             level_coords = []
             level_masks = []
             
             for b in range(batch_size):
-                # Extract features for this level - keep in [1, C, N] format
-                feat = feat_layer(all_features[b])  # [1, C, N]
-                feat = bn_layer(feat)  # Apply BatchNorm on [1, C, N]
-                feat = feat.squeeze(0).transpose(0, 1)  # Convert to [N, C] for storage
+                feat = all_features[b][i]
+                coord = all_coords[b]
+                mask = all_masks[b]
+                
+                # Ensure features and coords have same number of points
+                n_feat = feat.shape[0]
+                n_coord = coord.shape[0]
+                
+                if n_feat != n_coord:
+                    # This handles the size mismatch error
+                    # Use the original size to determine correct size
+                    target_size = original_sizes[b]
+                    
+                    if n_feat > target_size:
+                        feat = feat[:target_size]
+                    elif n_feat < target_size:
+                        # This shouldn't happen, but handle it gracefully
+                        pad_size = target_size - n_feat
+                        feat = F.pad(feat, (0, 0, 0, pad_size))
+                    
+                    if n_coord > target_size:
+                        coord = coord[:target_size]
+                        mask = mask[:target_size]
+                    elif n_coord < target_size:
+                        # This shouldn't happen, but handle it gracefully
+                        pad_size = target_size - n_coord
+                        coord = F.pad(coord, (0, 0, 0, pad_size))
+                        mask = F.pad(mask, (0, pad_size), value=True)
                 
                 level_features.append(feat)
-                level_coords.append(all_coords[b])
-                level_masks.append(all_masks[b])
+                level_coords.append(coord)
+                level_masks.append(mask)
             
-            # Pad to same size
+            # Pad to same size within batch
             max_points = max(f.shape[0] for f in level_features)
             padded_features = []
             padded_coords = []
@@ -335,28 +258,80 @@ class EfficientDGCNNBackbone(nn.Module):
             valid_mask = ~ms_masks[-1][b]
             valid_features = sem_features[b][valid_mask]
             
-            # Process semantic predictions in chunks if needed
-            if valid_features.shape[0] > 50000:
-                sem_chunks = []
-                for i in range(0, valid_features.shape[0], 50000):
-                    chunk = valid_features[i:i+50000]
-                    sem_chunks.append(self.sem_head(chunk))
-                sem_logit = torch.cat(sem_chunks, dim=0)
-            else:
+            if valid_features.shape[0] > 0:
+                # Ensure float32 for semantic head
+                valid_features = valid_features.to(self.dtype)
                 sem_logit = self.sem_head(valid_features)
+            else:
+                sem_logit = torch.zeros(0, 20, device=sem_features.device, dtype=self.dtype)
             
-            # Pad back
+            # Pad back to full size
             if valid_mask.sum() < sem_features.shape[1]:
-                full_logit = torch.zeros(sem_features.shape[1], 20).cuda()
-                full_logit[valid_mask] = sem_logit
+                full_logit = torch.zeros(sem_features.shape[1], 20, device=sem_features.device, dtype=self.dtype)
+                if valid_features.shape[0] > 0:
+                    full_logit[valid_mask] = sem_logit
                 sem_logit = full_logit
             
             sem_logits.append(sem_logit)
         
         sem_logits = torch.stack(sem_logits)
         
-        # Clear intermediate tensors
-        del all_features
-        torch.cuda.empty_cache()
-        
         return ms_features, ms_coords, ms_masks, sem_logits
+    
+    def process_single_cloud(self, coords, feats):
+        """Process a single point cloud and return multi-scale features"""
+        # Get number of points
+        n_points = coords.shape[0]
+        
+        # Combine coordinates and features
+        x_in = torch.cat([coords, feats[:, 3:]], dim=1).transpose(0, 1).unsqueeze(0)
+        
+        # Ensure float32
+        x_in = x_in.to(self.dtype)
+        
+        # DGCNN forward with efficient memory usage
+        with torch.cuda.amp.autocast(enabled=False):  # Disable autocast to prevent half precision
+            x1 = self.conv1(x_in)
+            x2 = self.conv2(x1)
+            x3 = self.conv3(x2)
+            x4 = self.conv4(x3)
+            
+            # Concatenate all edge conv outputs
+            x = torch.cat((x1, x2, x3, x4), dim=1)
+            x = self.conv5(x)
+            
+            # Global max pooling
+            x_global = F.adaptive_max_pool1d(x, 1)
+            x_global = x_global.expand(-1, -1, n_points)
+            
+            # Concatenate with global features
+            x = torch.cat((x, x_global), dim=1)
+        
+        # Generate features at each scale
+        features = []
+        for feat_layer, bn_layer in zip(self.feat_layers, self.out_bn):
+            # Apply layer and batch norm
+            feat = feat_layer(x)  # [1, C, N]
+            feat = bn_layer(feat)
+            feat = feat.squeeze(0).transpose(0, 1)  # [N, C]
+            
+            # Ensure correct size
+            if feat.shape[0] != n_points:
+                # This shouldn't happen, but handle it gracefully
+                if feat.shape[0] > n_points:
+                    feat = feat[:n_points]
+                else:
+                    pad_size = n_points - feat.shape[0]
+                    feat = F.pad(feat, (0, 0, 0, pad_size))
+            
+            features.append(feat)
+        
+        return features
+    
+    def to(self, *args, **kwargs):
+        """Override to ensure float32 is maintained"""
+        super().to(*args, **kwargs)
+        # Force float32 for all parameters
+        if len(args) > 0 and args[0] == torch.float16:
+            return super().to(torch.float32)
+        return self

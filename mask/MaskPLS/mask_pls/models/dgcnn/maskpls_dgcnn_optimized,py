@@ -1,4 +1,4 @@
-# mask_pls/models/mask_dgcnn_optimized.py
+# mask_pls/models/dgcnn/maskpls_dgcnn_optimized.py
 """
 Optimized MaskPLS with DGCNN backbone
 Fixes mixed precision and target dimension issues
@@ -10,7 +10,7 @@ import torch.nn.functional as F
 import numpy as np
 from pytorch_lightning.core.lightning import LightningModule
 
-from mask_pls.models.dgcnn_backbone_efficient import EfficientDGCNNBackbone
+from mask_pls.models.dgcnn.dgcnn_backbone_efficient import EfficientDGCNNBackbone
 from mask_pls.models.decoder import MaskedTransformerDecoder
 from mask_pls.models.loss import MaskLoss, SemLoss
 from mask_pls.utils.evaluate_panoptic import PanopticEvaluator
@@ -58,14 +58,9 @@ class MaskPLSDGCNNOptimized(LightningModule):
         self.use_amp = cfg.TRAIN.get('MIXED_PRECISION', False)
     
     def forward(self, x):
-        # Forward pass with optional mixed precision
-        if self.use_amp and self.training:
-            with torch.cuda.amp.autocast():
-                feats, coords, pad_masks, sem_logits = self.backbone(x)
-                outputs, padding = self.decoder(feats, coords, pad_masks)
-        else:
-            feats, coords, pad_masks, sem_logits = self.backbone(x)
-            outputs, padding = self.decoder(feats, coords, pad_masks)
+        # Forward pass without mixed precision for stability
+        feats, coords, pad_masks, sem_logits = self.backbone(x)
+        outputs, padding = self.decoder(feats, coords, pad_masks)
         
         return outputs, padding, sem_logits
     

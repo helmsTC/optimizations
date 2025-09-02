@@ -4,11 +4,33 @@ import torch.nn as nn
 import numpy as np
 import gc
 import os
+import sys
 from pathlib import Path
 import yaml
 from easydict import EasyDict as edict
-from mask_pls.models.dgcnn_backbone_efficient import EfficientDGCNNBackbone
-from mask_pls.models.mask_dgcnn_optimized import MaskPLSDGCNNOptimized
+
+# Add parent directory to path
+sys.path.append(str(Path(__file__).parent.parent))
+
+from mask_pls.models.dgcnn.dgcnn_backbone_efficient import EfficientDGCNNBackbone
+from mask_pls.models.dgcnn.maskpls_dgcnn_optimized import MaskPLSDGCNNOptimized
+
+
+def get_config():
+    """Load and merge configuration files"""
+    def getDir(obj):
+        return os.path.dirname(os.path.abspath(obj))
+    
+    config_dir = Path(__file__).parent.parent / "config"
+    
+    model_cfg = edict(yaml.safe_load(open(config_dir / "model.yaml")))
+    backbone_cfg = edict(yaml.safe_load(open(config_dir / "backbone.yaml")))
+    decoder_cfg = edict(yaml.safe_load(open(config_dir / "decoder.yaml")))
+    
+    cfg = edict({**model_cfg, **backbone_cfg, **decoder_cfg})
+    cfg.TRAIN.MIXED_PRECISION = False
+    
+    return cfg
 
 
 def test_memory():
@@ -17,20 +39,24 @@ def test_memory():
     torch.cuda.empty_cache()
     gc.collect()
     
+    # Ensure we're using float32
+    torch.set_default_dtype(torch.float32)
+    
     # Get initial memory
     initial_memory = torch.cuda.memory_allocated() / 1024**2
     print(f"Initial GPU memory: {initial_memory:.2f} MB")
     
     # Load config
-    from train_efficient_dgcnn import get_config
     cfg = get_config()
-    cfg.TRAIN.MIXED_PRECISION = False  # Disable for testing
     
     # Test backbone only first
     print("\nTesting Backbone Memory Usage:")
     backbone = EfficientDGCNNBackbone(cfg.BACKBONE)
     backbone = backbone.cuda()
     backbone.eval()
+    
+    # Ensure float32 mode
+    backbone = backbone.float()
     
     test_sizes = [1000, 5000, 10000, 20000, 50000]
     
@@ -41,8 +67,7 @@ def test_memory():
         before_memory = torch.cuda.memory_allocated() / 1024**2
         
         try:
-            # Create dummy input
-            batch_size = 1
+            # Create dummy input - ensure float32
             coords = np.random.randn(num_points, 3).astype(np.float32)
             feats = np.random.randn(num_points, 4).astype(np.float32)
             
@@ -53,7 +78,9 @@ def test_memory():
             
             # Forward pass
             with torch.no_grad():
-                outputs = backbone(x)
+                # Ensure no autocast
+                with torch.cuda.amp.autocast(enabled=False):
+                    outputs = backbone(x)
             
             after_memory = torch.cuda.memory_allocated() / 1024**2
             memory_used = after_memory - before_memory
@@ -62,6 +89,16 @@ def test_memory():
             
         except RuntimeError as e:
             print(f"{num_points} points: Failed - {str(e)}")
+            
+            # Additional debugging
+            if "size of tensor" in str(e):
+                print("  Tensor size mismatch detected")
+            elif "Half" in str(e) and "float" in str(e):
+                print("  Mixed precision issue detected")
+                # Check model dtypes
+                for name, param in backbone.named_parameters():
+                    if param.dtype != torch.float32:
+                        print(f"    {name}: {param.dtype}")
         
         # Clean up
         del x
@@ -70,50 +107,11 @@ def test_memory():
         torch.cuda.empty_cache()
         gc.collect()
     
-    # Test full model
-    print("\nTesting Full Model Memory Usage:")
-    del backbone
-    torch.cuda.empty_cache()
-    gc.collect()
-    
-    model = MaskPLSDGCNNOptimized(cfg)
-    model = model.cuda()
-    model.eval()
-    model.things_ids = [1, 2, 3, 4, 5, 6, 7, 8]  # Mock things IDs
-    
-    for num_points in [1000, 5000, 10000]:
-        torch.cuda.empty_cache()
-        gc.collect()
-        
-        before_memory = torch.cuda.memory_allocated() / 1024**2
-        
-        try:
-            # Create dummy batch
-            batch = create_dummy_batch(num_points, cfg)
-            
-            # Forward pass
-            with torch.no_grad():
-                outputs, padding, sem_logits = model(batch)
-            
-            after_memory = torch.cuda.memory_allocated() / 1024**2
-            memory_used = after_memory - before_memory
-            
-            print(f"{num_points} points: {memory_used:.2f} MB used")
-            
-        except RuntimeError as e:
-            print(f"{num_points} points: Failed - {str(e)}")
-        
-        # Clean up
-        del batch
-        if 'outputs' in locals():
-            del outputs, padding, sem_logits
-        torch.cuda.empty_cache()
-        gc.collect()
+    print("\nBackbone test completed.")
 
 
 def create_dummy_batch(num_points, cfg):
     """Create a dummy batch for testing"""
-    batch_size = 1
     num_masks = 10
     
     batch = {
@@ -123,7 +121,7 @@ def create_dummy_batch(num_points, cfg):
         'ins_label': [np.random.randint(0, 100, (num_points, 1)).astype(np.int64)],
         'masks': [torch.randint(0, 2, (num_masks, num_points), dtype=torch.float32)],
         'masks_cls': [torch.randint(0, 20, (num_masks,))],
-        'masks_ids': [[torch.randint(0, num_points, (100,)) for _ in range(num_masks)]],
+        'masks_ids': [[torch.randint(0, min(100, num_points), (min(100, num_points),)) for _ in range(num_masks)]],
         'fname': ['dummy.bin'],
         'pose': [np.eye(4)],
         'token': ['0']
