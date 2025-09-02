@@ -61,64 +61,79 @@ class MaskPLSDGCNN(LightningModule):
         
         return outputs, padding, sem_logits
     
-    def get_losses(self, x, outputs, padding, sem_logits):
-        """Compute all losses"""
-        # Mask losses
-        targets = {'classes': x['masks_cls'], 'masks': x['masks']}
-        loss_mask = self.mask_loss(outputs, targets, x['masks_ids'], x['pt_coord'])
+def get_losses(self, x, outputs, padding, sem_logits):
+    """Compute all losses"""
+    # Mask losses
+    targets = {'classes': x['masks_cls'], 'masks': x['masks']}
+    loss_mask = self.mask_loss(outputs, targets, x['masks_ids'], x['pt_coord'])
+    
+    # Semantic losses with proper shape handling
+    sem_labels = []
+    batch_size = len(x['sem_label'])
+    
+    for i in range(batch_size):
+        labels = x['sem_label'][i]
+        if isinstance(labels, np.ndarray):
+            labels = torch.from_numpy(labels).long().cuda()
         
-        # Semantic losses with proper shape handling
-        sem_labels = []
-        batch_size = len(x['sem_label'])
-        
-        for i in range(batch_size):
-            labels = x['sem_label'][i]
-            if isinstance(labels, np.ndarray):
-                labels = torch.from_numpy(labels).long().cuda()
-            
-            # Handle label shape
-            if labels.dim() == 2 and labels.shape[1] == 1:
-                labels = labels.squeeze(1)
-            elif labels.dim() > 1:
-                labels = labels.reshape(-1)
-            
-            # Get valid mask for this sample
-            valid_mask = ~padding[i]
-            
-            # Apply valid mask
-            if valid_mask.sum() > 0:
-                # Ensure indices are within bounds
-                min_len = min(labels.shape[0], valid_mask.shape[0])
-                valid_labels = labels[:min_len][valid_mask[:min_len]]
-                sem_labels.append(valid_labels)
-        
-        if sem_labels:
-            sem_labels = torch.cat(sem_labels)
-            
-            # Get valid semantic logits
-            sem_logits_valid = []
-            for i in range(batch_size):
-                valid_mask = ~padding[i]
-                if valid_mask.sum() > 0:
-                    sem_logits_valid.append(sem_logits[i][valid_mask])
-            
-            if sem_logits_valid:
-                sem_logits_valid = torch.cat(sem_logits_valid, dim=0)
-                
-                # Ensure correct dimensions
-                assert sem_labels.dim() == 1, f"sem_labels should be 1D, got {sem_labels.shape}"
-                assert sem_logits_valid.dim() == 2, f"sem_logits_valid should be 2D, got {sem_logits_valid.shape}"
-                
-                loss_sem = self.sem_loss(sem_logits_valid, sem_labels)
+        # CRITICAL FIX: Ensure labels are 1D
+        # The dataset returns labels as [N, 1], we need [N]
+        while labels.dim() > 1:
+            # If shape is [N, 1], squeeze the last dimension
+            if labels.shape[-1] == 1:
+                labels = labels.squeeze(-1)
             else:
-                loss_sem = {'sem_ce': torch.tensor(0.0).cuda(), 
-                           'sem_lov': torch.tensor(0.0).cuda()}
+                # If it's some other multi-dimensional shape, flatten it
+                labels = labels.reshape(-1)
+        
+        # Get valid mask for this sample
+        valid_mask = ~padding[i]
+        
+        # Apply valid mask
+        if valid_mask.sum() > 0:
+            # Ensure indices are within bounds
+            min_len = min(labels.shape[0], valid_mask.shape[0])
+            valid_labels = labels[:min_len][valid_mask[:min_len]]
+            sem_labels.append(valid_labels)
+    
+    if sem_labels:
+        sem_labels = torch.cat(sem_labels)
+        
+        # Ensure sem_labels is 1D
+        if sem_labels.dim() != 1:
+            print(f"WARNING: sem_labels has shape {sem_labels.shape}, expected 1D")
+            sem_labels = sem_labels.reshape(-1)
+        
+        # Get valid semantic logits
+        sem_logits_valid = []
+        for i in range(batch_size):
+            valid_mask = ~padding[i]
+            if valid_mask.sum() > 0:
+                sem_logits_valid.append(sem_logits[i][valid_mask])
+        
+        if sem_logits_valid:
+            sem_logits_valid = torch.cat(sem_logits_valid, dim=0)
+            
+            # Ensure sem_logits_valid is 2D [N, num_classes]
+            if sem_logits_valid.dim() != 2:
+                print(f"WARNING: sem_logits_valid has shape {sem_logits_valid.shape}, expected 2D")
+            
+            # Final shape assertions before loss computation
+            assert sem_labels.dim() == 1, f"sem_labels must be 1D, got shape {sem_labels.shape}"
+            assert sem_logits_valid.dim() == 2, f"sem_logits_valid must be 2D, got shape {sem_logits_valid.shape}"
+            assert sem_labels.shape[0] == sem_logits_valid.shape[0], \
+                f"Batch size mismatch: labels {sem_labels.shape[0]} vs logits {sem_logits_valid.shape[0]}"
+            
+            loss_sem = self.sem_loss(sem_logits_valid, sem_labels)
         else:
             loss_sem = {'sem_ce': torch.tensor(0.0).cuda(), 
                        'sem_lov': torch.tensor(0.0).cuda()}
-        
-        loss_mask.update(loss_sem)
-        return loss_mask
+    else:
+        loss_sem = {'sem_ce': torch.tensor(0.0).cuda(), 
+                   'sem_lov': torch.tensor(0.0).cuda()}
+    
+    loss_mask.update(loss_sem)
+    return loss_mask
     
     def training_step(self, batch, batch_idx):
         outputs, padding, sem_logits = self(batch)
