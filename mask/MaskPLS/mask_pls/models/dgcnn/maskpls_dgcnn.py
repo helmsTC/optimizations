@@ -1,3 +1,4 @@
+# mask_pls/models/dgcnn/maskpls_dgcnn.py
 """
 MaskPLS with DGCNN backbone for ONNX-compatible panoptic segmentation
 """
@@ -6,7 +7,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-from pytorch_lightning.core.lightning import LightningModule
+
+# Fix the import - use the correct module
+try:
+    from pytorch_lightning import LightningModule
+except ImportError:
+    from lightning.pytorch import LightningModule
 
 from mask_pls.models.dgcnn.dgcnn_backbone import DGCNNPretrainedBackbone
 from mask_pls.models.decoder import MaskedTransformerDecoder
@@ -14,12 +20,12 @@ from mask_pls.models.loss import MaskLoss, SemLoss
 from mask_pls.utils.evaluate_panoptic import PanopticEvaluator
 
 
-class MaskPLSDGCNN(LightningModule):
+class MaskPLSDGCNN(LightningModule):  # Make sure it inherits from LightningModule
     """
     MaskPLS model with DGCNN backbone
     """
     def __init__(self, cfg):
-        super().__init__()
+        super(MaskPLSDGCNN, self).__init__()  # Explicit super call
         self.save_hyperparameters(dict(cfg))
         self.cfg = cfg
         
@@ -61,81 +67,70 @@ class MaskPLSDGCNN(LightningModule):
         
         return outputs, padding, sem_logits
     
-def get_losses(self, x, outputs, padding, sem_logits):
-    """Compute all losses"""
-    # Mask losses
-    targets = {'classes': x['masks_cls'], 'masks': x['masks']}
-    loss_mask = self.mask_loss(outputs, targets, x['masks_ids'], x['pt_coord'])
-    
-    # Semantic losses with proper shape handling
-    sem_labels = []
-    batch_size = len(x['sem_label'])
-    
-    for i in range(batch_size):
-        labels = x['sem_label'][i]
-        if isinstance(labels, np.ndarray):
-            labels = torch.from_numpy(labels).long().cuda()
+    def get_losses(self, x, outputs, padding, sem_logits):
+        """Compute all losses"""
+        # Mask losses
+        targets = {'classes': x['masks_cls'], 'masks': x['masks']}
+        loss_mask = self.mask_loss(outputs, targets, x['masks_ids'], x['pt_coord'])
         
-        # CRITICAL FIX: Ensure labels are 1D
-        # The dataset returns labels as [N, 1], we need [N]
-        while labels.dim() > 1:
-            # If shape is [N, 1], squeeze the last dimension
-            if labels.shape[-1] == 1:
-                labels = labels.squeeze(-1)
-            else:
-                # If it's some other multi-dimensional shape, flatten it
-                labels = labels.reshape(-1)
+        # Semantic losses with proper shape handling
+        sem_labels = []
+        batch_size = len(x['sem_label'])
         
-        # Get valid mask for this sample
-        valid_mask = ~padding[i]
-        
-        # Apply valid mask
-        if valid_mask.sum() > 0:
-            # Ensure indices are within bounds
-            min_len = min(labels.shape[0], valid_mask.shape[0])
-            valid_labels = labels[:min_len][valid_mask[:min_len]]
-            sem_labels.append(valid_labels)
-    
-    if sem_labels:
-        sem_labels = torch.cat(sem_labels)
-        
-        # Ensure sem_labels is 1D
-        if sem_labels.dim() != 1:
-            print(f"WARNING: sem_labels has shape {sem_labels.shape}, expected 1D")
-            sem_labels = sem_labels.reshape(-1)
-        
-        # Get valid semantic logits
-        sem_logits_valid = []
         for i in range(batch_size):
+            labels = x['sem_label'][i]
+            if isinstance(labels, np.ndarray):
+                labels = torch.from_numpy(labels).long().cuda()
+            
+            # CRITICAL FIX: Ensure labels are 1D
+            while labels.dim() > 1:
+                if labels.shape[-1] == 1:
+                    labels = labels.squeeze(-1)
+                else:
+                    labels = labels.reshape(-1)
+            
+            # Get valid mask for this sample
             valid_mask = ~padding[i]
+            
+            # Apply valid mask
             if valid_mask.sum() > 0:
-                sem_logits_valid.append(sem_logits[i][valid_mask])
+                min_len = min(labels.shape[0], valid_mask.shape[0])
+                valid_labels = labels[:min_len][valid_mask[:min_len]]
+                sem_labels.append(valid_labels)
         
-        if sem_logits_valid:
-            sem_logits_valid = torch.cat(sem_logits_valid, dim=0)
+        if sem_labels:
+            sem_labels = torch.cat(sem_labels)
             
-            # Ensure sem_logits_valid is 2D [N, num_classes]
-            if sem_logits_valid.dim() != 2:
-                print(f"WARNING: sem_logits_valid has shape {sem_logits_valid.shape}, expected 2D")
+            # Ensure sem_labels is 1D
+            if sem_labels.dim() != 1:
+                sem_labels = sem_labels.reshape(-1)
             
-            # Final shape assertions before loss computation
-            assert sem_labels.dim() == 1, f"sem_labels must be 1D, got shape {sem_labels.shape}"
-            assert sem_logits_valid.dim() == 2, f"sem_logits_valid must be 2D, got shape {sem_logits_valid.shape}"
-            assert sem_labels.shape[0] == sem_logits_valid.shape[0], \
-                f"Batch size mismatch: labels {sem_labels.shape[0]} vs logits {sem_logits_valid.shape[0]}"
+            # Get valid semantic logits
+            sem_logits_valid = []
+            for i in range(batch_size):
+                valid_mask = ~padding[i]
+                if valid_mask.sum() > 0:
+                    sem_logits_valid.append(sem_logits[i][valid_mask])
             
-            loss_sem = self.sem_loss(sem_logits_valid, sem_labels)
+            if sem_logits_valid:
+                sem_logits_valid = torch.cat(sem_logits_valid, dim=0)
+                
+                assert sem_labels.dim() == 1, f"sem_labels must be 1D, got shape {sem_labels.shape}"
+                assert sem_logits_valid.dim() == 2, f"sem_logits_valid must be 2D, got shape {sem_logits_valid.shape}"
+                
+                loss_sem = self.sem_loss(sem_logits_valid, sem_labels)
+            else:
+                loss_sem = {'sem_ce': torch.tensor(0.0).cuda(), 
+                           'sem_lov': torch.tensor(0.0).cuda()}
         else:
             loss_sem = {'sem_ce': torch.tensor(0.0).cuda(), 
                        'sem_lov': torch.tensor(0.0).cuda()}
-    else:
-        loss_sem = {'sem_ce': torch.tensor(0.0).cuda(), 
-                   'sem_lov': torch.tensor(0.0).cuda()}
-    
-    loss_mask.update(loss_sem)
-    return loss_mask
+        
+        loss_mask.update(loss_sem)
+        return loss_mask
     
     def training_step(self, batch, batch_idx):
+        """Training step - required by Lightning"""
         outputs, padding, sem_logits = self(batch)
         losses = self.get_losses(batch, outputs, padding, sem_logits)
         
@@ -147,12 +142,13 @@ def get_losses(self, x, outputs, padding, sem_logits):
         total_loss = sum(losses.values())
         self.log('train_loss', total_loss, batch_size=self.cfg.TRAIN.BATCH_SIZE)
         
-        # Learning rate warmup
+        # Update step counter
         self.current_step += 1
         
         return total_loss
     
     def validation_step(self, batch, batch_idx):
+        """Validation step"""
         outputs, padding, sem_logits = self(batch)
         losses = self.get_losses(batch, outputs, padding, sem_logits)
         
@@ -171,6 +167,7 @@ def get_losses(self, x, outputs, padding, sem_logits):
         return total_loss
     
     def on_validation_epoch_end(self):
+        """Called at the end of validation epoch"""
         # Compute metrics
         pq = self.evaluator.get_mean_pq()
         iou = self.evaluator.get_mean_iou()
@@ -187,6 +184,7 @@ def get_losses(self, x, outputs, padding, sem_logits):
         self.validation_step_outputs.clear()
     
     def configure_optimizers(self):
+        """Configure optimizers - required by Lightning"""
         # Separate parameters for backbone and decoder
         backbone_params = []
         decoder_params = []
@@ -214,12 +212,15 @@ def get_losses(self, x, outputs, padding, sem_logits):
         return [optimizer], [scheduler]
     
     def optimizer_step(self, *args, **kwargs):
+        """Custom optimizer step for warmup"""
         # Learning rate warmup
         if self.current_step < self.warmup_steps:
             lr_scale = min(1.0, float(self.current_step) / float(self.warmup_steps))
             for pg in self.optimizers().param_groups:
-                pg['lr'] = lr_scale * self.cfg.TRAIN.LR
+                if 'lr' in pg:
+                    pg['lr'] = lr_scale * self.cfg.TRAIN.LR
         
+        # Call parent optimizer_step
         super().optimizer_step(*args, **kwargs)
     
     def panoptic_inference(self, outputs, padding):

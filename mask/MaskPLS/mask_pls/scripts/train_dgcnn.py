@@ -12,10 +12,17 @@ import yaml
 import numpy as np
 from pathlib import Path
 from easydict import EasyDict as edict
-from pytorch_lightning import Trainer
-from pytorch_lightning import loggers as pl_loggers
-from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint, EarlyStopping
-from pytorch_lightning.strategies import DDPStrategy
+try:
+    from pytorch_lightning import Trainer
+    from pytorch_lightning import loggers as pl_loggers
+    from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint, EarlyStopping
+    from pytorch_lightning.strategies import DDPStrategy
+except ImportError:
+    # For newer versions of PyTorch Lightning
+    from lightning.pytorch import Trainer
+    from lightning.pytorch import loggers as pl_loggers
+    from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint, EarlyStopping
+    from lightning.pytorch.strategies import DDPStrategy
 
 from mask_pls.datasets.semantic_dataset import SemanticDatasetModule
 from mask_pls.models.dgcnn.maskpls_dgcnn import MaskPLSDGCNN
