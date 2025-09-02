@@ -1,7 +1,6 @@
-# Save this as: mask/MaskPLS/mask_pls/scripts/train_dgcnn_optimized.py
+# mask_pls/scripts/train_efficient_dgcnn.py
 """
-Optimized training script for MaskPLS with DGCNN backbone
-Prevents OOM errors during validation
+Training script for efficient DGCNN-based MaskPLS
 """
 
 import os
@@ -11,7 +10,6 @@ from os.path import join
 import click
 import torch
 import yaml
-import numpy as np
 from pathlib import Path
 from easydict import EasyDict as edict
 from pytorch_lightning import Trainer
@@ -20,7 +18,7 @@ from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint, Ea
 from pytorch_lightning.strategies import DDPStrategy
 
 from mask_pls.datasets.semantic_dataset import SemanticDatasetModule
-from mask_pls.models.dgcnn.maskpls_dgcnn_optimized import MaskPLSDGCNNOptimized
+from mask_pls.models.mask_dgcnn_optimized import MaskPLSDGCNNOptimized
 
 
 def get_config():
@@ -32,87 +30,75 @@ def get_config():
     backbone_cfg = edict(yaml.safe_load(open(join(getDir(__file__), "../config/backbone.yaml"))))
     decoder_cfg = edict(yaml.safe_load(open(join(getDir(__file__), "../config/decoder.yaml"))))
     
-    # DGCNN-specific configuration with memory optimizations
+    # Efficient DGCNN configuration
     dgcnn_cfg = edict({
-        'CHUNK_SIZE': 10000,  # Process points in chunks
-        'VAL_BATCH_SIZE': 1,  # Validation batch size
         'TRAIN': {
             'WARMUP_STEPS': 1000,
             'GRADIENT_CLIP': 1.0,
-            'MIXED_PRECISION': True,
-            'SUBSAMPLE': True,  # Enable subsampling
-            'AUG': True,  # Enable augmentation
-            'VAL_CHECK_INTERVAL': 0.5,  # Check validation every half epoch
-            'ACCUMULATE_GRAD_BATCHES': 4,  # Gradient accumulation
+            'MIXED_PRECISION': False,  # Disabled for now
+            'ACCUMULATE_GRAD_BATCHES': 4,
         }
     })
     
     cfg = edict({**model_cfg, **backbone_cfg, **decoder_cfg, **dgcnn_cfg})
+    
+    # Override some settings for efficiency
+    cfg.TRAIN.BATCH_SIZE = 2  # Smaller batch size for memory
+    cfg.TRAIN.SUBSAMPLE = True
+    cfg.TRAIN.AUG = True
+    
     return cfg
 
 
 @click.command()
-@click.option("--config", type=str, default=None, help="Custom config file")
 @click.option("--checkpoint", type=str, default=None, help="Resume from checkpoint")
 @click.option("--epochs", type=int, default=100)
-@click.option("--batch_size", type=int, default=1)
-@click.option("--val_batch_size", type=int, default=1)
-@click.option("--lr", type=float, default=0.0005)
+@click.option("--batch_size", type=int, default=2)
+@click.option("--lr", type=float, default=0.001)
 @click.option("--gpus", type=int, default=1)
 @click.option("--num_workers", type=int, default=4)
 @click.option("--nuscenes", is_flag=True)
-@click.option("--experiment_name", type=str, default="maskpls_dgcnn_optimized")
-@click.option("--chunk_size", type=int, default=10000, help="Point cloud chunk size")
-@click.option("--subsample_points", type=int, default=50000, help="Subsample points during training")
-def main(config, checkpoint, epochs, batch_size, val_batch_size, lr, gpus, 
-         num_workers, nuscenes, experiment_name, chunk_size, subsample_points):
-    """Train MaskPLS with optimized DGCNN backbone"""
+@click.option("--experiment_name", type=str, default="maskpls_dgcnn_efficient")
+@click.option("--mixed_precision", is_flag=True, help="Use mixed precision training")
+def main(checkpoint, epochs, batch_size, lr, gpus, num_workers, 
+         nuscenes, experiment_name, mixed_precision):
+    """Train efficient MaskPLS with DGCNN backbone"""
     
     print("="*60)
-    print("MaskPLS Training with Optimized DGCNN Backbone")
+    print("MaskPLS Training with Efficient DGCNN Backbone")
     print("="*60)
     
     # Load configuration
     cfg = get_config()
     
-    if config:
-        custom_cfg = edict(yaml.safe_load(open(config)))
-        cfg.update(custom_cfg)
-    
     # Update configuration
     cfg.TRAIN.MAX_EPOCH = epochs
     cfg.TRAIN.BATCH_SIZE = batch_size
-    cfg.VAL_BATCH_SIZE = val_batch_size
     cfg.TRAIN.LR = lr
     cfg.TRAIN.N_GPUS = gpus
     cfg.TRAIN.NUM_WORKERS = num_workers
+    cfg.TRAIN.MIXED_PRECISION = mixed_precision
     cfg.EXPERIMENT.ID = experiment_name
-    cfg.CHUNK_SIZE = chunk_size
     
-    # Update subsampling for memory efficiency
     if nuscenes:
         cfg.MODEL.DATASET = "NUSCENES"
-        cfg.NUSCENES.SUB_NUM_POINTS = subsample_points
-    else:
-        cfg.KITTI.SUB_NUM_POINTS = subsample_points
     
     dataset = cfg.MODEL.DATASET
     
     print(f"Configuration:")
     print(f"  Dataset: {dataset}")
     print(f"  Batch Size: {batch_size}")
-    print(f"  Val Batch Size: {val_batch_size}")
     print(f"  Learning Rate: {lr}")
     print(f"  Epochs: {epochs}")
-    print(f"  Chunk Size: {chunk_size}")
-    print(f"  Subsample Points: {subsample_points}")
-    print(f"  Mixed Precision: {cfg.TRAIN.MIXED_PRECISION}")
+    print(f"  Mixed Precision: {mixed_precision}")
+    print(f"  GPUs: {gpus}")
+    print(f"  Workers: {num_workers}")
     
     # Create data module
     data = SemanticDatasetModule(cfg)
     data.setup()
     
-    # Set things_ids in model
+    # Create model
     model = MaskPLSDGCNNOptimized(cfg)
     model.things_ids = data.things_ids
     
@@ -142,7 +128,7 @@ def main(config, checkpoint, epochs, batch_size, val_batch_size, lr, gpus,
         ),
         
         ModelCheckpoint(
-            monitor="metrics/iou", 
+            monitor="metrics/iou",
             filename=f"{experiment_name}_epoch{{epoch:02d}}_iou{{metrics/iou:.3f}}",
             auto_insert_metric_name=False,
             mode="max",
@@ -157,15 +143,9 @@ def main(config, checkpoint, epochs, batch_size, val_batch_size, lr, gpus,
     ]
     
     # Training strategy
-    if gpus > 1:
-        strategy = DDPStrategy(
-            find_unused_parameters=False,
-            gradient_as_bucket_view=True  # Memory optimization
-        )
-    else:
-        strategy = None
+    strategy = 'auto' if gpus <= 1 else DDPStrategy(find_unused_parameters=False)
     
-    # Create trainer with memory optimizations
+    # Create trainer
     trainer = Trainer(
         devices=gpus,
         accelerator="gpu" if gpus > 0 else "cpu",
@@ -175,28 +155,16 @@ def main(config, checkpoint, epochs, batch_size, val_batch_size, lr, gpus,
         callbacks=callbacks,
         log_every_n_steps=10,
         gradient_clip_val=cfg.TRAIN.get('GRADIENT_CLIP', 1.0),
-        accumulate_grad_batches=cfg.TRAIN.get('ACCUMULATE_GRAD_BATCHES', 4),
-        precision=16 if cfg.TRAIN.get('MIXED_PRECISION', True) else 32,
-        val_check_interval=cfg.TRAIN.get('VAL_CHECK_INTERVAL', 0.5),
+        accumulate_grad_batches=cfg.TRAIN.get('ACCUMULATE_GRAD_BATCHES', 1),
+        precision=16 if mixed_precision else 32,  # Use 16-bit if mixed precision enabled
+        check_val_every_n_epoch=2,
         num_sanity_val_steps=0,
-        detect_anomaly=False,
         benchmark=True,
-        sync_batchnorm=True if gpus > 1 else False,
-        # Memory optimizations
-        enable_checkpointing=True,
-        enable_model_summary=True,
-        limit_val_batches=20,  # Limit validation batches to prevent OOM
+        sync_batchnorm=True if gpus > 1 else False
     )
     
     # Train
     print("\nStarting training...")
-    print("Memory optimizations enabled:")
-    print("  - Chunked point cloud processing")
-    print("  - Validation sub-batching")
-    print("  - Limited validation batches")
-    print("  - Mixed precision training")
-    print("  - Gradient accumulation")
-    
     trainer.fit(model, data)
     
     print("\nTraining completed!")
