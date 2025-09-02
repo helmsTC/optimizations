@@ -296,9 +296,10 @@ class EfficientDGCNNBackbone(nn.Module):
             level_masks = []
             
             for b in range(batch_size):
-                # Extract features for this level
-                feat = feat_layer(all_features[b]).squeeze(0).transpose(0, 1)
-                feat = bn_layer(feat.transpose(0, 1)).transpose(0, 1)
+                # Extract features for this level - keep in [1, C, N] format
+                feat = feat_layer(all_features[b])  # [1, C, N]
+                feat = bn_layer(feat)  # Apply BatchNorm on [1, C, N]
+                feat = feat.squeeze(0).transpose(0, 1)  # Convert to [N, C] for storage
                 
                 level_features.append(feat)
                 level_coords.append(all_coords[b])
