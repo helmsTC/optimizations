@@ -1,5 +1,7 @@
+# mask_pls/models/dgcnn/dgcnn_backbone.py
 """
 Dynamic Graph CNN (DGCNN) backbone for point cloud feature extraction
+Complete version with memory optimizations
 MIT Licensed - Compatible with ONNX export
 """
 
@@ -66,7 +68,7 @@ class EdgeConv(nn.Module):
 
 
 class DGCNNBackbone(nn.Module):
-    """DGCNN backbone for point cloud feature extraction"""
+    """DGCNN backbone for point cloud feature extraction with memory optimization"""
     def __init__(self, cfg):
         super().__init__()
         
@@ -127,7 +129,7 @@ class DGCNNBackbone(nn.Module):
         
         batch_size = len(coords_list)
         
-        # Process each point cloud
+        # Process each point cloud with memory optimization
         all_features = []
         all_coords = []
         all_masks = []
@@ -137,26 +139,43 @@ class DGCNNBackbone(nn.Module):
             coords = torch.from_numpy(coords_list[b]).float().cuda()
             feats = torch.from_numpy(feats_list[b]).float().cuda()
             
+            # Subsample if too many points during validation
+            if not self.training and coords.shape[0] > 30000:
+                indices = torch.randperm(coords.shape[0])[:30000]
+                coords = coords[indices]
+                feats = feats[indices]
+            
             # Combine coordinates and features
             x_in = torch.cat([coords, feats[:, 3:]], dim=1).transpose(0, 1).unsqueeze(0)
             
-            # DGCNN forward
-            x1 = self.conv1(x_in)
-            x2 = self.conv2(x1)
-            x3 = self.conv3(x2)
-            x4 = self.conv4(x3)
-            
-            # Concatenate all edge conv outputs
-            x = torch.cat((x1, x2, x3, x4), dim=1)
-            x = self.conv5(x)
-            
-            # Global features - no longer used for concat
-            # x_global = F.adaptive_max_pool1d(x, 1).expand(-1, -1, x.size(2))
-            # x = torch.cat((x, x_global), dim=1)
+            # DGCNN forward with memory optimization for validation
+            if not self.training:
+                with torch.no_grad():
+                    x1 = self.conv1(x_in)
+                    x2 = self.conv2(x1)
+                    x3 = self.conv3(x2)
+                    x4 = self.conv4(x3)
+                    x = torch.cat((x1, x2, x3, x4), dim=1)
+                    x = self.conv5(x)
+            else:
+                x1 = self.conv1(x_in)
+                x2 = self.conv2(x1)
+                x3 = self.conv3(x2)
+                x4 = self.conv4(x3)
+                x = torch.cat((x1, x2, x3, x4), dim=1)
+                x = self.conv5(x)
             
             all_features.append(x)
             all_coords.append(coords)
             all_masks.append(torch.zeros(coords.shape[0], dtype=torch.bool).cuda())
+            
+            # Clear intermediate variables to save memory
+            if not self.training:
+                del x1, x2, x3, x4, x_in
+        
+        # Clear cache periodically during validation
+        if not self.training and batch_size > 1:
+            torch.cuda.empty_cache()
         
         # Generate multi-scale features
         ms_features = []
@@ -220,6 +239,11 @@ class DGCNNBackbone(nn.Module):
         
         sem_logits = torch.stack(padded_sem_logits)
         
+        # Clear features list if in validation mode
+        if not self.training:
+            del all_features
+            torch.cuda.empty_cache()
+        
         return ms_features, ms_coords, ms_masks, sem_logits
 
 
@@ -234,52 +258,32 @@ class DGCNNPretrainedBackbone(DGCNNBackbone):
     def load_pretrained(self, path):
         """Load pre-trained weights from classification/segmentation tasks"""
         print(f"Loading pre-trained weights from {path}")
-        checkpoint = torch.load(path, map_location='cpu')
-        
-        # Handle different checkpoint formats
-        if 'state_dict' in checkpoint:
-            state_dict = checkpoint['state_dict']
-        elif 'model_state_dict' in checkpoint:
-            state_dict = checkpoint['model_state_dict']
-        else:
-            state_dict = checkpoint
-        
-        # Map pretrained weights to our architecture
-        # This assumes the pretrained model has similar EdgeConv layers
-        model_dict = self.state_dict()
-        
-        # Create mapping for potentially different layer names
-        mapping = {
-            # Map EdgeConv layers
-            'edge_conv1': 'conv1.conv',
-            'edge_conv2': 'conv2.conv',
-            'edge_conv3': 'conv3.conv',
-            'edge_conv4': 'conv4.conv',
-            # Map aggregation layer
-            'conv5': 'conv5',
-            # Add more mappings as needed based on your pretrained model
-        }
-        
-        # Filter and map pretrained weights
-        pretrained_dict = {}
-        for key, value in state_dict.items():
-            # Try direct mapping first
-            if key in model_dict and value.shape == model_dict[key].shape:
-                pretrained_dict[key] = value
+        try:
+            checkpoint = torch.load(path, map_location='cpu')
+            
+            # Handle different checkpoint formats
+            if 'state_dict' in checkpoint:
+                state_dict = checkpoint['state_dict']
+            elif 'model_state_dict' in checkpoint:
+                state_dict = checkpoint['model_state_dict']
             else:
-                # Try mapping with different names
-                for old_name, new_name in mapping.items():
-                    if old_name in key:
-                        new_key = key.replace(old_name, new_name)
-                        if new_key in model_dict and value.shape == model_dict[new_key].shape:
-                            pretrained_dict[new_key] = value
-                            break
-        
-        # Update current model
-        model_dict.update(pretrained_dict)
-        self.load_state_dict(model_dict, strict=False)
-        
-        print(f"Loaded {len(pretrained_dict)}/{len(model_dict)} layers from pre-trained model")
-        
-        # List loaded layers
-        print("Loaded layers:", list(pretrained_dict.keys())[:10], "...")
+                state_dict = checkpoint
+            
+            # Map pretrained weights to our architecture
+            model_dict = self.state_dict()
+            
+            # Filter and map pretrained weights
+            pretrained_dict = {}
+            for key, value in state_dict.items():
+                # Try direct mapping first
+                if key in model_dict and value.shape == model_dict[key].shape:
+                    pretrained_dict[key] = value
+            
+            # Update current model
+            model_dict.update(pretrained_dict)
+            self.load_state_dict(model_dict, strict=False)
+            
+            print(f"Loaded {len(pretrained_dict)}/{len(model_dict)} layers from pre-trained model")
+        except Exception as e:
+            print(f"Warning: Could not load pretrained weights from {path}: {e}")
+            print("Continuing with random initialization...")

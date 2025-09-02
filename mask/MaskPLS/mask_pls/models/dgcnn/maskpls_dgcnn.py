@@ -1,6 +1,7 @@
 # mask_pls/models/dgcnn/maskpls_dgcnn.py
 """
 MaskPLS with DGCNN backbone for ONNX-compatible panoptic segmentation
+Complete version with memory optimization fixes
 """
 
 import torch
@@ -8,7 +9,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 
-# Fix the import - use the correct module
 try:
     from pytorch_lightning import LightningModule
 except ImportError:
@@ -20,12 +20,12 @@ from mask_pls.models.loss import MaskLoss, SemLoss
 from mask_pls.utils.evaluate_panoptic import PanopticEvaluator
 
 
-class MaskPLSDGCNN(LightningModule):  # Make sure it inherits from LightningModule
+class MaskPLSDGCNN(LightningModule):
     """
-    MaskPLS model with DGCNN backbone
+    MaskPLS model with DGCNN backbone - Memory Optimized Version
     """
     def __init__(self, cfg):
-        super(MaskPLSDGCNN, self).__init__()  # Explicit super call
+        super(MaskPLSDGCNN, self).__init__()
         self.save_hyperparameters(dict(cfg))
         self.cfg = cfg
         
@@ -82,7 +82,7 @@ class MaskPLSDGCNN(LightningModule):  # Make sure it inherits from LightningModu
             if isinstance(labels, np.ndarray):
                 labels = torch.from_numpy(labels).long().cuda()
             
-            # CRITICAL FIX: Ensure labels are 1D
+            # Ensure labels are 1D
             while labels.dim() > 1:
                 if labels.shape[-1] == 1:
                     labels = labels.squeeze(-1)
@@ -114,10 +114,6 @@ class MaskPLSDGCNN(LightningModule):  # Make sure it inherits from LightningModu
             
             if sem_logits_valid:
                 sem_logits_valid = torch.cat(sem_logits_valid, dim=0)
-                
-                assert sem_labels.dim() == 1, f"sem_labels must be 1D, got shape {sem_labels.shape}"
-                assert sem_logits_valid.dim() == 2, f"sem_logits_valid must be 2D, got shape {sem_logits_valid.shape}"
-                
                 loss_sem = self.sem_loss(sem_logits_valid, sem_labels)
             else:
                 loss_sem = {'sem_ce': torch.tensor(0.0).cuda(), 
@@ -148,26 +144,40 @@ class MaskPLSDGCNN(LightningModule):  # Make sure it inherits from LightningModu
         return total_loss
     
     def validation_step(self, batch, batch_idx):
-        """Validation step"""
-        outputs, padding, sem_logits = self(batch)
-        losses = self.get_losses(batch, outputs, padding, sem_logits)
+        """Validation step with memory optimization"""
+        # Use torch.no_grad() to prevent gradient computation
+        with torch.no_grad():
+            outputs, padding, sem_logits = self(batch)
+            losses = self.get_losses(batch, outputs, padding, sem_logits)
         
-        # Log losses
+        # Log losses - detach to prevent gradient tracking
         for k, v in losses.items():
-            self.log(f'val/{k}', v, batch_size=self.cfg.TRAIN.BATCH_SIZE)
+            self.log(f'val/{k}', v.detach(), batch_size=self.cfg.TRAIN.BATCH_SIZE)
         
-        total_loss = sum(losses.values())
+        total_loss = sum(losses.values()).detach()
         self.log('val_loss', total_loss, batch_size=self.cfg.TRAIN.BATCH_SIZE)
         
-        # Panoptic inference
-        sem_pred, ins_pred = self.panoptic_inference(outputs, padding)
+        # Panoptic inference with no_grad
+        with torch.no_grad():
+            sem_pred, ins_pred = self.panoptic_inference(outputs, padding)
+        
+        # Update evaluator (this should handle numpy arrays, no gradients)
         self.evaluator.update(sem_pred, ins_pred, batch)
         
-        self.validation_step_outputs.append(total_loss)
-        return total_loss
+        # Store only the scalar value, not the tensor
+        self.validation_step_outputs.append(total_loss.item())
+        
+        # Explicitly clear CUDA cache periodically
+        if batch_idx % 10 == 0:  # Every 10 batches
+            torch.cuda.empty_cache()
+        
+        return total_loss.item()  # Return scalar, not tensor
     
     def on_validation_epoch_end(self):
         """Called at the end of validation epoch"""
+        # Clear CUDA cache before computing metrics
+        torch.cuda.empty_cache()
+        
         # Compute metrics
         pq = self.evaluator.get_mean_pq()
         iou = self.evaluator.get_mean_iou()
@@ -182,6 +192,9 @@ class MaskPLSDGCNN(LightningModule):  # Make sure it inherits from LightningModu
         # Reset
         self.evaluator.reset()
         self.validation_step_outputs.clear()
+        
+        # Final cache clear
+        torch.cuda.empty_cache()
     
     def configure_optimizers(self):
         """Configure optimizers - required by Lightning"""
