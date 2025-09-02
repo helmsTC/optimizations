@@ -103,7 +103,7 @@ class EfficientDGCNNBackbone(nn.Module):
         self.conv3 = EdgeConv(64, 128, k=self.k)
         self.conv4 = EdgeConv(128, 256, k=self.k)
         
-        # Aggregation
+        # Aggregation - output is 512 channels (64+64+128+256)
         self.conv5 = nn.Sequential(
             nn.Conv1d(512, 512, kernel_size=1, bias=False),
             nn.BatchNorm1d(512),
@@ -111,11 +111,12 @@ class EfficientDGCNNBackbone(nn.Module):
         )
         
         # Multi-scale feature extraction matching MaskPLS architecture
+        # Input is 512 channels from conv5, NOT 1024
         self.feat_layers = nn.ModuleList([
-            nn.Conv1d(512, output_channels[5], kernel_size=1),  # 256
-            nn.Conv1d(512, output_channels[6], kernel_size=1),  # 128
-            nn.Conv1d(512, output_channels[7], kernel_size=1),  # 96
-            nn.Conv1d(512, output_channels[8], kernel_size=1),  # 96
+            nn.Conv1d(512, output_channels[5], kernel_size=1),  # 512 -> 256
+            nn.Conv1d(512, output_channels[6], kernel_size=1),  # 512 -> 128
+            nn.Conv1d(512, output_channels[7], kernel_size=1),  # 512 -> 96
+            nn.Conv1d(512, output_channels[8], kernel_size=1),  # 512 -> 96
         ])
         
         # Batch normalization for outputs
@@ -199,30 +200,18 @@ class EfficientDGCNNBackbone(nn.Module):
                 coord = all_coords[b]
                 mask = all_masks[b]
                 
-                # Ensure features and coords have same number of points
+                # Features and coords should already have the same size
+                # but double-check
                 n_feat = feat.shape[0]
                 n_coord = coord.shape[0]
+                target_size = original_sizes[b]
                 
-                if n_feat != n_coord:
-                    # This handles the size mismatch error
-                    # Use the original size to determine correct size
-                    target_size = original_sizes[b]
-                    
-                    if n_feat > target_size:
-                        feat = feat[:target_size]
-                    elif n_feat < target_size:
-                        # This shouldn't happen, but handle it gracefully
-                        pad_size = target_size - n_feat
-                        feat = F.pad(feat, (0, 0, 0, pad_size))
-                    
-                    if n_coord > target_size:
-                        coord = coord[:target_size]
-                        mask = mask[:target_size]
-                    elif n_coord < target_size:
-                        # This shouldn't happen, but handle it gracefully
-                        pad_size = target_size - n_coord
-                        coord = F.pad(coord, (0, 0, 0, pad_size))
-                        mask = F.pad(mask, (0, pad_size), value=True)
+                if n_feat != target_size or n_coord != target_size:
+                    print(f"Warning: Size mismatch - feat: {n_feat}, coord: {n_coord}, target: {target_size}")
+                    # Adjust to target size
+                    feat = feat[:target_size]
+                    coord = coord[:target_size]
+                    mask = mask[:target_size]
                 
                 level_features.append(feat)
                 level_coords.append(coord)
@@ -291,33 +280,32 @@ class EfficientDGCNNBackbone(nn.Module):
         
         # DGCNN forward with efficient memory usage
         with torch.cuda.amp.autocast(enabled=False):  # Disable autocast to prevent half precision
-            x1 = self.conv1(x_in)
-            x2 = self.conv2(x1)
-            x3 = self.conv3(x2)
-            x4 = self.conv4(x3)
+            # EdgeConv layers
+            x1 = self.conv1(x_in)      # [1, 64, N]
+            x2 = self.conv2(x1)         # [1, 64, N]
+            x3 = self.conv3(x2)         # [1, 128, N]
+            x4 = self.conv4(x3)         # [1, 256, N]
             
-            # Concatenate all edge conv outputs
+            # Concatenate all edge conv outputs -> [1, 512, N]
             x = torch.cat((x1, x2, x3, x4), dim=1)
+            
+            # Apply conv5 to aggregate features -> [1, 512, N]
             x = self.conv5(x)
             
-            # Global max pooling
-            x_global = F.adaptive_max_pool1d(x, 1)
-            x_global = x_global.expand(-1, -1, n_points)
-            
-            # Concatenate with global features
-            x = torch.cat((x, x_global), dim=1)
+            # NOTE: We do NOT concatenate with global features here
+            # The feat_layers expect 512 channels, not 1024
         
         # Generate features at each scale
         features = []
         for feat_layer, bn_layer in zip(self.feat_layers, self.out_bn):
             # Apply layer and batch norm
-            feat = feat_layer(x)  # [1, C, N]
+            feat = feat_layer(x)  # [1, C_out, N]
             feat = bn_layer(feat)
-            feat = feat.squeeze(0).transpose(0, 1)  # [N, C]
+            feat = feat.squeeze(0).transpose(0, 1)  # [N, C_out]
             
             # Ensure correct size
             if feat.shape[0] != n_points:
-                # This shouldn't happen, but handle it gracefully
+                print(f"Warning: Feature size mismatch - expected {n_points}, got {feat.shape[0]}")
                 if feat.shape[0] > n_points:
                     feat = feat[:n_points]
                 else:
@@ -330,8 +318,15 @@ class EfficientDGCNNBackbone(nn.Module):
     
     def to(self, *args, **kwargs):
         """Override to ensure float32 is maintained"""
-        super().to(*args, **kwargs)
-        # Force float32 for all parameters
-        if len(args) > 0 and args[0] == torch.float16:
-            return super().to(torch.float32)
-        return self
+        # Check if trying to convert to half precision
+        if len(args) > 0:
+            if args[0] == torch.float16 or args[0] == torch.half:
+                # Force float32 instead
+                return super().to(torch.float32, *args[1:], **kwargs)
+        
+        # Check kwargs for dtype
+        if 'dtype' in kwargs:
+            if kwargs['dtype'] == torch.float16 or kwargs['dtype'] == torch.half:
+                kwargs['dtype'] = torch.float32
+        
+        return super().to(*args, **kwargs)
