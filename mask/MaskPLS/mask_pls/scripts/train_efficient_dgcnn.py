@@ -16,10 +16,18 @@ from pytorch_lightning import Trainer
 from pytorch_lightning import loggers as pl_loggers
 from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint, EarlyStopping
 from pytorch_lightning.strategies import DDPStrategy
+from pytorch_lightning.callbacks import Callback
 
 from mask_pls.datasets.semantic_dataset import SemanticDatasetModule
 from mask_pls.models.dgcnn.maskpls_dgcnn_optimized import MaskPLSDGCNNOptimized
 
+class GPUMemoryMonitor(Callback):
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        if batch_idx % 10 == 0:
+            torch.cuda.empty_cache()
+            
+    def on_validation_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx):
+        torch.cuda.empty_cache()
 
 def get_config():
     """Load and merge configuration files"""
@@ -156,12 +164,13 @@ def main(checkpoint, epochs, batch_size, lr, gpus, num_workers,
         strategy=strategy,
         logger=tb_logger,
         max_epochs=epochs,
-        callbacks=callbacks,
+        callbacks=callbacks + [GPUMemoryMonitor()],
         log_every_n_steps=10,
         gradient_clip_val=cfg.TRAIN.get('GRADIENT_CLIP', 1.0),
-        accumulate_grad_batches=cfg.TRAIN.get('ACCUMULATE_GRAD_BATCHES', 1),
+        accumulate_grad_batches=8,
         precision=16 if mixed_precision else 32,  # Use 16-bit if mixed precision enabled
         check_val_every_n_epoch=2,
+        limit_val_batches=0.25,
         num_sanity_val_steps=0,
         benchmark=True,
         sync_batchnorm=True if gpus > 1 else False

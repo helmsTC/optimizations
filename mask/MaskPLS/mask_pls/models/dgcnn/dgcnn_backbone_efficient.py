@@ -10,6 +10,7 @@ import torch.nn.functional as F
 import numpy as np
 from typing import List, Tuple, Optional
 import os
+from torch.utils.checkpoint import checkpoint
 
 
 def knn(x, k):
@@ -21,11 +22,23 @@ def knn(x, k):
     Returns:
         idx: [B, N, k] indices of k nearest neighbors
     """
-    inner = -2 * torch.matmul(x.transpose(2, 1), x)
-    xx = torch.sum(x**2, dim=1, keepdim=True)
-    pairwise_distance = -xx - inner - xx.transpose(2, 1)
+    batch_size = x.size(0)
+    num_points = x.size(2)
     
-    idx = pairwise_distance.topk(k=k, dim=-1)[1]
+    # For very large point clouds, use CPU for distance computation
+    if num_points > 30000 and not x.requires_grad:
+        x_cpu = x.cpu()
+        inner = -2 * torch.matmul(x_cpu.transpose(2, 1), x_cpu)
+        xx = torch.sum(x_cpu**2, dim=1, keepdim=True)
+        pairwise_distance = -xx - inner - xx.transpose(2, 1)
+        idx = pairwise_distance.topk(k=k, dim=-1)[1].cuda()
+    else:
+        # Original GPU computation
+        inner = -2 * torch.matmul(x.transpose(2, 1), x)
+        xx = torch.sum(x**2, dim=1, keepdim=True)
+        pairwise_distance = -xx - inner - xx.transpose(2, 1)
+        idx = pairwise_distance.topk(k=k, dim=-1)[1]
+    
     return idx
 
 
@@ -88,10 +101,10 @@ class EfficientDGCNNBackbone(nn.Module):
     """
     Efficient DGCNN backbone for point cloud feature extraction
     """
-    def __init__(self, cfg,  pretrained_path=None)
+    def __init__(self, cfg, pretrained_path=None):
         super().__init__()
         
-        self.k = 20  # number of nearest neighbors
+        self.k = 10  # Reduced from 20 to 10 for memory efficiency
         input_dim = cfg.INPUT_DIM
         output_channels = cfg.CHANNELS
         
@@ -112,7 +125,6 @@ class EfficientDGCNNBackbone(nn.Module):
         )
         
         # Multi-scale feature extraction matching MaskPLS architecture
-        # Input is 512 channels from conv5, NOT 1024
         self.feat_layers = nn.ModuleList([
             nn.Conv1d(512, output_channels[5], kernel_size=1),  # 512 -> 256
             nn.Conv1d(512, output_channels[6], kernel_size=1),  # 512 -> 128
@@ -131,7 +143,7 @@ class EfficientDGCNNBackbone(nn.Module):
         # Initialize weights
         self.init_weights()
 
-          # Load pretrained weights if provided
+        # Load pretrained weights if provided
         if pretrained_path and os.path.exists(pretrained_path):
             self.load_pretrained(pretrained_path)
         elif pretrained_path:
@@ -139,6 +151,7 @@ class EfficientDGCNNBackbone(nn.Module):
 
         # Ensure float32
         self.to(self.dtype)
+        
     def load_pretrained(self, pretrained_path):
         """
         Load pre-trained weights from classification/segmentation tasks
@@ -174,7 +187,6 @@ class EfficientDGCNNBackbone(nn.Module):
                         print(f"  Skipping {k}: shape mismatch - pretrained {v.shape} vs model {model_dict[k].shape}")
                 else:
                     # Try to match similar layers
-                    # For example, if pretrained has 'conv1.0.weight' and we have 'conv1.conv.0.weight'
                     matched = False
                     for model_key in model_dict.keys():
                         if self._keys_match(k, model_key) and v.shape == model_dict[model_key].shape:
@@ -192,23 +204,15 @@ class EfficientDGCNNBackbone(nn.Module):
             
             print(f"Loaded {len(pretrained_dict)}/{len(model_dict)} layers from pre-trained model")
             
-            # List loaded layers for verification
-            if len(pretrained_dict) > 0:
-                print("Loaded layers:")
-                for k in sorted(pretrained_dict.keys()):
-                    print(f"  - {k}")
-            
         except Exception as e:
             print(f"Error loading pretrained weights: {e}")
             print("Continuing with randomly initialized weights")
             
     def _keys_match(self, key1, key2):
         """Check if two keys potentially refer to the same layer"""
-        # Remove common prefixes/suffixes
         key1_parts = key1.replace('module.', '').replace('.weight', '').replace('.bias', '').split('.')
         key2_parts = key2.replace('module.', '').replace('.weight', '').replace('.bias', '').split('.')
         
-        # Check if core parts match
         for part1 in key1_parts:
             if part1 in key2_parts:
                 return True        
@@ -216,7 +220,6 @@ class EfficientDGCNNBackbone(nn.Module):
 
     def _is_relevant_key(self, key):
         """Check if a key is relevant for loading"""
-        # Skip keys that are definitely not relevant
         irrelevant_patterns = ['fc', 'classifier', 'head', 'global', 'decode']
         for pattern in irrelevant_patterns:
             if pattern in key.lower():
@@ -268,12 +271,24 @@ class EfficientDGCNNBackbone(nn.Module):
             n_points = coords.shape[0]
             original_sizes.append(n_points)
             
+            # More aggressive subsampling during validation
+            if not self.training:
+                max_val_points = 15000  # Reduced from 30000
+                if coords.shape[0] > max_val_points:
+                    indices = torch.randperm(coords.shape[0])[:max_val_points]
+                    coords = coords[indices]
+                    feats = feats[indices]
+            
             # DGCNN forward pass
             point_features = self.process_single_cloud(coords, feats)
             
             all_features.append(point_features)
             all_coords.append(coords)
-            all_masks.append(torch.zeros(n_points, dtype=torch.bool, device=coords.device))
+            all_masks.append(torch.zeros(coords.shape[0], dtype=torch.bool, device=coords.device))
+            
+            # Clear cache after each sample during validation
+            if not self.training:
+                torch.cuda.empty_cache()
         
         # Generate multi-scale features with consistent sizing
         ms_features = []
@@ -290,18 +305,16 @@ class EfficientDGCNNBackbone(nn.Module):
                 coord = all_coords[b]
                 mask = all_masks[b]
                 
-                # Features and coords should already have the same size
-                # but double-check
+                # Ensure consistent sizes
                 n_feat = feat.shape[0]
                 n_coord = coord.shape[0]
-                target_size = original_sizes[b]
                 
-                if n_feat != target_size or n_coord != target_size:
-                    print(f"Warning: Size mismatch - feat: {n_feat}, coord: {n_coord}, target: {target_size}")
-                    # Adjust to target size
-                    feat = feat[:target_size]
-                    coord = coord[:target_size]
-                    mask = mask[:target_size]
+                if n_feat != n_coord:
+                    print(f"Warning: Size mismatch - feat: {n_feat}, coord: {n_coord}")
+                    min_size = min(n_feat, n_coord)
+                    feat = feat[:min_size]
+                    coord = coord[:min_size]
+                    mask = mask[:min_size]
                 
                 level_features.append(feat)
                 level_coords.append(coord)
@@ -338,7 +351,6 @@ class EfficientDGCNNBackbone(nn.Module):
             valid_features = sem_features[b][valid_mask]
             
             if valid_features.shape[0] > 0:
-                # Ensure float32 for semantic head
                 valid_features = valid_features.to(self.dtype)
                 sem_logit = self.sem_head(valid_features)
             else:
@@ -359,8 +371,14 @@ class EfficientDGCNNBackbone(nn.Module):
     
     def process_single_cloud(self, coords, feats):
         """Process a single point cloud and return multi-scale features"""
-        # Get number of points
         n_points = coords.shape[0]
+        
+        # Process in chunks if too large
+        max_chunk_size = 20000  # Adjust based on your GPU memory
+        
+        if n_points > max_chunk_size and not self.training:
+            # Process in chunks during validation
+            return self.process_in_chunks(coords, feats, max_chunk_size)
         
         # Combine coordinates and features
         x_in = torch.cat([coords, feats[:, 3:]], dim=1).transpose(0, 1).unsqueeze(0)
@@ -370,20 +388,24 @@ class EfficientDGCNNBackbone(nn.Module):
         
         # DGCNN forward with efficient memory usage
         with torch.cuda.amp.autocast(enabled=False):  # Disable autocast to prevent half precision
-            # EdgeConv layers
-            x1 = self.conv1(x_in)      # [1, 64, N]
-            x2 = self.conv2(x1)         # [1, 64, N]
-            x3 = self.conv3(x2)         # [1, 128, N]
-            x4 = self.conv4(x3)         # [1, 256, N]
+            if self.training:
+                # Use gradient checkpointing during training
+                x1 = checkpoint(self.conv1, x_in)
+                x2 = checkpoint(self.conv2, x1)
+                x3 = checkpoint(self.conv3, x2)
+                x4 = checkpoint(self.conv4, x3)
+            else:
+                # Normal forward during validation
+                x1 = self.conv1(x_in)
+                x2 = self.conv2(x1)
+                x3 = self.conv3(x2)
+                x4 = self.conv4(x3)
             
             # Concatenate all edge conv outputs -> [1, 512, N]
             x = torch.cat((x1, x2, x3, x4), dim=1)
             
             # Apply conv5 to aggregate features -> [1, 512, N]
             x = self.conv5(x)
-            
-            # NOTE: We do NOT concatenate with global features here
-            # The feat_layers expect 512 channels, not 1024
         
         # Generate features at each scale
         features = []
@@ -405,6 +427,53 @@ class EfficientDGCNNBackbone(nn.Module):
             features.append(feat)
         
         return features
+    
+    def process_in_chunks(self, coords, feats, chunk_size):
+        """Process large point clouds in chunks"""
+        n_points = coords.shape[0]
+        num_chunks = (n_points + chunk_size - 1) // chunk_size
+        
+        all_features = [[] for _ in range(len(self.feat_layers))]
+        
+        for i in range(num_chunks):
+            start_idx = i * chunk_size
+            end_idx = min((i + 1) * chunk_size, n_points)
+            
+            # Process chunk
+            chunk_coords = coords[start_idx:end_idx]
+            chunk_feats = feats[start_idx:end_idx]
+            
+            # Combine coordinates and features
+            x_in = torch.cat([chunk_coords, chunk_feats[:, 3:]], dim=1).transpose(0, 1).unsqueeze(0)
+            x_in = x_in.to(self.dtype)
+            
+            # DGCNN forward for this chunk
+            with torch.cuda.amp.autocast(enabled=False):
+                with torch.no_grad():  # No gradients needed for chunks
+                    x1 = self.conv1(x_in)
+                    x2 = self.conv2(x1)
+                    x3 = self.conv3(x2)
+                    x4 = self.conv4(x3)
+                    x = torch.cat((x1, x2, x3, x4), dim=1)
+                    x = self.conv5(x)
+            
+            # Generate features at each scale for this chunk
+            for level_idx, (feat_layer, bn_layer) in enumerate(zip(self.feat_layers, self.out_bn)):
+                feat = feat_layer(x)
+                feat = bn_layer(feat)
+                feat = feat.squeeze(0).transpose(0, 1)
+                all_features[level_idx].append(feat)
+            
+            # Clear intermediate tensors
+            del x1, x2, x3, x4, x, x_in
+            torch.cuda.empty_cache()
+        
+        # Concatenate all chunks
+        final_features = []
+        for level_features in all_features:
+            final_features.append(torch.cat(level_features, dim=0))
+        
+        return final_features
     
     def to(self, *args, **kwargs):
         """Override to ensure float32 is maintained"""
