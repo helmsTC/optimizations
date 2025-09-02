@@ -60,6 +60,8 @@ def get_config():
 @click.option("--nuscenes", is_flag=True)
 @click.option("--experiment_name", type=str, default="maskpls_dgcnn_efficient")
 @click.option("--mixed_precision", is_flag=True, help="Use mixed precision training")
+@click.option("--pretrained", type=str, default=None, help="Pre-trained DGCNN weights")
+
 def main(checkpoint, epochs, batch_size, lr, gpus, num_workers, 
          nuscenes, experiment_name, mixed_precision):
     """Train efficient MaskPLS with DGCNN backbone"""
@@ -79,7 +81,9 @@ def main(checkpoint, epochs, batch_size, lr, gpus, num_workers,
     cfg.TRAIN.NUM_WORKERS = num_workers
     cfg.TRAIN.MIXED_PRECISION = mixed_precision
     cfg.EXPERIMENT.ID = experiment_name
-    
+    if pretrained:
+    cfg.PRETRAINED_PATH = pretrained
+    print(f"  Using pretrained weights: {pretrained}")
     if nuscenes:
         cfg.MODEL.DATASET = "NUSCENES"
     

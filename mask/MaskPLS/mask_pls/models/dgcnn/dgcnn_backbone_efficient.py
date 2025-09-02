@@ -9,6 +9,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from typing import List, Tuple, Optional
+import os
 
 
 def knn(x, k):
@@ -87,7 +88,7 @@ class EfficientDGCNNBackbone(nn.Module):
     """
     Efficient DGCNN backbone for point cloud feature extraction
     """
-    def __init__(self, cfg):
+    def __init__(self, cfg,  pretrained_path=None)
         super().__init__()
         
         self.k = 20  # number of nearest neighbors
@@ -129,10 +130,99 @@ class EfficientDGCNNBackbone(nn.Module):
         
         # Initialize weights
         self.init_weights()
-        
+
+          # Load pretrained weights if provided
+        if pretrained_path and os.path.exists(pretrained_path):
+            self.load_pretrained(pretrained_path)
+        elif pretrained_path:
+            print(f"Warning: Pretrained path {pretrained_path} does not exist")
+
         # Ensure float32
         self.to(self.dtype)
-    
+    def load_pretrained(self, pretrained_path):
+        """
+        Load pre-trained weights from classification/segmentation tasks
+        """
+        print(f"Loading pre-trained weights from {pretrained_path}")
+        
+        try:
+            checkpoint = torch.load(pretrained_path, map_location='cpu')
+            
+            # Handle different checkpoint formats
+            if 'state_dict' in checkpoint:
+                state_dict = checkpoint['state_dict']
+            elif 'model_state_dict' in checkpoint:
+                state_dict = checkpoint['model_state_dict']
+            else:
+                state_dict = checkpoint
+            
+            # Get current model state
+            model_dict = self.state_dict()
+            
+            # Filter out incompatible keys
+            pretrained_dict = {}
+            for k, v in state_dict.items():
+                # Remove module. prefix if present
+                if k.startswith('module.'):
+                    k = k[7:]
+                
+                # Check if the key exists and shapes match
+                if k in model_dict:
+                    if v.shape == model_dict[k].shape:
+                        pretrained_dict[k] = v
+                    else:
+                        print(f"  Skipping {k}: shape mismatch - pretrained {v.shape} vs model {model_dict[k].shape}")
+                else:
+                    # Try to match similar layers
+                    # For example, if pretrained has 'conv1.0.weight' and we have 'conv1.conv.0.weight'
+                    matched = False
+                    for model_key in model_dict.keys():
+                        if self._keys_match(k, model_key) and v.shape == model_dict[model_key].shape:
+                            pretrained_dict[model_key] = v
+                            matched = True
+                            print(f"  Matched {k} -> {model_key}")
+                            break
+                    
+                    if not matched and self._is_relevant_key(k):
+                        print(f"  Skipping {k}: not found in model")
+            
+            # Update current model
+            model_dict.update(pretrained_dict)
+            self.load_state_dict(model_dict, strict=False)
+            
+            print(f"Loaded {len(pretrained_dict)}/{len(model_dict)} layers from pre-trained model")
+            
+            # List loaded layers for verification
+            if len(pretrained_dict) > 0:
+                print("Loaded layers:")
+                for k in sorted(pretrained_dict.keys()):
+                    print(f"  - {k}")
+            
+        except Exception as e:
+            print(f"Error loading pretrained weights: {e}")
+            print("Continuing with randomly initialized weights")
+            
+    def _keys_match(self, key1, key2):
+        """Check if two keys potentially refer to the same layer"""
+        # Remove common prefixes/suffixes
+        key1_parts = key1.replace('module.', '').replace('.weight', '').replace('.bias', '').split('.')
+        key2_parts = key2.replace('module.', '').replace('.weight', '').replace('.bias', '').split('.')
+        
+        # Check if core parts match
+        for part1 in key1_parts:
+            if part1 in key2_parts:
+                return True        
+        return False   
+
+    def _is_relevant_key(self, key):
+        """Check if a key is relevant for loading"""
+        # Skip keys that are definitely not relevant
+        irrelevant_patterns = ['fc', 'classifier', 'head', 'global', 'decode']
+        for pattern in irrelevant_patterns:
+            if pattern in key.lower():
+                return False
+        return True          
+
     def init_weights(self):
         for m in self.modules():
             if isinstance(m, nn.Conv2d) or isinstance(m, nn.Conv1d):

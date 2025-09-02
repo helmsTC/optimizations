@@ -31,8 +31,10 @@ class MaskPLSDGCNNOptimized(LightningModule):
         self.things_ids = []  # Will be set by datamodule
         
         # Initialize backbone
-        self.backbone = EfficientDGCNNBackbone(cfg.BACKBONE)
-        
+        pretrained_path = cfg.get('PRETRAINED_PATH', None)
+
+        self.backbone = EfficientDGCNNBackbone(cfg.BACKBONE, pretrained_path)
+
         # Initialize decoder
         self.decoder = MaskedTransformerDecoder(
             cfg.DECODER,
