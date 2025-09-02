@@ -1,7 +1,5 @@
-# mask_pls/models/dgcnn/maskpls_dgcnn.py
 """
 MaskPLS with DGCNN backbone for ONNX-compatible panoptic segmentation
-Fixed version with proper device handling
 """
 
 import torch
@@ -29,7 +27,7 @@ class MaskPLSDGCNN(LightningModule):
         self.num_classes = cfg[dataset].NUM_CLASSES
         self.things_ids = []  # Will be set by datamodule
         
-        # DGCNN backbone
+        # DGCNN backbone with pretrained weights
         pretrained_path = cfg.get('PRETRAINED_PATH', None)
         self.backbone = DGCNNPretrainedBackbone(cfg.BACKBONE, pretrained_path)
         
@@ -65,67 +63,59 @@ class MaskPLSDGCNN(LightningModule):
     
     def get_losses(self, x, outputs, padding, sem_logits):
         """Compute all losses"""
-        # Get device from model
-        device = next(self.parameters()).device
-        
         # Mask losses
-        targets = {
-            'classes': [cls.to(device) if isinstance(cls, torch.Tensor) else cls 
-                       for cls in x['masks_cls']],
-            'masks': [mask.to(device) if isinstance(mask, torch.Tensor) else mask 
-                     for mask in x['masks']]
-        }
+        targets = {'classes': x['masks_cls'], 'masks': x['masks']}
+        loss_mask = self.mask_loss(outputs, targets, x['masks_ids'], x['pt_coord'])
         
-        # Ensure masks_ids are on the correct device
-        masks_ids = []
-        for ids in x['masks_ids']:
-            if isinstance(ids, list):
-                masks_ids.append([id.to(device) if isinstance(id, torch.Tensor) else id 
-                                 for id in ids])
-            else:
-                masks_ids.append(ids)
-        
-        # Ensure coordinates are on correct device
-        pt_coord = []
-        for coord in x['pt_coord']:
-            if isinstance(coord, np.ndarray):
-                pt_coord.append(coord)  # Keep as numpy for loss function
-            elif isinstance(coord, torch.Tensor):
-                pt_coord.append(coord.cpu().numpy())  # Convert to numpy
-            else:
-                pt_coord.append(coord)
-        
-        loss_mask = self.mask_loss(outputs, targets, masks_ids, pt_coord)
-        
-        # Semantic losses
+        # Semantic losses with proper shape handling
         sem_labels = []
-        for i, labels in enumerate(x['sem_label']):
+        batch_size = len(x['sem_label'])
+        
+        for i in range(batch_size):
+            labels = x['sem_label'][i]
             if isinstance(labels, np.ndarray):
-                labels = torch.from_numpy(labels).long().to(device)
-            elif isinstance(labels, torch.Tensor):
-                labels = labels.long().to(device)
-            else:
-                labels = torch.tensor(labels).long().to(device)
-                
+                labels = torch.from_numpy(labels).long().cuda()
+            
+            # Handle label shape
+            if labels.dim() == 2 and labels.shape[1] == 1:
+                labels = labels.squeeze(1)
+            elif labels.dim() > 1:
+                labels = labels.reshape(-1)
+            
+            # Get valid mask for this sample
             valid_mask = ~padding[i]
             
-            # Ensure we have valid labels
-            if valid_mask.any():
-                valid_labels = labels[valid_mask]
+            # Apply valid mask
+            if valid_mask.sum() > 0:
+                # Ensure indices are within bounds
+                min_len = min(labels.shape[0], valid_mask.shape[0])
+                valid_labels = labels[:min_len][valid_mask[:min_len]]
                 sem_labels.append(valid_labels)
         
         if sem_labels:
             sem_labels = torch.cat(sem_labels)
-            sem_logits_valid = sem_logits[~padding]
             
-            # Ensure both are on the same device
-            sem_labels = sem_labels.to(device)
-            sem_logits_valid = sem_logits_valid.to(device)
+            # Get valid semantic logits
+            sem_logits_valid = []
+            for i in range(batch_size):
+                valid_mask = ~padding[i]
+                if valid_mask.sum() > 0:
+                    sem_logits_valid.append(sem_logits[i][valid_mask])
             
-            loss_sem = self.sem_loss(sem_logits_valid, sem_labels)
+            if sem_logits_valid:
+                sem_logits_valid = torch.cat(sem_logits_valid, dim=0)
+                
+                # Ensure correct dimensions
+                assert sem_labels.dim() == 1, f"sem_labels should be 1D, got {sem_labels.shape}"
+                assert sem_logits_valid.dim() == 2, f"sem_logits_valid should be 2D, got {sem_logits_valid.shape}"
+                
+                loss_sem = self.sem_loss(sem_logits_valid, sem_labels)
+            else:
+                loss_sem = {'sem_ce': torch.tensor(0.0).cuda(), 
+                           'sem_lov': torch.tensor(0.0).cuda()}
         else:
-            loss_sem = {'sem_ce': torch.tensor(0.0).to(device), 
-                       'sem_lov': torch.tensor(0.0).to(device)}
+            loss_sem = {'sem_ce': torch.tensor(0.0).cuda(), 
+                       'sem_lov': torch.tensor(0.0).cuda()}
         
         loss_mask.update(loss_sem)
         return loss_mask
@@ -171,9 +161,9 @@ class MaskPLSDGCNN(LightningModule):
         iou = self.evaluator.get_mean_iou()
         rq = self.evaluator.get_mean_rq()
         
-        self.log('metrics/pq', pq, batch_size=self.cfg.TRAIN.BATCH_SIZE)
-        self.log('metrics/iou', iou, batch_size=self.cfg.TRAIN.BATCH_SIZE)
-        self.log('metrics/rq', rq, batch_size=self.cfg.TRAIN.BATCH_SIZE)
+        self.log('metrics/pq', pq)
+        self.log('metrics/iou', iou)
+        self.log('metrics/rq', rq)
         
         print(f"\nValidation Metrics - PQ: {pq:.4f}, IoU: {iou:.4f}, RQ: {rq:.4f}")
         
@@ -222,8 +212,6 @@ class MaskPLSDGCNN(LightningModule):
         mask_cls = outputs["pred_logits"]
         mask_pred = outputs["pred_masks"]
         
-        device = mask_cls.device
-        
         sem_pred = []
         ins_pred = []
         
@@ -246,7 +234,7 @@ class MaskPLSDGCNN(LightningModule):
             # Get instance masks
             cur_prob_masks = cur_scores.unsqueeze(0) * cur_masks
             panoptic_seg = torch.zeros(cur_masks.shape[0], dtype=torch.int32, 
-                                     device=device)
+                                     device=cur_masks.device)
             segments_info = []
             
             current_segment_id = 0
@@ -290,13 +278,3 @@ class MaskPLSDGCNN(LightningModule):
             ins_pred.append(ins.cpu().numpy())
         
         return sem_pred, ins_pred
-    
-    def on_train_start(self):
-        """Ensure model is on correct device at training start"""
-        # This is handled by Lightning, but we can add explicit checks if needed
-        pass
-    
-    def on_validation_start(self):
-        """Ensure model is on correct device at validation start"""
-        # This is handled by Lightning, but we can add explicit checks if needed
-        pass

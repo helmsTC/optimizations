@@ -1,7 +1,5 @@
-# mask_pls/scripts/train_dgcnn.py
 """
 Training script for MaskPLS with DGCNN backbone
-Optimized for better performance and ONNX compatibility
 """
 
 import os
@@ -28,26 +26,20 @@ class AugmentedDataModule(SemanticDatasetModule):
     """Data module with augmentation support"""
     def __init__(self, cfg):
         super().__init__(cfg)
-        # Only apply augmentation if specified
-        if hasattr(cfg, 'AUGMENTATION'):
-            self.augmentation = PointCloudAugmentation(cfg.AUGMENTATION)
-        else:
-            self.augmentation = None
+        self.augmentation = PointCloudAugmentation(cfg.get('AUGMENTATION', {}))
     
     def setup(self, stage=None):
         super().setup(stage)
         
-        # Apply augmentation to training dataset if enabled
-        if hasattr(self, 'train_mask_set') and self.augmentation is not None:
+        # Apply augmentation to training dataset
+        if hasattr(self, 'train_mask_set') and self.cfg.TRAIN.get('AUG', True):
             original_getitem = self.train_mask_set.__getitem__
             
             def augmented_getitem(idx):
                 data = original_getitem(idx)
-                if self.cfg.TRAIN.get('AUG', True) and self.augmentation:
-                    xyz, feats = data[0], data[1]
-                    # Apply augmentation
-                    xyz_aug, feats_aug = self.augmentation(xyz, feats)
-                    data = (xyz_aug, feats_aug) + data[2:]
+                xyz, feats = data[0], data[1]
+                xyz_aug, feats_aug = self.augmentation(xyz, feats)
+                data = (xyz_aug, feats_aug) + data[2:]
                 return data
             
             self.train_mask_set.__getitem__ = augmented_getitem
@@ -62,47 +54,38 @@ def get_config():
     backbone_cfg = edict(yaml.safe_load(open(join(getDir(__file__), "../config/backbone.yaml"))))
     decoder_cfg = edict(yaml.safe_load(open(join(getDir(__file__), "../config/decoder.yaml"))))
     
-    # Merge base configurations
-    cfg = edict({**model_cfg, **backbone_cfg, **decoder_cfg})
-    
-    # DGCNN-specific configuration additions (only add what's missing)
-    dgcnn_additions = {
+    # DGCNN-specific configuration
+    dgcnn_cfg = edict({
         'AUGMENTATION': {
             'rotation': True,
             'scaling': True,
             'flipping': True,
             'jittering': True,
-            'dropout': False  # Start with dropout disabled
+            'dropout': True
         },
-        'PRETRAINED_PATH': None,
-    }
+        'PRETRAINED_PATH': None,  # Will be set by command line
+        'TRAIN': {
+            'WARMUP_STEPS': 1000,
+            'GRADIENT_CLIP': 1.0,
+            'MIXED_PRECISION': True
+        }
+    })
     
-    # Add DGCNN-specific fields
-    cfg.update(dgcnn_additions)
-    
-    # Add training parameters if missing
-    if 'TRAIN' not in cfg:
-        cfg.TRAIN = edict()
-    
-    # Add missing TRAIN fields with defaults
-    train_defaults = {
-        'WARMUP_STEPS': 1000,
-        'GRADIENT_CLIP': 1.0,
-        'MIXED_PRECISION': False,  # Start with FP32 for stability
-        'SUBSAMPLE': True,  # This was missing!
-        'AUG': True,  # This was also referenced but missing
-    }
-    
-    for key, value in train_defaults.items():
-        if key not in cfg.TRAIN:
-            cfg.TRAIN[key] = value
+    # Merge configs
+    cfg = edict({**model_cfg, **backbone_cfg, **decoder_cfg})
+    # Update with DGCNN config
+    for key, value in dgcnn_cfg.items():
+        if key in cfg and isinstance(cfg[key], dict):
+            cfg[key].update(value)
+        else:
+            cfg[key] = value
     
     return cfg
 
 
 @click.command()
 @click.option("--config", type=str, default=None, help="Custom config file")
-@click.option("--pretrained", type=str, default=None, help="Pre-trained DGCNN weights")
+@click.option("--pretrained", type=str, required=True, help="Pre-trained DGCNN weights (.pth file)")
 @click.option("--checkpoint", type=str, default=None, help="Resume from checkpoint")
 @click.option("--epochs", type=int, default=100)
 @click.option("--batch_size", type=int, default=2)
@@ -111,9 +94,8 @@ def get_config():
 @click.option("--num_workers", type=int, default=4)
 @click.option("--nuscenes", is_flag=True)
 @click.option("--experiment_name", type=str, default="maskpls_dgcnn")
-@click.option("--debug", is_flag=True, help="Enable debug mode")
 def main(config, pretrained, checkpoint, epochs, batch_size, lr, gpus, 
-         num_workers, nuscenes, experiment_name, debug):
+         num_workers, nuscenes, experiment_name):
     """Train MaskPLS with DGCNN backbone"""
     
     print("="*60)
@@ -127,16 +109,14 @@ def main(config, pretrained, checkpoint, epochs, batch_size, lr, gpus,
         custom_cfg = edict(yaml.safe_load(open(config)))
         cfg.update(custom_cfg)
     
-    # Update configuration with command line arguments
+    # Update configuration
     cfg.TRAIN.MAX_EPOCH = epochs
     cfg.TRAIN.BATCH_SIZE = batch_size
     cfg.TRAIN.LR = lr
     cfg.TRAIN.N_GPUS = gpus
     cfg.TRAIN.NUM_WORKERS = num_workers
     cfg.EXPERIMENT.ID = experiment_name
-    
-    if pretrained:
-        cfg.PRETRAINED_PATH = pretrained
+    cfg.PRETRAINED_PATH = pretrained  # Set the pretrained path
     
     if nuscenes:
         cfg.MODEL.DATASET = "NUSCENES"
@@ -148,28 +128,14 @@ def main(config, pretrained, checkpoint, epochs, batch_size, lr, gpus,
     print(f"  Batch Size: {batch_size}")
     print(f"  Learning Rate: {lr}")
     print(f"  Epochs: {epochs}")
-    print(f"  Workers: {num_workers}")
-    print(f"  GPUs: {gpus}")
-    print(f"  Subsample: {cfg.TRAIN.SUBSAMPLE}")
-    print(f"  Augmentation: {cfg.TRAIN.AUG}")
-    print(f"  Pre-trained: {pretrained is not None}")
-    
-    if debug:
-        print("\nDebug mode enabled - using reduced settings")
-        cfg.TRAIN.NUM_WORKERS = 0  # Use main thread for debugging
-        cfg.TRAIN.BATCH_SIZE = 1
-        epochs = 2
+    print(f"  Pre-trained weights: {pretrained}")
     
     # Create data module with augmentation
-    print("\nInitializing data module...")
     data = AugmentedDataModule(cfg)
     data.setup()
     
-    # Create model
-    print("Creating model...")
+    # Create model with pretrained weights
     model = MaskPLSDGCNN(cfg)
-    
-    # Set things_ids from data module
     model.things_ids = data.things_ids
     
     # Load checkpoint if provided
@@ -198,7 +164,7 @@ def main(config, pretrained, checkpoint, epochs, batch_size, lr, gpus,
         ),
         
         ModelCheckpoint(
-            monitor="metrics/iou", 
+            monitor="metrics/iou",
             filename=f"{experiment_name}_epoch{{epoch:02d}}_iou{{metrics/iou:.3f}}",
             auto_insert_metric_name=False,
             mode="max",
@@ -213,14 +179,11 @@ def main(config, pretrained, checkpoint, epochs, batch_size, lr, gpus,
     ]
     
     # Training strategy
-    if gpus > 1:
-        strategy = DDPStrategy(find_unused_parameters=False)
-    else:
-        strategy = None
+    strategy = DDPStrategy(find_unused_parameters=False) if gpus > 1 else None
     
     # Create trainer
     trainer = Trainer(
-        devices=gpus if gpus > 0 else 1,
+        devices=gpus,
         accelerator="gpu" if gpus > 0 else "cpu",
         strategy=strategy,
         logger=tb_logger,
@@ -228,29 +191,21 @@ def main(config, pretrained, checkpoint, epochs, batch_size, lr, gpus,
         callbacks=callbacks,
         log_every_n_steps=10,
         gradient_clip_val=cfg.TRAIN.get('GRADIENT_CLIP', 1.0),
-        accumulate_grad_batches=cfg.TRAIN.get('BATCH_ACC', 1),
-        precision=16 if cfg.TRAIN.get('MIXED_PRECISION', False) else 32,
+        accumulate_grad_batches=cfg.TRAIN.get('BATCH_ACC', 4),
+        precision=16 if cfg.TRAIN.get('MIXED_PRECISION', True) else 32,
         check_val_every_n_epoch=2,
-        num_sanity_val_steps=2 if not debug else 0,
-        detect_anomaly=debug,
-        benchmark=True if not debug else False,
-        sync_batchnorm=True if gpus > 1 else False,
-        enable_progress_bar=True,
-        enable_model_summary=True,
+        num_sanity_val_steps=0,
+        detect_anomaly=False,
+        benchmark=True,
+        sync_batchnorm=True if gpus > 1 else False
     )
     
     # Train
     print("\nStarting training...")
-    try:
-        trainer.fit(model, data)
-        print("\nTraining completed successfully!")
-        print(f"Best checkpoints saved in: experiments/{experiment_name}")
-    except Exception as e:
-        print(f"\nTraining failed with error: {e}")
-        if debug:
-            import traceback
-            traceback.print_exc()
-        raise
+    trainer.fit(model, data)
+    
+    print("\nTraining completed!")
+    print(f"Best checkpoints saved in: experiments/{experiment_name}")
 
 
 if __name__ == "__main__":

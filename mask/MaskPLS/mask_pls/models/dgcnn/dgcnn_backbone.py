@@ -1,4 +1,3 @@
-# mask_pls/models/dgcnn/dgcnn_backbone.py
 """
 Dynamic Graph CNN (DGCNN) backbone for point cloud feature extraction
 MIT Licensed - Compatible with ONNX export
@@ -12,14 +11,7 @@ from typing import List, Tuple, Optional
 
 
 def knn(x, k):
-    """
-    Get k nearest neighbors index
-    Args:
-        x: [B, C, N] input features
-        k: number of neighbors
-    Returns:
-        idx: [B, N, k] indices of k nearest neighbors
-    """
+    """Get k nearest neighbors index"""
     inner = -2 * torch.matmul(x.transpose(2, 1), x)
     xx = torch.sum(x**2, dim=1, keepdim=True)
     pairwise_distance = -xx - inner - xx.transpose(2, 1)
@@ -29,15 +21,7 @@ def knn(x, k):
 
 
 def get_graph_feature(x, k=20, idx=None):
-    """
-    Construct edge features for each point
-    Args:
-        x: [B, C, N]
-        k: number of neighbors
-        idx: pre-computed indices
-    Returns:
-        edge features: [B, 2*C, N, k]
-    """
+    """Construct edge features for each point"""
     batch_size = x.size(0)
     num_points = x.size(2)
     x = x.view(batch_size, -1, num_points)
@@ -64,9 +48,7 @@ def get_graph_feature(x, k=20, idx=None):
 
 
 class EdgeConv(nn.Module):
-    """
-    Edge convolution layer
-    """
+    """Edge convolution layer"""
     def __init__(self, in_channels, out_channels, k=20):
         super().__init__()
         self.k = k
@@ -84,9 +66,7 @@ class EdgeConv(nn.Module):
 
 
 class DGCNNBackbone(nn.Module):
-    """
-    DGCNN backbone for point cloud feature extraction
-    """
+    """DGCNN backbone for point cloud feature extraction"""
     def __init__(self, cfg):
         super().__init__()
         
@@ -146,32 +126,19 @@ class DGCNNBackbone(nn.Module):
         feats_list = x['feats']
         
         batch_size = len(coords_list)
-        device = 'cuda' if torch.cuda.is_available() else 'cpu'
         
         # Process each point cloud
         all_features = []
         all_coords = []
         all_masks = []
-        max_points = 0
+        all_sem_logits = []
         
         for b in range(batch_size):
-            # Handle both numpy arrays and tensors
-            if isinstance(coords_list[b], np.ndarray):
-                coords = torch.from_numpy(coords_list[b]).float().to(device)
-            else:
-                coords = coords_list[b].float().to(device)
-                
-            if isinstance(feats_list[b], np.ndarray):
-                feats = torch.from_numpy(feats_list[b]).float().to(device)
-            else:
-                feats = feats_list[b].float().to(device)
+            coords = torch.from_numpy(coords_list[b]).float().cuda()
+            feats = torch.from_numpy(feats_list[b]).float().cuda()
             
-            # Update max points
-            max_points = max(max_points, coords.shape[0])
-            
-            # DGCNN expects [B, C, N] format
-            # Combine coordinates and intensity for input
-            x_in = feats.transpose(0, 1).unsqueeze(0)  # [1, C, N]
+            # Combine coordinates and features
+            x_in = torch.cat([coords, feats[:, 3:]], dim=1).transpose(0, 1).unsqueeze(0)
             
             # DGCNN forward
             x1 = self.conv1(x_in)
@@ -180,16 +147,16 @@ class DGCNNBackbone(nn.Module):
             x4 = self.conv4(x3)
             
             # Concatenate all edge conv outputs
-            x = torch.cat((x1, x2, x3, x4), dim=1)  # [1, 512, N]
+            x = torch.cat((x1, x2, x3, x4), dim=1)
             x = self.conv5(x)
             
-            # Global features (optional, can be disabled for point-wise tasks)
+            # Global features - no longer used for concat
             # x_global = F.adaptive_max_pool1d(x, 1).expand(-1, -1, x.size(2))
             # x = torch.cat((x, x_global), dim=1)
             
             all_features.append(x)
             all_coords.append(coords)
-            all_masks.append(torch.zeros(coords.shape[0], dtype=torch.bool, device=device))
+            all_masks.append(torch.zeros(coords.shape[0], dtype=torch.bool).cuda())
         
         # Generate multi-scale features
         ms_features = []
@@ -202,58 +169,62 @@ class DGCNNBackbone(nn.Module):
             level_masks = []
             
             for b in range(batch_size):
-                # Apply feature layer and batch norm
-                feat = feat_layer(all_features[b])  # [1, C_out, N]
-                feat = bn_layer(feat)
-                feat = feat.squeeze(0).transpose(0, 1)  # [N, C_out]
+                feat = feat_layer(all_features[b]).squeeze(0).transpose(0, 1)
+                feat = bn_layer(feat.transpose(0, 1)).transpose(0, 1)
                 
-                # Pad to max points
+                level_features.append(feat)
+                level_coords.append(all_coords[b])
+                level_masks.append(all_masks[b])
+            
+            # Pad to same size
+            max_points = max(f.shape[0] for f in level_features)
+            padded_features = []
+            padded_coords = []
+            padded_masks = []
+            
+            for feat, coord, mask in zip(level_features, level_coords, level_masks):
                 n_points = feat.shape[0]
                 if n_points < max_points:
                     pad_size = max_points - n_points
                     feat = F.pad(feat, (0, 0, 0, pad_size))
-                    coord = F.pad(all_coords[b], (0, 0, 0, pad_size))
-                    mask = F.pad(all_masks[b], (0, pad_size), value=True)
-                else:
-                    coord = all_coords[b]
-                    mask = all_masks[b]
+                    coord = F.pad(coord, (0, 0, 0, pad_size))
+                    mask = F.pad(mask, (0, pad_size), value=True)
                 
-                level_features.append(feat)
-                level_coords.append(coord)
-                level_masks.append(mask)
+                padded_features.append(feat)
+                padded_coords.append(coord)
+                padded_masks.append(mask)
             
-            ms_features.append(torch.stack(level_features))
-            ms_coords.append(torch.stack(level_coords))
-            ms_masks.append(torch.stack(level_masks))
+            ms_features.append(torch.stack(padded_features))
+            ms_coords.append(torch.stack(padded_coords))
+            ms_masks.append(torch.stack(padded_masks))
         
-        # Semantic predictions
-        sem_features = ms_features[-1]  # Use last level features
+        # Generate semantic logits
         sem_logits = []
-        
         for b in range(batch_size):
-            valid_mask = ~ms_masks[-1][b]
-            valid_features = sem_features[b][valid_mask]
-            
-            if valid_features.shape[0] > 0:
-                sem_logit = self.sem_head(valid_features)
-                
-                # Pad back to full size
-                full_logit = torch.zeros(max_points, 20, device=device)
-                full_logit[valid_mask] = sem_logit
-                sem_logits.append(full_logit)
-            else:
-                # Empty point cloud
-                sem_logits.append(torch.zeros(max_points, 20, device=device))
+            # Use the last feature level for semantic prediction
+            feat = self.feat_layers[-1](all_features[b]).squeeze(0).transpose(0, 1)
+            feat = self.out_bn[-1](feat.transpose(0, 1)).transpose(0, 1)
+            sem_logit = self.sem_head(feat)
+            sem_logits.append(sem_logit)
         
-        sem_logits = torch.stack(sem_logits)
+        # Pad semantic logits
+        max_points = max(logit.shape[0] for logit in sem_logits)
+        padded_sem_logits = []
+        
+        for sem_logit in sem_logits:
+            n_points = sem_logit.shape[0]
+            if n_points < max_points:
+                pad_size = max_points - n_points
+                sem_logit = F.pad(sem_logit, (0, 0, 0, pad_size))
+            padded_sem_logits.append(sem_logit)
+        
+        sem_logits = torch.stack(padded_sem_logits)
         
         return ms_features, ms_coords, ms_masks, sem_logits
 
 
 class DGCNNPretrainedBackbone(DGCNNBackbone):
-    """
-    DGCNN backbone with pre-trained weights support
-    """
+    """DGCNN backbone with pre-trained weights support"""
     def __init__(self, cfg, pretrained_path=None):
         super().__init__(cfg)
         
@@ -261,9 +232,7 @@ class DGCNNPretrainedBackbone(DGCNNBackbone):
             self.load_pretrained(pretrained_path)
     
     def load_pretrained(self, path):
-        """
-        Load pre-trained weights from classification/segmentation tasks
-        """
+        """Load pre-trained weights from classification/segmentation tasks"""
         print(f"Loading pre-trained weights from {path}")
         checkpoint = torch.load(path, map_location='cpu')
         
@@ -275,13 +244,42 @@ class DGCNNPretrainedBackbone(DGCNNBackbone):
         else:
             state_dict = checkpoint
         
-        # Filter out incompatible keys
+        # Map pretrained weights to our architecture
+        # This assumes the pretrained model has similar EdgeConv layers
         model_dict = self.state_dict()
-        pretrained_dict = {k: v for k, v in state_dict.items() 
-                          if k in model_dict and v.shape == model_dict[k].shape}
+        
+        # Create mapping for potentially different layer names
+        mapping = {
+            # Map EdgeConv layers
+            'edge_conv1': 'conv1.conv',
+            'edge_conv2': 'conv2.conv',
+            'edge_conv3': 'conv3.conv',
+            'edge_conv4': 'conv4.conv',
+            # Map aggregation layer
+            'conv5': 'conv5',
+            # Add more mappings as needed based on your pretrained model
+        }
+        
+        # Filter and map pretrained weights
+        pretrained_dict = {}
+        for key, value in state_dict.items():
+            # Try direct mapping first
+            if key in model_dict and value.shape == model_dict[key].shape:
+                pretrained_dict[key] = value
+            else:
+                # Try mapping with different names
+                for old_name, new_name in mapping.items():
+                    if old_name in key:
+                        new_key = key.replace(old_name, new_name)
+                        if new_key in model_dict and value.shape == model_dict[new_key].shape:
+                            pretrained_dict[new_key] = value
+                            break
         
         # Update current model
         model_dict.update(pretrained_dict)
         self.load_state_dict(model_dict, strict=False)
         
         print(f"Loaded {len(pretrained_dict)}/{len(model_dict)} layers from pre-trained model")
+        
+        # List loaded layers
+        print("Loaded layers:", list(pretrained_dict.keys())[:10], "...")
