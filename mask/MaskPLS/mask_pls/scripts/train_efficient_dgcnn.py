@@ -18,7 +18,7 @@ from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint, Ea
 from pytorch_lightning.strategies import DDPStrategy
 
 from mask_pls.datasets.semantic_dataset import SemanticDatasetModule
-from mask_pls.models.mask_dgcnn_optimized import MaskPLSDGCNNOptimized
+from mask_pls.models.dgcnn.maskpls_dgcnn_optimized import MaskPLSDGCNNOptimized
 
 
 def get_config():
@@ -63,7 +63,7 @@ def get_config():
 @click.option("--pretrained", type=str, default=None, help="Pre-trained DGCNN weights")
 
 def main(checkpoint, epochs, batch_size, lr, gpus, num_workers, 
-         nuscenes, experiment_name, mixed_precision):
+         nuscenes, experiment_name, mixed_precision, pretrained):
     """Train efficient MaskPLS with DGCNN backbone"""
     
     print("="*60)
@@ -82,7 +82,7 @@ def main(checkpoint, epochs, batch_size, lr, gpus, num_workers,
     cfg.TRAIN.MIXED_PRECISION = mixed_precision
     cfg.EXPERIMENT.ID = experiment_name
     if pretrained:
-    cfg.PRETRAINED_PATH = pretrained
+        cfg.PRETRAINED_PATH = pretrained
     print(f"  Using pretrained weights: {pretrained}")
     if nuscenes:
         cfg.MODEL.DATASET = "NUSCENES"
