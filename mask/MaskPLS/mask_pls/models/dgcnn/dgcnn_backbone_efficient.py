@@ -155,12 +155,12 @@ class EfficientDGCNNBackbone(nn.Module):
             nn.LeakyReLU(negative_slope=0.2, inplace=True)
         )
         
-        # Multi-scale feature extraction
+        # Multi-scale feature extraction - expecting 1024 input channels (512 + 512 global)
         self.feat_layers = nn.ModuleList([
-            nn.Conv1d(512, output_channels[5], kernel_size=1),  # 256
-            nn.Conv1d(512, output_channels[6], kernel_size=1),  # 128
-            nn.Conv1d(512, output_channels[7], kernel_size=1),  # 96
-            nn.Conv1d(512, output_channels[8], kernel_size=1),  # 96
+            nn.Conv1d(1024, output_channels[5], kernel_size=1),  # 256
+            nn.Conv1d(1024, output_channels[6], kernel_size=1),  # 128
+            nn.Conv1d(1024, output_channels[7], kernel_size=1),  # 96
+            nn.Conv1d(1024, output_channels[8], kernel_size=1),  # 96
         ])
         
         # Batch normalization for outputs
@@ -250,8 +250,8 @@ class EfficientDGCNNBackbone(nn.Module):
         x4 = self.conv4(x3)
         
         # Concatenate all edge conv outputs
-        x = torch.cat((x1, x2, x3, x4), dim=1)
-        x = self.conv5(x)
+        x = torch.cat((x1, x2, x3, x4), dim=1)  # Should be 64+64+128+256 = 512 channels
+        x = self.conv5(x)  # Still 512 channels after conv5
         
         # Global features - use chunked max pooling for very large inputs
         if x.shape[2] > 50000:
@@ -266,7 +266,8 @@ class EfficientDGCNNBackbone(nn.Module):
         else:
             x_global = F.adaptive_max_pool1d(x, 1).expand(-1, -1, x.size(2))
         
-        x = torch.cat((x, x_global), dim=1)
+        # Concatenate with global features to get 1024 channels total
+        x = torch.cat((x, x_global), dim=1)  # 512 + 512 = 1024 channels
         return x
     
     def forward(self, x):
