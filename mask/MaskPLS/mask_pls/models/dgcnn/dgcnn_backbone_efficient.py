@@ -117,19 +117,19 @@ class EfficientDGCNNBackbone(nn.Module):
         self.conv3 = EdgeConv(64, 128, k=self.k)
         self.conv4 = EdgeConv(128, 256, k=self.k)
         
-        # Aggregation - output is 512 channels (64+64+128+256)
+        # Aggregation - match pretrained model with 1024 channels
         self.conv5 = nn.Sequential(
-            nn.Conv1d(512, 512, kernel_size=1, bias=False),
-            nn.BatchNorm1d(512),
+            nn.Conv1d(512, 1024, kernel_size=1, bias=False),
+            nn.BatchNorm1d(1024),
             nn.LeakyReLU(negative_slope=0.2)
         )
         
         # Multi-scale feature extraction matching MaskPLS architecture
         self.feat_layers = nn.ModuleList([
-            nn.Conv1d(512, output_channels[5], kernel_size=1),  # 512 -> 256
-            nn.Conv1d(512, output_channels[6], kernel_size=1),  # 512 -> 128
-            nn.Conv1d(512, output_channels[7], kernel_size=1),  # 512 -> 96
-            nn.Conv1d(512, output_channels[8], kernel_size=1),  # 512 -> 96
+            nn.Conv1d(1024, output_channels[5], kernel_size=1),  # 1024 -> 256
+            nn.Conv1d(1024, output_channels[6], kernel_size=1),  # 1024 -> 128
+            nn.Conv1d(1024, output_channels[7], kernel_size=1),  # 1024 -> 96
+            nn.Conv1d(1024, output_channels[8], kernel_size=1),  # 1024 -> 96
         ])
         
         # Batch normalization for outputs

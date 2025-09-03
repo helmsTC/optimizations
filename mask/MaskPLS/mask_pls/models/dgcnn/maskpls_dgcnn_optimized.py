@@ -202,23 +202,12 @@ class MaskPLSDGCNNOptimized(LightningModule):
         self.validation_step_outputs.clear()
     
     def configure_optimizers(self):
-        # Separate parameters for pretrained vs random initialized layers
-        pretrained_params = []  # conv1-4 (loaded from pretrained)
-        random_params = []      # conv5, feat_layers, sem_head, decoder
-        
-        for name, param in self.named_parameters():
-            # Pretrained layers get lower LR
-            if 'backbone' in name and any(layer in name for layer in ['conv1', 'conv2', 'conv3', 'conv4']):
-                pretrained_params.append(param)
-            else:
-                # Random initialized layers (conv5+, decoder) get full LR
-                random_params.append(param)
-        
-        # Different learning rates based on initialization
-        optimizer = torch.optim.AdamW([
-            {'params': pretrained_params, 'lr': self.cfg.TRAIN.LR * 0.1},  # Pretrained layers
-            {'params': random_params, 'lr': self.cfg.TRAIN.LR}             # Random layers
-        ], weight_decay=1e-4)
+        # Use uniform learning rate since architecture now matches pretrained model
+        optimizer = torch.optim.AdamW(
+            self.parameters(), 
+            lr=self.cfg.TRAIN.LR,
+            weight_decay=1e-4
+        )
         
         # Scheduler
         scheduler = {
