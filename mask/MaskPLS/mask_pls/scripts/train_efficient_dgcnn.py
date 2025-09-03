@@ -112,7 +112,8 @@ def main(checkpoint, epochs, batch_size, lr, gpus, num_workers,
     
     # Create model
     model = MaskPLSDGCNNOptimized(cfg)
-    model.things_ids = data.things_ids
+    # Set things_ids after data setup
+    model.things_ids = getattr(data, 'things_ids', [])
     
     # Load checkpoint if provided
     if checkpoint:

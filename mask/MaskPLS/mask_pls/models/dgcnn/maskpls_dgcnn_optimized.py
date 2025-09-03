@@ -67,33 +67,11 @@ class MaskPLSDGCNNOptimized(LightningModule):
     
     def get_losses(self, x, outputs, padding, sem_logits, coords):
         """Compute all losses with proper target formatting and subsampling handling"""
-        # First, we need to handle the mask loss with subsampling
-        # The masks are defined on the original points, but we have subsampled
-        
-        # Get the actual number of points used by the backbone for each sample
-        actual_points_per_sample = []
-        for coord in coords[-1]:  # Use the last level coordinates
-            valid_mask = ~padding[len(actual_points_per_sample)]
-            actual_points_per_sample.append(valid_mask.sum().item())
-        
-        # For mask loss, we need to handle the subsampling carefully
-        # The backbone may have subsampled the points, so we need to adjust the masks
-        
         # Prepare mask loss targets
         targets = {'classes': x['masks_cls'], 'masks': x['masks']}
         
-        # We need to subsample the masks to match the subsampled points
-        # This is a temporary fix - ideally, the subsampling indices should be passed through
-        try:
-            loss_mask = self.mask_loss(outputs, targets, x['masks_ids'], x['pt_coord'])
-        except Exception as e:
-            print(f"Mask loss error: {e}")
-            # Fallback: create dummy loss
-            loss_mask = {
-                'loss_ce': torch.tensor(0.0, device=self.device),
-                'loss_dice': torch.tensor(0.0, device=self.device),
-                'loss_mask': torch.tensor(0.0, device=self.device)
-            }
+        # Compute mask loss - let the loss function handle the coordinate matching
+        loss_mask = self.mask_loss(outputs, targets, x['masks_ids'], x['pt_coord'])
         
         # Prepare semantic loss targets with subsampling awareness
         sem_labels = []
@@ -117,19 +95,13 @@ class MaskPLSDGCNNOptimized(LightningModule):
             valid_mask = ~padding[i]
             num_valid = valid_mask.sum().item()
             
-            # Handle subsampling: if the backbone subsampled, we need to subsample labels too
+            # Handle subsampling: Use consistent approach for training and validation
             original_num_points = labels.shape[0]
             backbone_num_points = valid_mask.shape[0]
             
             if original_num_points > backbone_num_points:
-                # The backbone subsampled - we need to subsample the labels
-                # This is approximate - ideally we'd have the exact indices used
-                if not self.training:
-                    # During validation, use deterministic subsampling
-                    indices = torch.linspace(0, original_num_points-1, backbone_num_points).long()
-                else:
-                    # During training, use random subsampling
-                    indices = torch.randperm(original_num_points)[:backbone_num_points]
+                # The backbone subsampled - use deterministic subsampling for consistency
+                indices = torch.linspace(0, original_num_points-1, backbone_num_points).long()
                 labels = labels[indices]
             elif original_num_points < backbone_num_points:
                 # This shouldn't happen, but handle it gracefully
@@ -205,33 +177,9 @@ class MaskPLSDGCNNOptimized(LightningModule):
         # Panoptic inference
         sem_pred, ins_pred = self.panoptic_inference(outputs, padding)
         
-        # For evaluation, we need to handle the subsampling
-        # Map predictions back to original point cloud size
-        mapped_sem_pred = []
-        mapped_ins_pred = []
-        
-        for i in range(len(sem_pred)):
-            original_size = batch['sem_label'][i].shape[0]
-            pred_size = sem_pred[i].shape[0]
-            
-            if pred_size < original_size:
-                # Predictions are subsampled, need to map back
-                # Simple nearest neighbor upsampling
-                if pred_size > 0:
-                    indices = torch.linspace(0, pred_size-1, original_size).long()
-                    mapped_sem = sem_pred[i][indices]
-                    mapped_ins = ins_pred[i][indices]
-                else:
-                    mapped_sem = np.zeros(original_size, dtype=np.int32)
-                    mapped_ins = np.zeros(original_size, dtype=np.int32)
-                mapped_sem_pred.append(mapped_sem)
-                mapped_ins_pred.append(mapped_ins)
-            else:
-                # No subsampling or predictions are larger (shouldn't happen)
-                mapped_sem_pred.append(sem_pred[i][:original_size])
-                mapped_ins_pred.append(ins_pred[i][:original_size])
-        
-        self.evaluator.update(mapped_sem_pred, mapped_ins_pred, batch)
+        # Use predictions directly - they should match the ground truth size
+        # due to consistent subsampling in get_losses
+        self.evaluator.update(sem_pred, ins_pred, batch)
         
         self.validation_step_outputs.append(total_loss)
         return total_loss
