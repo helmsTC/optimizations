@@ -177,9 +177,10 @@ class MaskPLSDGCNNOptimized(LightningModule):
         # Panoptic inference
         sem_pred, ins_pred = self.panoptic_inference(outputs, padding)
         
-        # Use predictions directly - they should match the ground truth size
-        # due to consistent subsampling in get_losses
-        self.evaluator.update(sem_pred, ins_pred, batch)
+        # Need to subsample ground truth to match prediction size for evaluation
+        # The evaluator expects predictions and ground truth to have same dimensions
+        subsampled_batch = self.subsample_ground_truth_for_eval(batch, sem_pred)
+        self.evaluator.update(sem_pred, ins_pred, subsampled_batch)
         
         self.validation_step_outputs.append(total_loss)
         return total_loss
@@ -320,3 +321,50 @@ class MaskPLSDGCNNOptimized(LightningModule):
             ins_pred.append(instance_seg.cpu().numpy())
         
         return sem_pred, ins_pred
+    
+    def subsample_ground_truth_for_eval(self, batch, sem_pred):
+        """Subsample ground truth labels to match prediction dimensions for evaluation"""
+        subsampled_batch = {}
+        subsampled_batch['fname'] = batch['fname']
+        
+        subsampled_sem_labels = []
+        subsampled_ins_labels = []
+        
+        for i in range(len(sem_pred)):
+            pred_size = len(sem_pred[i])
+            
+            # Get original labels
+            sem_label = batch['sem_label'][i]
+            ins_label = batch['ins_label'][i]
+            
+            # Convert to tensors if needed
+            if isinstance(sem_label, np.ndarray):
+                sem_label = torch.from_numpy(sem_label)
+            if isinstance(ins_label, np.ndarray):
+                ins_label = torch.from_numpy(ins_label)
+            
+            # Flatten if needed
+            if sem_label.dim() > 1:
+                sem_label = sem_label.squeeze(-1)
+            if ins_label.dim() > 1:
+                ins_label = ins_label.squeeze(-1)
+            
+            original_size = len(sem_label)
+            
+            if pred_size < original_size:
+                # Subsample ground truth to match predictions using same deterministic approach
+                indices = torch.linspace(0, original_size-1, pred_size).long()
+                subsampled_sem = sem_label[indices]
+                subsampled_ins = ins_label[indices]
+            else:
+                # No subsampling needed or pred is larger (shouldn't happen)
+                subsampled_sem = sem_label[:pred_size]
+                subsampled_ins = ins_label[:pred_size]
+            
+            subsampled_sem_labels.append(subsampled_sem.cpu().numpy())
+            subsampled_ins_labels.append(subsampled_ins.cpu().numpy())
+        
+        subsampled_batch['sem_label'] = subsampled_sem_labels
+        subsampled_batch['ins_label'] = subsampled_ins_labels
+        
+        return subsampled_batch
