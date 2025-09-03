@@ -1,12 +1,5 @@
-# mask_pls/scripts/train_efficient_dgcnn.py
-"""
-Training script for efficient DGCNN-based MaskPLS
-"""
-
+# mask_pls/scripts/train_dgcnn_fixed.py
 import os
-os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
-
-from os.path import join
 import click
 import torch
 import yaml
@@ -15,67 +8,47 @@ from easydict import EasyDict as edict
 from pytorch_lightning import Trainer
 from pytorch_lightning import loggers as pl_loggers
 from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint, EarlyStopping
-from pytorch_lightning.strategies import DDPStrategy
-from pytorch_lightning.callbacks import Callback
 
 from mask_pls.datasets.semantic_dataset import SemanticDatasetModule
-from mask_pls.models.dgcnn.maskpls_dgcnn_optimized import MaskPLSDGCNNOptimized
-
-class GPUMemoryMonitor(Callback):
-    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
-        if batch_idx % 10 == 0:
-            torch.cuda.empty_cache()
-            
-    def on_validation_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx):
-        torch.cuda.empty_cache()
+from mask_pls.models.dgcnn.maskpls_dgcnn_fixed import MaskPLSDGCNNFixed
 
 def get_config():
     """Load and merge configuration files"""
     def getDir(obj):
         return os.path.dirname(os.path.abspath(obj))
     
-    model_cfg = edict(yaml.safe_load(open(join(getDir(__file__), "../config/model.yaml"))))
-    backbone_cfg = edict(yaml.safe_load(open(join(getDir(__file__), "../config/backbone.yaml"))))
-    decoder_cfg = edict(yaml.safe_load(open(join(getDir(__file__), "../config/decoder.yaml"))))
+    model_cfg = edict(yaml.safe_load(open(os.path.join(getDir(__file__), "../config/model.yaml"))))
+    backbone_cfg = edict(yaml.safe_load(open(os.path.join(getDir(__file__), "../config/backbone.yaml"))))
+    decoder_cfg = edict(yaml.safe_load(open(os.path.join(getDir(__file__), "../config/decoder.yaml"))))
     
-    # Efficient DGCNN configuration
-    dgcnn_cfg = edict({
-        'TRAIN': {
-            'WARMUP_STEPS': 1000,
-            'GRADIENT_CLIP': 1.0,
-            'MIXED_PRECISION': False,  # Disabled for now
-            'ACCUMULATE_GRAD_BATCHES': 4,
-        }
-    })
+    cfg = edict({**model_cfg, **backbone_cfg, **decoder_cfg})
     
-    cfg = edict({**model_cfg, **backbone_cfg, **decoder_cfg, **dgcnn_cfg})
-    
-    # Override some settings for efficiency
-    cfg.TRAIN.BATCH_SIZE = 2  # Smaller batch size for memory
+    # Adjust training parameters
+    cfg.TRAIN.BATCH_SIZE = 2  # Small batch size
+    cfg.TRAIN.ACCUMULATE_GRAD_BATCHES = 2  # Effective batch size of 4
+    cfg.TRAIN.WARMUP_STEPS = 500
     cfg.TRAIN.SUBSAMPLE = True
     cfg.TRAIN.AUG = True
+    cfg.TRAIN.LR = 0.0001  # Lower learning rate
     
     return cfg
-
 
 @click.command()
 @click.option("--checkpoint", type=str, default=None, help="Resume from checkpoint")
 @click.option("--epochs", type=int, default=100)
 @click.option("--batch_size", type=int, default=2)
-@click.option("--lr", type=float, default=0.001)
+@click.option("--lr", type=float, default=0.0001)
 @click.option("--gpus", type=int, default=1)
 @click.option("--num_workers", type=int, default=4)
 @click.option("--nuscenes", is_flag=True)
-@click.option("--experiment_name", type=str, default="maskpls_dgcnn_efficient")
-@click.option("--mixed_precision", is_flag=True, help="Use mixed precision training")
+@click.option("--experiment_name", type=str, default="maskpls_dgcnn_fixed")
 @click.option("--pretrained", type=str, default=None, help="Pre-trained DGCNN weights")
-
 def main(checkpoint, epochs, batch_size, lr, gpus, num_workers, 
-         nuscenes, experiment_name, mixed_precision, pretrained):
-    """Train efficient MaskPLS with DGCNN backbone"""
+         nuscenes, experiment_name, pretrained):
+    """Train fixed MaskPLS with DGCNN backbone"""
     
     print("="*60)
-    print("MaskPLS Training with Efficient DGCNN Backbone")
+    print("MaskPLS Training with Fixed DGCNN Backbone")
     print("="*60)
     
     # Load configuration
@@ -87,37 +60,32 @@ def main(checkpoint, epochs, batch_size, lr, gpus, num_workers,
     cfg.TRAIN.LR = lr
     cfg.TRAIN.N_GPUS = gpus
     cfg.TRAIN.NUM_WORKERS = num_workers
-    cfg.TRAIN.MIXED_PRECISION = mixed_precision
     cfg.EXPERIMENT.ID = experiment_name
+    
     if pretrained:
         cfg.PRETRAINED_PATH = pretrained
-    print(f"  Using pretrained weights: {pretrained}")
+    
     if nuscenes:
         cfg.MODEL.DATASET = "NUSCENES"
     
-    dataset = cfg.MODEL.DATASET
-    
     print(f"Configuration:")
-    print(f"  Dataset: {dataset}")
+    print(f"  Dataset: {cfg.MODEL.DATASET}")
     print(f"  Batch Size: {batch_size}")
     print(f"  Learning Rate: {lr}")
     print(f"  Epochs: {epochs}")
-    print(f"  Mixed Precision: {mixed_precision}")
     print(f"  GPUs: {gpus}")
-    print(f"  Workers: {num_workers}")
     
     # Create data module
     data = SemanticDatasetModule(cfg)
     data.setup()
     
     # Create model
-    model = MaskPLSDGCNNOptimized(cfg)
-    # Set things_ids after data setup
-    model.things_ids = getattr(data, 'things_ids', [])
+    model = MaskPLSDGCNNFixed(cfg)
+    model.things_ids = data.things_ids
     
     # Load checkpoint if provided
     if checkpoint:
-        print(f"\nLoading checkpoint: {checkpoint}")
+        print(f"Loading checkpoint: {checkpoint}")
         ckpt = torch.load(checkpoint, map_location='cpu')
         model.load_state_dict(ckpt['state_dict'], strict=False)
     
@@ -150,29 +118,25 @@ def main(checkpoint, epochs, batch_size, lr, gpus, num_workers,
         
         EarlyStopping(
             monitor="val_loss",
-            patience=20,
+            patience=15,
             mode="min"
         )
     ]
-    
-    # Training strategy
-    strategy = 'auto' if gpus <= 1 else DDPStrategy(find_unused_parameters=False)
     
     # Create trainer
     trainer = Trainer(
         devices=gpus,
         accelerator="gpu" if gpus > 0 else "cpu",
-        strategy=strategy,
+        strategy="ddp" if gpus > 1 else "auto",
         logger=tb_logger,
         max_epochs=epochs,
-        callbacks=callbacks + [GPUMemoryMonitor()],
+        callbacks=callbacks,
         log_every_n_steps=10,
-        gradient_clip_val=cfg.TRAIN.get('GRADIENT_CLIP', 1.0),
-        accumulate_grad_batches=8,
-        precision=16 if mixed_precision else 32,  # Use 16-bit if mixed precision enabled
-        check_val_every_n_epoch=2,
-        limit_val_batches=0.25,
-        num_sanity_val_steps=0,
+        gradient_clip_val=0.5,  # Gradient clipping
+        accumulate_grad_batches=cfg.TRAIN.get('ACCUMULATE_GRAD_BATCHES', 2),
+        precision=32,  # Use full precision for stability
+        check_val_every_n_epoch=1,  # Validate every epoch
+        num_sanity_val_steps=2,
         benchmark=True,
         sync_batchnorm=True if gpus > 1 else False
     )
@@ -182,8 +146,6 @@ def main(checkpoint, epochs, batch_size, lr, gpus, num_workers,
     trainer.fit(model, data)
     
     print("\nTraining completed!")
-    print(f"Best checkpoints saved in: experiments/{experiment_name}")
-
 
 if __name__ == "__main__":
     main()

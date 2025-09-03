@@ -1,57 +1,25 @@
-# mask_pls/models/dgcnn/dgcnn_backbone_efficient.py
-"""
-Efficient DGCNN backbone for point cloud feature extraction
-Optimized for memory usage and ONNX compatibility
-"""
-
+# mask_pls/models/dgcnn/dgcnn_backbone_efficient_fixed.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-from typing import List, Tuple, Optional
+from typing import Dict, List, Tuple
 import os
-from torch.utils.checkpoint import checkpoint
-
 
 def knn(x, k):
-    """
-    Get k nearest neighbors index
-    Args:
-        x: [B, C, N] input features
-        k: number of neighbors
-    Returns:
-        idx: [B, N, k] indices of k nearest neighbors
-    """
+    """Get k nearest neighbors index"""
     batch_size = x.size(0)
     num_points = x.size(2)
     
-    # For very large point clouds, use CPU for distance computation
-    if num_points > 30000 and not x.requires_grad:
-        x_cpu = x.cpu()
-        inner = -2 * torch.matmul(x_cpu.transpose(2, 1), x_cpu)
-        xx = torch.sum(x_cpu**2, dim=1, keepdim=True)
-        pairwise_distance = -xx - inner - xx.transpose(2, 1)
-        idx = pairwise_distance.topk(k=k, dim=-1)[1].cuda()
-    else:
-        # Original GPU computation
-        inner = -2 * torch.matmul(x.transpose(2, 1), x)
-        xx = torch.sum(x**2, dim=1, keepdim=True)
-        pairwise_distance = -xx - inner - xx.transpose(2, 1)
-        idx = pairwise_distance.topk(k=k, dim=-1)[1]
+    inner = -2 * torch.matmul(x.transpose(2, 1), x)
+    xx = torch.sum(x**2, dim=1, keepdim=True)
+    pairwise_distance = -xx - inner - xx.transpose(2, 1)
     
+    idx = pairwise_distance.topk(k=k, dim=-1)[1]
     return idx
 
-
 def get_graph_feature(x, k=20, idx=None):
-    """
-    Construct edge features for each point
-    Args:
-        x: [B, C, N]
-        k: number of neighbors
-        idx: pre-computed indices
-    Returns:
-        edge features: [B, 2*C, N, k]
-    """
+    """Construct edge features for each point"""
     batch_size = x.size(0)
     num_points = x.size(2)
     x = x.view(batch_size, -1, num_points)
@@ -76,11 +44,8 @@ def get_graph_feature(x, k=20, idx=None):
     
     return feature
 
-
 class EdgeConv(nn.Module):
-    """
-    Edge convolution layer
-    """
+    """Edge convolution layer"""
     def __init__(self, in_channels, out_channels, k=20):
         super().__init__()
         self.k = k
@@ -96,20 +61,15 @@ class EdgeConv(nn.Module):
         x = x.max(dim=-1, keepdim=False)[0]
         return x
 
-
-class EfficientDGCNNBackbone(nn.Module):
-    """
-    Efficient DGCNN backbone for point cloud feature extraction
-    """
+class FixedDGCNNBackbone(nn.Module):
+    """Fixed DGCNN backbone with proper subsampling tracking"""
     def __init__(self, cfg, pretrained_path=None):
         super().__init__()
         
-        self.k = 10  # Reduced from 20 to 10 for memory efficiency
+        self.k = 20  # Keep original k=20 for better features
         input_dim = cfg.INPUT_DIM
         output_channels = cfg.CHANNELS
-        
-        # Ensure all operations use float32
-        self.dtype = torch.float32
+        self.num_classes = 20  # Will be overridden by dataset config
         
         # EdgeConv layers
         self.conv1 = EdgeConv(input_dim, 64, k=self.k)
@@ -117,19 +77,19 @@ class EfficientDGCNNBackbone(nn.Module):
         self.conv3 = EdgeConv(64, 128, k=self.k)
         self.conv4 = EdgeConv(128, 256, k=self.k)
         
-        # Aggregation - match pretrained model with 1024 channels
+        # Aggregation - use 512 to match original architecture
         self.conv5 = nn.Sequential(
-            nn.Conv1d(512, 1024, kernel_size=1, bias=False),
-            nn.BatchNorm1d(1024),
+            nn.Conv1d(512, 512, kernel_size=1, bias=False),
+            nn.BatchNorm1d(512),
             nn.LeakyReLU(negative_slope=0.2)
         )
         
-        # Multi-scale feature extraction matching MaskPLS architecture
+        # Multi-scale feature extraction
         self.feat_layers = nn.ModuleList([
-            nn.Conv1d(1024, output_channels[5], kernel_size=1),  # 1024 -> 256
-            nn.Conv1d(1024, output_channels[6], kernel_size=1),  # 1024 -> 128
-            nn.Conv1d(1024, output_channels[7], kernel_size=1),  # 1024 -> 96
-            nn.Conv1d(1024, output_channels[8], kernel_size=1),  # 1024 -> 96
+            nn.Conv1d(512, output_channels[5], kernel_size=1),  # 256
+            nn.Conv1d(512, output_channels[6], kernel_size=1),  # 128
+            nn.Conv1d(512, output_channels[7], kernel_size=1),  # 96
+            nn.Conv1d(512, output_channels[8], kernel_size=1),  # 96
         ])
         
         # Batch normalization for outputs
@@ -137,101 +97,28 @@ class EfficientDGCNNBackbone(nn.Module):
             nn.BatchNorm1d(output_channels[i]) for i in range(5, 9)
         ])
         
-        # Semantic head
-        self.sem_head = nn.Linear(output_channels[8], 20)
+        # Semantic head - will be reconfigured
+        self.sem_head = nn.Linear(output_channels[8], self.num_classes)
+        
+        # Track subsampling
+        self.subsample_indices = {}
         
         # Initialize weights
         self.init_weights()
-
-        # Load pretrained weights if provided
+        
+        # Load pretrained if available
         if pretrained_path and os.path.exists(pretrained_path):
             self.load_pretrained(pretrained_path)
-        elif pretrained_path:
-            print(f"Warning: Pretrained path {pretrained_path} does not exist")
-
-        # Ensure float32
-        self.to(self.dtype)
-        
-    def load_pretrained(self, pretrained_path):
-        """
-        Load pre-trained weights from classification/segmentation tasks
-        """
-        print(f"Loading pre-trained weights from {pretrained_path}")
-        
-        try:
-            checkpoint = torch.load(pretrained_path, map_location='cpu')
-            
-            # Handle different checkpoint formats
-            if 'state_dict' in checkpoint:
-                state_dict = checkpoint['state_dict']
-            elif 'model_state_dict' in checkpoint:
-                state_dict = checkpoint['model_state_dict']
-            else:
-                state_dict = checkpoint
-            
-            # Get current model state
-            model_dict = self.state_dict()
-            
-            # Filter out incompatible keys
-            pretrained_dict = {}
-            for k, v in state_dict.items():
-                # Remove module. prefix if present
-                if k.startswith('module.'):
-                    k = k[7:]
-                
-                # Check if the key exists and shapes match
-                if k in model_dict:
-                    if v.shape == model_dict[k].shape:
-                        pretrained_dict[k] = v
-                    else:
-                        print(f"  Skipping {k}: shape mismatch - pretrained {v.shape} vs model {model_dict[k].shape}")
-                else:
-                    # Try to match similar layers
-                    matched = False
-                    for model_key in model_dict.keys():
-                        if self._keys_match(k, model_key) and v.shape == model_dict[model_key].shape:
-                            pretrained_dict[model_key] = v
-                            matched = True
-                            print(f"  Matched {k} -> {model_key}")
-                            break
-                    
-                    if not matched and self._is_relevant_key(k):
-                        print(f"  Skipping {k}: not found in model")
-            
-            # Update current model
-            model_dict.update(pretrained_dict)
-            self.load_state_dict(model_dict, strict=False)
-            
-            print(f"Loaded {len(pretrained_dict)}/{len(model_dict)} layers from pre-trained model")
-            
-        except Exception as e:
-            print(f"Error loading pretrained weights: {e}")
-            print("Continuing with randomly initialized weights")
-            
-    def _keys_match(self, key1, key2):
-        """Check if two keys potentially refer to the same layer"""
-        key1_parts = key1.replace('module.', '').replace('.weight', '').replace('.bias', '').split('.')
-        key2_parts = key2.replace('module.', '').replace('.weight', '').replace('.bias', '').split('.')
-        
-        for part1 in key1_parts:
-            if part1 in key2_parts:
-                return True        
-        return False   
-
-    def _is_relevant_key(self, key):
-        """Check if a key is relevant for loading"""
-        irrelevant_patterns = ['fc', 'classifier', 'head', 'global', 'decode']
-        for pattern in irrelevant_patterns:
-            if pattern in key.lower():
-                return False
-        return True          
-
+    
+    def set_num_classes(self, num_classes):
+        """Update number of classes for semantic head"""
+        self.num_classes = num_classes
+        self.sem_head = nn.Linear(self.sem_head.in_features, num_classes)
+    
     def init_weights(self):
         for m in self.modules():
             if isinstance(m, nn.Conv2d) or isinstance(m, nn.Conv1d):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='leaky_relu')
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
             elif isinstance(m, nn.BatchNorm2d) or isinstance(m, nn.BatchNorm1d):
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
@@ -240,252 +127,156 @@ class EfficientDGCNNBackbone(nn.Module):
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
     
+    def load_pretrained(self, path):
+        print(f"Loading pretrained weights from {path}")
+        try:
+            checkpoint = torch.load(path, map_location='cpu')
+            state_dict = checkpoint.get('state_dict', checkpoint)
+            
+            # Filter compatible weights
+            model_dict = self.state_dict()
+            pretrained_dict = {k: v for k, v in state_dict.items() 
+                             if k in model_dict and v.shape == model_dict[k].shape}
+            
+            model_dict.update(pretrained_dict)
+            self.load_state_dict(model_dict, strict=False)
+            print(f"Loaded {len(pretrained_dict)}/{len(model_dict)} layers")
+        except Exception as e:
+            print(f"Warning: Could not load pretrained weights: {e}")
+    
     def forward(self, x):
         """
         Args:
             x: dict with 'pt_coord' and 'feats' lists
         Returns:
-            multi-scale features, coordinates, padding masks, semantic logits
+            multi-scale features, coordinates, padding masks, semantic logits, subsample indices
         """
-        # Prepare batch
         coords_list = x['pt_coord']
         feats_list = x['feats']
         
         batch_size = len(coords_list)
         
+        # Clear subsample tracking
+        self.subsample_indices = {}
+        
         # Process each point cloud
         all_features = []
         all_coords = []
         all_masks = []
-        original_sizes = []
         
         for b in range(batch_size):
             coords = torch.from_numpy(coords_list[b]).float().cuda()
             feats = torch.from_numpy(feats_list[b]).float().cuda()
             
-            # Ensure float32 dtype
-            coords = coords.to(self.dtype)
-            feats = feats.to(self.dtype)
+            original_size = coords.shape[0]
             
-            # Store original size
-            n_points = coords.shape[0]
-            original_sizes.append(n_points)
+            # Subsample if needed (training: 50000, validation: 30000)
+            max_points = 50000 if self.training else 30000
+            if coords.shape[0] > max_points:
+                # Random sampling with tracking
+                indices = torch.randperm(coords.shape[0], device=coords.device)[:max_points]
+                indices = indices.sort()[0]  # Sort for consistency
+                coords = coords[indices]
+                feats = feats[indices]
+                self.subsample_indices[b] = indices
+            else:
+                self.subsample_indices[b] = torch.arange(coords.shape[0], device=coords.device)
             
-            # More aggressive subsampling during validation
-            if not self.training:
-                max_val_points = 15000  # Reduced from 30000
-                if coords.shape[0] > max_val_points:
-                    indices = torch.randperm(coords.shape[0])[:max_val_points]
-                    coords = coords[indices]
-                    feats = feats[indices]
-            
-            # DGCNN forward pass
+            # Process through DGCNN
             point_features = self.process_single_cloud(coords, feats)
             
             all_features.append(point_features)
             all_coords.append(coords)
             all_masks.append(torch.zeros(coords.shape[0], dtype=torch.bool, device=coords.device))
-            
-            # Clear cache after each sample during validation
-            if not self.training:
-                torch.cuda.empty_cache()
         
-        # Generate multi-scale features with consistent sizing
+        # Generate multi-scale features with padding
         ms_features = []
         ms_coords = []
         ms_masks = []
         
         for i in range(len(self.feat_layers)):
-            level_features = []
-            level_coords = []
-            level_masks = []
-            
-            for b in range(batch_size):
-                feat = all_features[b][i]
-                coord = all_coords[b]
-                mask = all_masks[b]
-                
-                # Ensure consistent sizes
-                n_feat = feat.shape[0]
-                n_coord = coord.shape[0]
-                
-                if n_feat != n_coord:
-                    print(f"Warning: Size mismatch - feat: {n_feat}, coord: {n_coord}")
-                    min_size = min(n_feat, n_coord)
-                    feat = feat[:min_size]
-                    coord = coord[:min_size]
-                    mask = mask[:min_size]
-                
-                level_features.append(feat)
-                level_coords.append(coord)
-                level_masks.append(mask)
-            
-            # Pad to same size within batch
-            max_points = max(f.shape[0] for f in level_features)
-            padded_features = []
-            padded_coords = []
-            padded_masks = []
-            
-            for feat, coord, mask in zip(level_features, level_coords, level_masks):
-                n_points = feat.shape[0]
-                if n_points < max_points:
-                    pad_size = max_points - n_points
-                    feat = F.pad(feat, (0, 0, 0, pad_size))
-                    coord = F.pad(coord, (0, 0, 0, pad_size))
-                    mask = F.pad(mask, (0, pad_size), value=True)
-                
-                padded_features.append(feat)
-                padded_coords.append(coord)
-                padded_masks.append(mask)
-            
-            ms_features.append(torch.stack(padded_features))
-            ms_coords.append(torch.stack(padded_coords))
-            ms_masks.append(torch.stack(padded_masks))
+            level_features, level_coords, level_masks = self.pad_batch_level(
+                [f[i] for f in all_features],
+                all_coords,
+                all_masks
+            )
+            ms_features.append(level_features)
+            ms_coords.append(level_coords)
+            ms_masks.append(level_masks)
         
         # Semantic predictions
-        sem_features = ms_features[-1]
-        sem_logits = []
-        
-        for b in range(batch_size):
-            valid_mask = ~ms_masks[-1][b]
-            valid_features = sem_features[b][valid_mask]
-            
-            if valid_features.shape[0] > 0:
-                valid_features = valid_features.to(self.dtype)
-                sem_logit = self.sem_head(valid_features)
-            else:
-                sem_logit = torch.zeros(0, 20, device=sem_features.device, dtype=self.dtype)
-            
-            # Pad back to full size
-            if valid_mask.sum() < sem_features.shape[1]:
-                full_logit = torch.zeros(sem_features.shape[1], 20, device=sem_features.device, dtype=self.dtype)
-                if valid_features.shape[0] > 0:
-                    full_logit[valid_mask] = sem_logit
-                sem_logit = full_logit
-            
-            sem_logits.append(sem_logit)
-        
-        sem_logits = torch.stack(sem_logits)
+        sem_logits = self.compute_semantic_logits(ms_features[-1], ms_masks[-1])
         
         return ms_features, ms_coords, ms_masks, sem_logits
     
     def process_single_cloud(self, coords, feats):
-        """Process a single point cloud and return multi-scale features"""
-        n_points = coords.shape[0]
+        """Process a single point cloud through DGCNN"""
+        # Combine coordinates and intensity
+        x_in = torch.cat([coords, feats[:, 3:4]], dim=1).transpose(0, 1).unsqueeze(0)
         
-        # Process in chunks if too large
-        max_chunk_size = 20000  # Adjust based on your GPU memory
+        # Edge convolutions
+        x1 = self.conv1(x_in)
+        x2 = self.conv2(x1)
+        x3 = self.conv3(x2)
+        x4 = self.conv4(x3)
         
-        if n_points > max_chunk_size and not self.training:
-            # Process in chunks during validation
-            return self.process_in_chunks(coords, feats, max_chunk_size)
+        # Aggregate features
+        x = torch.cat((x1, x2, x3, x4), dim=1)
+        x = self.conv5(x)
         
-        # Combine coordinates and features
-        x_in = torch.cat([coords, feats[:, 3:]], dim=1).transpose(0, 1).unsqueeze(0)
-        
-        # Ensure float32
-        x_in = x_in.to(self.dtype)
-        
-        # DGCNN forward with efficient memory usage
-        with torch.cuda.amp.autocast(enabled=False):  # Disable autocast to prevent half precision
-            if self.training:
-                # Use gradient checkpointing during training
-                x1 = checkpoint(self.conv1, x_in)
-                x2 = checkpoint(self.conv2, x1)
-                x3 = checkpoint(self.conv3, x2)
-                x4 = checkpoint(self.conv4, x3)
-            else:
-                # Normal forward during validation
-                x1 = self.conv1(x_in)
-                x2 = self.conv2(x1)
-                x3 = self.conv3(x2)
-                x4 = self.conv4(x3)
-            
-            # Concatenate all edge conv outputs -> [1, 512, N]
-            x = torch.cat((x1, x2, x3, x4), dim=1)
-            
-            # Apply conv5 to aggregate features -> [1, 512, N]
-            x = self.conv5(x)
-        
-        # Generate features at each scale
+        # Generate multi-scale features
         features = []
         for feat_layer, bn_layer in zip(self.feat_layers, self.out_bn):
-            # Apply layer and batch norm
-            feat = feat_layer(x)  # [1, C_out, N]
+            feat = feat_layer(x)
             feat = bn_layer(feat)
-            feat = feat.squeeze(0).transpose(0, 1)  # [N, C_out]
-            
-            # Ensure correct size
-            if feat.shape[0] != n_points:
-                print(f"Warning: Feature size mismatch - expected {n_points}, got {feat.shape[0]}")
-                if feat.shape[0] > n_points:
-                    feat = feat[:n_points]
-                else:
-                    pad_size = n_points - feat.shape[0]
-                    feat = F.pad(feat, (0, 0, 0, pad_size))
-            
+            feat = feat.squeeze(0).transpose(0, 1)
             features.append(feat)
         
         return features
     
-    def process_in_chunks(self, coords, feats, chunk_size):
-        """Process large point clouds in chunks"""
-        n_points = coords.shape[0]
-        num_chunks = (n_points + chunk_size - 1) // chunk_size
+    def pad_batch_level(self, features, coords, masks):
+        """Pad features, coordinates and masks to same size"""
+        max_points = max(f.shape[0] for f in features)
         
-        all_features = [[] for _ in range(len(self.feat_layers))]
+        padded_features = []
+        padded_coords = []
+        padded_masks = []
         
-        for i in range(num_chunks):
-            start_idx = i * chunk_size
-            end_idx = min((i + 1) * chunk_size, n_points)
+        for feat, coord, mask in zip(features, coords, masks):
+            n_points = feat.shape[0]
+            if n_points < max_points:
+                pad_size = max_points - n_points
+                feat = F.pad(feat, (0, 0, 0, pad_size))
+                coord = F.pad(coord, (0, 0, 0, pad_size))
+                mask = F.pad(mask, (0, pad_size), value=True)
             
-            # Process chunk
-            chunk_coords = coords[start_idx:end_idx]
-            chunk_feats = feats[start_idx:end_idx]
-            
-            # Combine coordinates and features
-            x_in = torch.cat([chunk_coords, chunk_feats[:, 3:]], dim=1).transpose(0, 1).unsqueeze(0)
-            x_in = x_in.to(self.dtype)
-            
-            # DGCNN forward for this chunk
-            with torch.cuda.amp.autocast(enabled=False):
-                with torch.no_grad():  # No gradients needed for chunks
-                    x1 = self.conv1(x_in)
-                    x2 = self.conv2(x1)
-                    x3 = self.conv3(x2)
-                    x4 = self.conv4(x3)
-                    x = torch.cat((x1, x2, x3, x4), dim=1)
-                    x = self.conv5(x)
-            
-            # Generate features at each scale for this chunk
-            for level_idx, (feat_layer, bn_layer) in enumerate(zip(self.feat_layers, self.out_bn)):
-                feat = feat_layer(x)
-                feat = bn_layer(feat)
-                feat = feat.squeeze(0).transpose(0, 1)
-                all_features[level_idx].append(feat)
-            
-            # Clear intermediate tensors
-            del x1, x2, x3, x4, x, x_in
-            torch.cuda.empty_cache()
+            padded_features.append(feat)
+            padded_coords.append(coord)
+            padded_masks.append(mask)
         
-        # Concatenate all chunks
-        final_features = []
-        for level_features in all_features:
-            final_features.append(torch.cat(level_features, dim=0))
-        
-        return final_features
+        return (torch.stack(padded_features), 
+                torch.stack(padded_coords), 
+                torch.stack(padded_masks))
     
-    def to(self, *args, **kwargs):
-        """Override to ensure float32 is maintained"""
-        # Check if trying to convert to half precision
-        if len(args) > 0:
-            if args[0] == torch.float16 or args[0] == torch.half:
-                # Force float32 instead
-                return super().to(torch.float32, *args[1:], **kwargs)
+    def compute_semantic_logits(self, features, masks):
+        """Compute semantic logits for valid points"""
+        batch_size = features.shape[0]
+        sem_logits = []
         
-        # Check kwargs for dtype
-        if 'dtype' in kwargs:
-            if kwargs['dtype'] == torch.float16 or kwargs['dtype'] == torch.half:
-                kwargs['dtype'] = torch.float32
+        for b in range(batch_size):
+            valid_mask = ~masks[b]
+            if valid_mask.sum() > 0:
+                valid_features = features[b][valid_mask]
+                logits = self.sem_head(valid_features)
+            else:
+                logits = torch.zeros(0, self.num_classes, device=features.device)
+            
+            # Pad back to full size
+            full_logits = torch.zeros(features.shape[1], self.num_classes, 
+                                     device=features.device)
+            if valid_mask.sum() > 0:
+                full_logits[valid_mask] = logits
+            
+            sem_logits.append(full_logits)
         
-        return super().to(*args, **kwargs)
+        return torch.stack(sem_logits)
