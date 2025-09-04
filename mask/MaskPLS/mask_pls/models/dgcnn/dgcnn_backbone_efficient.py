@@ -49,12 +49,9 @@ class EdgeConv(nn.Module):
     def __init__(self, in_channels, out_channels, k=20):
         super().__init__()
         self.k = k
-        # Match DGCNN naming convention for weight loading
-        self.conv1 = nn.Conv2d(in_channels * 2, out_channels, kernel_size=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(out_channels)
         self.conv = nn.Sequential(
-            self.conv1,
-            self.bn1,
+            nn.Conv2d(in_channels * 2, out_channels, kernel_size=1, bias=False),
+            nn.BatchNorm2d(out_channels),
             nn.LeakyReLU(negative_slope=0.2)
         )
     
@@ -65,7 +62,7 @@ class EdgeConv(nn.Module):
         return x
 
 class FixedDGCNNBackbone(nn.Module):
-    """Fixed DGCNN backbone with proper pretrained weight loading"""
+    """Fixed DGCNN backbone with improved pretrained weight loading"""
     def __init__(self, cfg, pretrained_path=None):
         super().__init__()
         
@@ -74,8 +71,7 @@ class FixedDGCNNBackbone(nn.Module):
         output_channels = cfg.CHANNELS
         self.num_classes = 20  # Will be overridden by dataset config
         
-        # Match DGCNN architecture naming for pretrained weights
-        # EdgeConv layers with proper naming
+        # EdgeConv layers
         self.edge_conv1 = nn.Sequential(
             nn.Conv2d(input_dim * 2, 64, kernel_size=1, bias=False),
             nn.BatchNorm2d(64),
@@ -100,23 +96,10 @@ class FixedDGCNNBackbone(nn.Module):
             nn.LeakyReLU(negative_slope=0.2)
         )
         
-        # Aggregation layers matching DGCNN
+        # Aggregation layers
         self.conv5 = nn.Sequential(
             nn.Conv1d(512, 512, kernel_size=1, bias=False),
             nn.BatchNorm1d(512),
-            nn.LeakyReLU(negative_slope=0.2)
-        )
-        
-        # For compatibility with pretrained models that have these layers
-        self.emb = nn.Sequential(
-            nn.Conv1d(512, 512, kernel_size=1, bias=False),
-            nn.BatchNorm1d(512),
-            nn.LeakyReLU(negative_slope=0.2),
-            nn.Conv1d(512, 256, kernel_size=1, bias=False),
-            nn.BatchNorm1d(256),
-            nn.LeakyReLU(negative_slope=0.2),
-            nn.Conv1d(256, 128, kernel_size=1, bias=False),
-            nn.BatchNorm1d(128),
             nn.LeakyReLU(negative_slope=0.2)
         )
         
@@ -133,7 +116,7 @@ class FixedDGCNNBackbone(nn.Module):
             nn.BatchNorm1d(output_channels[i]) for i in range(5, 9)
         ])
         
-        # Semantic head - will be reconfigured
+        # Semantic head
         self.sem_head = nn.Linear(output_channels[8], self.num_classes)
         
         # Track subsampling
@@ -144,7 +127,7 @@ class FixedDGCNNBackbone(nn.Module):
         
         # Load pretrained if available
         if pretrained_path and os.path.exists(pretrained_path):
-            self.load_pretrained_dgcnn(pretrained_path)
+            self.load_pretrained_partial(pretrained_path)
     
     def set_num_classes(self, num_classes):
         """Update number of classes for semantic head"""
@@ -165,131 +148,246 @@ class FixedDGCNNBackbone(nn.Module):
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
     
-    def load_pretrained_dgcnn(self, path):
-        """Load pretrained DGCNN weights with proper mapping"""
+    def load_pretrained_partial(self, path):
+        """Load pretrained weights with partial loading strategy"""
+        print(f"\n{'='*60}")
         print(f"Loading pretrained DGCNN weights from {path}")
+        print(f"{'='*60}")
         
         try:
             # Load checkpoint
             checkpoint = torch.load(path, map_location='cpu')
             
-            # Handle different checkpoint formats
-            if 'state_dict' in checkpoint:
-                pretrained_dict = checkpoint['state_dict']
-            elif 'model_state_dict' in checkpoint:
-                pretrained_dict = checkpoint['model_state_dict']
+            # Extract state dict
+            if isinstance(checkpoint, dict):
+                if 'state_dict' in checkpoint:
+                    pretrained_dict = checkpoint['state_dict']
+                elif 'model_state_dict' in checkpoint:
+                    pretrained_dict = checkpoint['model_state_dict']
+                elif 'model' in checkpoint:
+                    pretrained_dict = checkpoint['model']
+                else:
+                    pretrained_dict = checkpoint
             else:
                 pretrained_dict = checkpoint
             
             # Get current model state
             model_dict = self.state_dict()
             
-            # Create mapping for DGCNN weights to our model
+            # Analyze pretrained model structure
+            print("\nAnalyzing pretrained model structure...")
+            pretrained_layers = self._analyze_checkpoint(pretrained_dict)
+            
+            # Strategy 1: Try direct mapping for feature extraction layers only
             mapped_dict = {}
             
-            # Common DGCNN weight mappings
-            weight_mappings = {
-                # Edge convolution mappings
-                'conv1.0.weight': 'edge_conv1.0.weight',
-                'conv1.0.bias': 'edge_conv1.0.bias',
-                'conv1.1.weight': 'edge_conv1.1.weight',
-                'conv1.1.bias': 'edge_conv1.1.bias',
-                'conv1.1.running_mean': 'edge_conv1.1.running_mean',
-                'conv1.1.running_var': 'edge_conv1.1.running_var',
-                
-                'conv2.0.weight': 'edge_conv2.0.weight',
-                'conv2.0.bias': 'edge_conv2.0.bias',
-                'conv2.1.weight': 'edge_conv2.1.weight',
-                'conv2.1.bias': 'edge_conv2.1.bias',
-                'conv2.1.running_mean': 'edge_conv2.1.running_mean',
-                'conv2.1.running_var': 'edge_conv2.1.running_var',
-                
-                'conv3.0.weight': 'edge_conv3.0.weight',
-                'conv3.0.bias': 'edge_conv3.0.bias',
-                'conv3.1.weight': 'edge_conv3.1.weight',
-                'conv3.1.bias': 'edge_conv3.1.bias',
-                'conv3.1.running_mean': 'edge_conv3.1.running_mean',
-                'conv3.1.running_var': 'edge_conv3.1.running_var',
-                
-                'conv4.0.weight': 'edge_conv4.0.weight',
-                'conv4.0.bias': 'edge_conv4.0.bias',
-                'conv4.1.weight': 'edge_conv4.1.weight',
-                'conv4.1.bias': 'edge_conv4.1.bias',
-                'conv4.1.running_mean': 'edge_conv4.1.running_mean',
-                'conv4.1.running_var': 'edge_conv4.1.running_var',
-                
-                # Conv5 mappings
-                'conv5.0.weight': 'conv5.0.weight',
-                'conv5.0.bias': 'conv5.0.bias',
-                'conv5.1.weight': 'conv5.1.weight',
-                'conv5.1.bias': 'conv5.1.bias',
-                'conv5.1.running_mean': 'conv5.1.running_mean',
-                'conv5.1.running_var': 'conv5.1.running_var',
-                
-                # Embedding layers (if present in pretrained)
-                'emb.0.weight': 'emb.0.weight',
-                'emb.0.bias': 'emb.0.bias',
-                'emb.1.weight': 'emb.1.weight',
-                'emb.1.bias': 'emb.1.bias',
-                'emb.1.running_mean': 'emb.1.running_mean',
-                'emb.1.running_var': 'emb.1.running_var',
-            }
+            # Define mapping strategies
+            mapping_strategies = [
+                # Strategy 1: Direct DGCNN naming
+                {
+                    'conv1': 'edge_conv1.0',
+                    'bn1': 'edge_conv1.1',
+                    'conv2': 'edge_conv2.0',
+                    'bn2': 'edge_conv2.1',
+                    'conv3': 'edge_conv3.0',
+                    'bn3': 'edge_conv3.1',
+                    'conv4': 'edge_conv4.0',
+                    'bn4': 'edge_conv4.1',
+                },
+                # Strategy 2: EdgeConv naming
+                {
+                    'edge_conv1.conv.0': 'edge_conv1.0',
+                    'edge_conv1.conv.1': 'edge_conv1.1',
+                    'edge_conv2.conv.0': 'edge_conv2.0',
+                    'edge_conv2.conv.1': 'edge_conv2.1',
+                    'edge_conv3.conv.0': 'edge_conv3.0',
+                    'edge_conv3.conv.1': 'edge_conv3.1',
+                    'edge_conv4.conv.0': 'edge_conv4.0',
+                    'edge_conv4.conv.1': 'edge_conv4.1',
+                }
+            ]
             
-            # Also try direct mappings for edge_conv layers
-            for key in pretrained_dict.keys():
-                # Handle edge_conv naming
-                if key.startswith('edge_conv'):
-                    if key in model_dict and pretrained_dict[key].shape == model_dict[key].shape:
-                        mapped_dict[key] = pretrained_dict[key]
+            # Try each mapping strategy
+            for strategy_idx, mapping in enumerate(mapping_strategies, 1):
+                print(f"\nTrying mapping strategy {strategy_idx}...")
+                strategy_mapped = self._apply_mapping_strategy(
+                    pretrained_dict, model_dict, mapping
+                )
+                mapped_dict.update(strategy_mapped)
                 
-                # Handle conv layer mappings
-                elif key in weight_mappings:
-                    target_key = weight_mappings[key]
-                    if target_key in model_dict:
-                        if pretrained_dict[key].shape == model_dict[target_key].shape:
-                            mapped_dict[target_key] = pretrained_dict[key]
-                        else:
-                            print(f"  Shape mismatch: {key} -> {target_key}: {pretrained_dict[key].shape} vs {model_dict[target_key].shape}")
-                
-                # Try direct mapping
-                elif key in model_dict:
-                    if pretrained_dict[key].shape == model_dict[key].shape:
-                        mapped_dict[key] = pretrained_dict[key]
+                if len(strategy_mapped) > 0:
+                    print(f"  Strategy {strategy_idx} mapped {len(strategy_mapped)} parameters")
             
-            # Special handling for models with different input dimensions
-            # If the first conv layer has different input channels, skip it
-            if 'edge_conv1.0.weight' in model_dict:
-                model_in_channels = model_dict['edge_conv1.0.weight'].shape[1]
-                if 'conv1.0.weight' in pretrained_dict:
-                    pretrained_in_channels = pretrained_dict['conv1.0.weight'].shape[1]
-                    if model_in_channels != pretrained_in_channels:
-                        print(f"  Input dimension mismatch ({pretrained_in_channels} vs {model_in_channels}), skipping first conv layer")
-                        # Remove first conv from mapped_dict if it was added
-                        keys_to_remove = ['edge_conv1.0.weight', 'edge_conv1.0.bias']
-                        for key in keys_to_remove:
-                            if key in mapped_dict:
-                                del mapped_dict[key]
-            
-            # Update model with mapped weights
-            model_dict.update(mapped_dict)
-            self.load_state_dict(model_dict, strict=False)
-            
-            print(f"Successfully loaded {len(mapped_dict)}/{len(model_dict)} layers from pretrained model")
-            
-            # Print which layers were loaded
+            # Handle dimension mismatches for first conv layer
             if len(mapped_dict) > 0:
-                print("Loaded layers:")
-                loaded_prefixes = set()
-                for key in mapped_dict.keys():
-                    prefix = key.split('.')[0]
-                    loaded_prefixes.add(prefix)
-                for prefix in sorted(loaded_prefixes):
-                    count = sum(1 for k in mapped_dict.keys() if k.startswith(prefix))
-                    print(f"  {prefix}: {count} parameters")
+                mapped_dict = self._handle_dimension_mismatch(
+                    pretrained_dict, model_dict, mapped_dict
+                )
             
+            # Load aggregation layer (conv5) if possible - this is usually safe
+            conv5_mapped = self._load_conv5(pretrained_dict, model_dict)
+            mapped_dict.update(conv5_mapped)
+            
+            # Apply the mapped weights
+            if len(mapped_dict) > 0:
+                # Only load weights that exist and match
+                filtered_dict = {}
+                for key, value in mapped_dict.items():
+                    if key in model_dict:
+                        if value.shape == model_dict[key].shape:
+                            filtered_dict[key] = value
+                        else:
+                            print(f"  Skipping {key}: shape mismatch {value.shape} vs {model_dict[key].shape}")
+                
+                if len(filtered_dict) > 0:
+                    model_dict.update(filtered_dict)
+                    self.load_state_dict(model_dict, strict=False)
+                    
+                    print(f"\n✓ Successfully loaded {len(filtered_dict)}/{len(model_dict)} parameters")
+                    
+                    # Summary of loaded layers
+                    self._print_loading_summary(filtered_dict)
+                    
+                    # Print which important layers were loaded
+                    important_layers = ['edge_conv1', 'edge_conv2', 'edge_conv3', 'edge_conv4', 'conv5']
+                    print("\nStatus of important layers:")
+                    for layer in important_layers:
+                        loaded = any(key.startswith(layer) for key in filtered_dict.keys())
+                        status = "✓ Loaded" if loaded else "✗ Not loaded"
+                        print(f"  {layer}: {status}")
+                else:
+                    print("\n✗ No compatible weights found after filtering")
+            else:
+                print("\n✗ No weights could be mapped from pretrained model")
+                print("  Continuing with random initialization...")
+                
         except Exception as e:
-            print(f"Warning: Could not load pretrained weights: {e}")
-            print("Continuing with randomly initialized weights")
+            print(f"\n✗ Error loading pretrained weights: {e}")
+            print("  Continuing with random initialization...")
+            import traceback
+            traceback.print_exc()
+    
+    def _analyze_checkpoint(self, state_dict):
+        """Analyze the structure of the checkpoint"""
+        layers = {
+            'conv': [],
+            'bn': [],
+            'linear': [],
+            'other': []
+        }
+        
+        for key in state_dict.keys():
+            if 'conv' in key.lower() and 'weight' in key:
+                layers['conv'].append(key)
+            elif ('bn' in key.lower() or 'norm' in key.lower()) and 'weight' in key:
+                layers['bn'].append(key)
+            elif ('linear' in key.lower() or 'fc' in key.lower()) and 'weight' in key:
+                layers['linear'].append(key)
+            else:
+                layers['other'].append(key)
+        
+        print(f"  Found {len(layers['conv'])} conv layers")
+        print(f"  Found {len(layers['bn'])} batch norm layers")
+        print(f"  Found {len(layers['linear'])} linear layers")
+        
+        return layers
+    
+    def _apply_mapping_strategy(self, pretrained_dict, model_dict, mapping):
+        """Apply a specific mapping strategy"""
+        mapped = {}
+        
+        for pretrained_prefix, model_prefix in mapping.items():
+            # Map all parameters with this prefix
+            for key in pretrained_dict.keys():
+                if key.startswith(pretrained_prefix):
+                    # Create new key
+                    suffix = key[len(pretrained_prefix):]
+                    new_key = model_prefix + suffix
+                    
+                    if new_key in model_dict:
+                        if pretrained_dict[key].shape == model_dict[new_key].shape:
+                            mapped[new_key] = pretrained_dict[key]
+        
+        return mapped
+    
+    def _handle_dimension_mismatch(self, pretrained_dict, model_dict, mapped_dict):
+        """Handle dimension mismatches, especially for first conv layer"""
+        first_conv_key = 'edge_conv1.0.weight'
+        
+        if first_conv_key not in mapped_dict and first_conv_key in model_dict:
+            model_shape = model_dict[first_conv_key].shape
+            print(f"\nHandling first conv layer dimension mismatch...")
+            print(f"  Target shape: {model_shape}")
+            
+            # Look for conv1 in pretrained model
+            candidates = ['conv1.weight', 'edge_conv1.conv.0.weight', 'conv1.0.weight']
+            
+            for candidate in candidates:
+                if candidate in pretrained_dict:
+                    pretrained_shape = pretrained_dict[candidate].shape
+                    print(f"  Found {candidate} with shape {pretrained_shape}")
+                    
+                    # Check if we can adapt it
+                    if pretrained_shape[0] == model_shape[0]:  # Same output channels
+                        if pretrained_shape[1] == 6 and model_shape[1] == 8:
+                            # 3D input (6 after edge features) -> 4D input (8 after edge features)
+                            print(f"  Adapting from 3D to 4D input...")
+                            adapted_weight = torch.zeros(model_shape)
+                            # Initialize with small random values
+                            adapted_weight.normal_(0, 0.01)
+                            # Copy the existing 6 channels
+                            adapted_weight[:, :6, :, :] = pretrained_dict[candidate]
+                            # The last 2 channels for intensity will learn from scratch
+                            mapped_dict[first_conv_key] = adapted_weight
+                            print(f"  ✓ Adapted first conv layer")
+                            break
+                        elif pretrained_shape == model_shape:
+                            # Direct match
+                            mapped_dict[first_conv_key] = pretrained_dict[candidate]
+                            print(f"  ✓ Loaded first conv layer directly")
+                            break
+        
+        return mapped_dict
+    
+    def _load_conv5(self, pretrained_dict, model_dict):
+        """Try to load conv5 aggregation layer"""
+        mapped = {}
+        
+        # Conv5 mappings
+        conv5_mappings = [
+            ('conv5.weight', 'conv5.0.weight'),
+            ('conv5.bias', 'conv5.0.bias'),
+            ('bn5.weight', 'conv5.1.weight'),
+            ('bn5.bias', 'conv5.1.bias'),
+            ('bn5.running_mean', 'conv5.1.running_mean'),
+            ('bn5.running_var', 'conv5.1.running_var'),
+            ('conv5.0.weight', 'conv5.0.weight'),  # Direct mapping
+            ('conv5.1.weight', 'conv5.1.weight'),
+            ('conv5.1.bias', 'conv5.1.bias'),
+            ('conv5.1.running_mean', 'conv5.1.running_mean'),
+            ('conv5.1.running_var', 'conv5.1.running_var'),
+        ]
+        
+        for old_key, new_key in conv5_mappings:
+            if old_key in pretrained_dict and new_key in model_dict:
+                if pretrained_dict[old_key].shape == model_dict[new_key].shape:
+                    mapped[new_key] = pretrained_dict[old_key]
+        
+        return mapped
+    
+    def _print_loading_summary(self, loaded_dict):
+        """Print a summary of what was loaded"""
+        layer_counts = {}
+        
+        for key in loaded_dict.keys():
+            layer = key.split('.')[0]
+            if layer not in layer_counts:
+                layer_counts[layer] = 0
+            layer_counts[layer] += 1
+        
+        print("\nLoaded parameters by layer:")
+        for layer, count in sorted(layer_counts.items()):
+            print(f"  {layer}: {count} parameters")
     
     def forward(self, x):
         """Forward pass with edge convolutions"""
@@ -309,8 +407,6 @@ class FixedDGCNNBackbone(nn.Module):
         for b in range(batch_size):
             coords = torch.from_numpy(coords_list[b]).float().cuda()
             feats = torch.from_numpy(feats_list[b]).float().cuda()
-            
-            original_size = coords.shape[0]
             
             # Subsample if needed
             max_points = 50000 if self.training else 30000
