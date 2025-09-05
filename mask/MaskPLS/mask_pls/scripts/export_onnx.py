@@ -308,7 +308,14 @@ class FullModelWithoutEinsum(nn.Module):
         
         # Process features
         last_coords = coords.pop()
-        mask_features = decoder.mask_feat_proj(feats.pop()) + decoder.pe_layer(last_coords)
+        last_feat = feats.pop()
+        
+        # Reshape feature tensor to expected format for mask_feat_proj
+        # From [B, C, N] to [B, N, C] for linear layer
+        if last_feat.dim() == 3:
+            last_feat = last_feat.permute(0, 2, 1)  # [B, N, C]
+        
+        mask_features = decoder.mask_feat_proj(last_feat) + decoder.pe_layer(last_coords)
         last_pad = pad_masks.pop()
         
         src = []
@@ -316,7 +323,14 @@ class FullModelWithoutEinsum(nn.Module):
         
         for i in range(decoder.num_feature_levels):
             pos.append(decoder.pe_layer(coords[i]))
-            feat = decoder.input_proj[i](feats[i])
+            feat = feats[i]
+            
+            # Reshape feature tensor to expected format for input_proj
+            # From [B, C, N] to [B, N, C] for linear layer
+            if feat.dim() == 3:
+                feat = feat.permute(0, 2, 1)  # [B, N, C]
+                
+            feat = decoder.input_proj[i](feat)
             src.append(feat)
         
         bs = src[0].shape[0]
