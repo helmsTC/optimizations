@@ -364,6 +364,28 @@ def export_onnx(checkpoint, output, num_points, opset, validate, debug):
     print("\n" + "="*60)
     print("Export completed!")
     print("="*60)
+    
+    print("\n📌 IMPORTANT: GPU Inference")
+    print("-" * 30)
+    print("Although export was done on CPU, the model WILL run on GPU!")
+    print("\nExample GPU inference:")
+    print("```python")
+    print("import onnxruntime as ort")
+    print("import numpy as np")
+    print()
+    print("# This automatically uses GPU if available")
+    print("providers = ['CUDAExecutionProvider', 'CPUExecutionProvider']")
+    print(f"session = ort.InferenceSession('{output}', providers=providers)")
+    print()
+    print("# Model runs on GPU!")
+    print("inputs = {")
+    print("    'point_coords': np.random.randn(50000, 3).astype(np.float32),")
+    print("    'point_features': np.random.randn(50000, 4).astype(np.float32)")
+    print("}")
+    print("outputs = session.run(None, inputs)")
+    print("```")
+    print("\nTo test GPU inference, run:")
+    print(f"python inference_onnx_gpu.py {output} --compare")
 
 
 if __name__ == "__main__":
