@@ -219,12 +219,12 @@ class CPUBackboneWrapper(nn.Module):
             all_coords.append(ms_coords_b)
             all_masks.append(ms_masks_b)
             
-            # Semantic segmentation
+            # Semantic segmentation  
             if hasattr(self, 'sem_head'):
-                sem_feat = self.feat_layers[-1](x5)
-                sem_feat = self.out_bn[-1](sem_feat)
-                sem_feat = sem_feat.squeeze(0).T  # [N, C]
-                sem_logits = self.sem_head(sem_feat).unsqueeze(0)  # Add batch dim
+                sem_feat = self.feat_layers[-1](x5)  # [1, C, N]
+                sem_feat = self.out_bn[-1](sem_feat)  # [1, C, N]
+                sem_feat = sem_feat.squeeze(0).permute(1, 0)  # [N, C]
+                sem_logits = self.sem_head(sem_feat).unsqueeze(0)  # [1, N, num_classes]
         
         # Combine batch results
         ms_features = []
