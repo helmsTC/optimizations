@@ -42,9 +42,13 @@ def test_export(model, dummy_input, name):
         # Test forward pass
         with torch.no_grad():
             output = model(dummy_input)
-            print(f"✓ Forward pass successful: {output.shape}")
+            if isinstance(output, tuple):
+                shapes = [o.shape for o in output]
+                print(f"[OK] Forward pass successful: {shapes}")
+            else:
+                print(f"[OK] Forward pass successful: {output.shape}")
     except Exception as e:
-        print(f"✗ Forward pass failed: {e}")
+        print(f"[FAIL] Forward pass failed: {e}")
         return False
     
     try:
@@ -68,19 +72,19 @@ def test_export(model, dummy_input, name):
                 print(f"File header: {header.hex()}")
                 
                 if header.startswith(b'\x08\x07\x12\x07pyto'):
-                    print(f"✗ {name}: Created PyTorch file, not ONNX")
+                    print(f"[FAIL] {name}: Created PyTorch file, not ONNX")
                     Path(output_path).unlink()
                     return False
                 else:
-                    print(f"✓ {name}: Successfully created ONNX file")
+                    print(f"[OK] {name}: Successfully created ONNX file")
                     Path(output_path).unlink()  # Clean up
                     return True
         else:
-            print(f"✗ {name}: No output file created")
+            print(f"[FAIL] {name}: No output file created")
             return False
             
     except Exception as e:
-        print(f"✗ {name}: Export failed with error: {e}")
+        print(f"[FAIL] {name}: Export failed with error: {e}")
         return False
 
 def main():
