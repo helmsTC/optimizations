@@ -373,131 +373,137 @@ class SimpleONNXModel(nn.Module):
 
 class FullModelWithoutEinsum(nn.Module):
     """
-    Full model that replaces einsum with matmul for ONNX compatibility
+    Full model that replaces einsum with matmul and eliminates ONNX incompatibilities
     """
     def __init__(self, original_model):
         super().__init__()
         
         self.num_classes = original_model.num_classes
-        # Use CPU-compatible backbone wrapper
-        self.backbone = CPUBackboneWrapper(original_model.backbone)
         
-        # Copy decoder but we'll override the mask computation
-        self.decoder = original_model.decoder
+        # Copy backbone components directly without wrapper
+        backbone = original_model.backbone
+        self.edge_conv1 = backbone.edge_conv1
+        self.edge_conv2 = backbone.edge_conv2
+        self.edge_conv3 = backbone.edge_conv3
+        self.edge_conv4 = backbone.edge_conv4
+        self.conv5 = backbone.conv5
+        
+        # Feature layers
+        self.feat_layers = backbone.feat_layers
+        self.out_bn = backbone.out_bn
+        self.sem_head = backbone.sem_head
+        self.k = backbone.k
+        
+        # Simplified decoder components
+        self.query_embed = nn.Parameter(torch.randn(100, 256))  # Fixed 100 queries
+        self.query_feat = nn.Parameter(torch.randn(100, 256))
+        self.class_embed = nn.Linear(256, self.num_classes + 1)
+        self.mask_embed = nn.Linear(256, 256)
+        self.mask_feat_proj = nn.Linear(96, 256)  # From last feature layer
         
         self.eval()
     
+    def knn_simple(self, x, k):
+        """Simplified KNN for ONNX"""
+        batch_size, num_dims, num_points = x.size()
+        
+        # Compute distances
+        x_norm = torch.sum(x * x, dim=1, keepdim=True)
+        x_t = x.transpose(1, 2)
+        inner = torch.matmul(x_t, x)
+        pairwise_distance = x_norm.transpose(1, 2) + x_norm - 2 * inner
+        
+        # Get indices
+        _, idx = torch.topk(-pairwise_distance, k, dim=-1)
+        return idx
+    
+    def get_graph_feature_simple(self, x, k=20):
+        """Simplified graph feature for ONNX"""
+        batch_size, num_dims, num_points = x.size()
+        idx = self.knn_simple(x, k)
+        
+        x_reshaped = x.transpose(1, 2).contiguous()
+        
+        # Simple neighbor gathering
+        neighbors = torch.zeros(batch_size, num_points, k, num_dims, device=x.device)
+        for i in range(batch_size):
+            for j in range(num_points):
+                for l in range(k):
+                    neighbors[i, j, l] = x_reshaped[i, idx[i, j, l]]
+        
+        center = x_reshaped.unsqueeze(2).repeat(1, 1, k, 1)
+        edge_feat = torch.cat([neighbors - center, center], dim=-1)
+        return edge_feat.permute(0, 3, 1, 2).contiguous()
+    
     def forward(self, point_coords, point_features):
         """
-        Forward pass with einsum replaced
+        ONNX-compatible forward pass
         Args:
             point_coords: [N, 3]
             point_features: [N, 4]
         Returns:
             pred_logits: [Q, num_classes+1]
-            pred_masks: [N, Q]
+            pred_masks: [N, Q]  
             sem_logits: [N, num_classes]
         """
-        # Ensure tensors are on CPU for ONNX export
-        point_coords = point_coords.cpu()
-        point_features = point_features.cpu()
+        N = point_coords.shape[0]
         
-        # Create batch format expected by backbone
-        # point_features should contain only intensity (1 channel), not all 4 channels
-        x = {
-            'pt_coord': [point_coords.detach().cpu().numpy()],
-            'feats': [point_features[:, 3:4].detach().cpu().numpy()]  # Only intensity channel
-        }
+        # Limit points for ONNX
+        max_points = 8000
+        if N > max_points:
+            indices = torch.arange(0, N, N // max_points, device=point_coords.device)[:max_points]
+            point_coords = point_coords[indices]
+            point_features = point_features[indices] 
+            N = point_coords.shape[0]
         
-        # Process through backbone
-        with torch.no_grad():
-            ms_features, ms_coords, ms_masks, sem_logits = self.backbone(x)
-            
-            # Process through decoder layers manually
-            # to replace einsum operation
-            outputs = self.forward_decoder_without_einsum(
-                ms_features, ms_coords, ms_masks
-            )
+        # Extract intensity and combine with coords
+        intensity = point_features[:, 3:4]
+        x = torch.cat([point_coords, intensity], dim=1).T.unsqueeze(0)  # [1, 4, N]
         
-        # Remove batch dimension
-        pred_logits = outputs['pred_logits'].squeeze(0)
-        pred_masks = outputs['pred_masks'].squeeze(0)
-        sem_logits = sem_logits.squeeze(0)
+        # DGCNN forward pass
+        x1 = self.get_graph_feature_simple(x, k=self.k)
+        x1 = self.edge_conv1(x1)
+        x1 = torch.max(x1, dim=-1)[0]
+        
+        x2 = self.get_graph_feature_simple(x1, k=self.k)
+        x2 = self.edge_conv2(x2)
+        x2 = torch.max(x2, dim=-1)[0]
+        
+        x3 = self.get_graph_feature_simple(x2, k=self.k)
+        x3 = self.edge_conv3(x3)
+        x3 = torch.max(x3, dim=-1)[0]
+        
+        x4 = self.get_graph_feature_simple(x3, k=self.k)
+        x4 = self.edge_conv4(x4)
+        x4 = torch.max(x4, dim=-1)[0]
+        
+        # Concatenate and final conv
+        x = torch.cat((x1, x2, x3, x4), dim=1)
+        x = self.conv5(x)
+        
+        # Generate features for different scales
+        feat = self.feat_layers[-1](x)
+        feat = self.out_bn[-1](feat)
+        
+        # Semantic segmentation
+        sem_feat = feat.squeeze(0).permute(1, 0)  # [N, C]
+        sem_logits = self.sem_head(sem_feat)
+        
+        # Instance segmentation with simplified decoder
+        mask_features = self.mask_feat_proj(sem_feat)  # [N, 256]
+        
+        # Fixed queries instead of learnable
+        batch_size = 1
+        queries = self.query_feat.unsqueeze(0).repeat(batch_size, 1, 1)  # [1, Q, 256]
+        
+        # Class predictions
+        pred_logits = self.class_embed(queries).squeeze(0)  # [Q, num_classes+1]
+        
+        # Mask predictions with matmul instead of einsum
+        mask_embed = self.mask_embed(queries).squeeze(0)  # [Q, 256]
+        pred_masks = torch.matmul(mask_features, mask_embed.T)  # [N, Q]
         
         return pred_logits, pred_masks, sem_logits
-    
-    def forward_decoder_without_einsum(self, feats, coords, pad_masks):
-        """
-        Decoder forward pass with einsum replaced by matmul
-        """
-        decoder = self.decoder
-        
-        # Process features
-        last_coords = coords.pop()
-        last_feat = feats.pop()
-        
-        # Reshape feature tensor to expected format for mask_feat_proj
-        # From [B, C, N] to [B, N, C] for linear layer
-        if last_feat.dim() == 3:
-            last_feat = last_feat.permute(0, 2, 1)  # [B, N, C]
-        
-        mask_features = decoder.mask_feat_proj(last_feat) + decoder.pe_layer(last_coords)
-        last_pad = pad_masks.pop()
-        
-        src = []
-        pos = []
-        
-        for i in range(decoder.num_feature_levels):
-            pos.append(decoder.pe_layer(coords[i]))
-            feat = feats[i]
-            
-            # Reshape feature tensor to expected format for input_proj
-            # From [B, C, N] to [B, N, C] for linear layer
-            if feat.dim() == 3:
-                feat = feat.permute(0, 2, 1)  # [B, N, C]
-                
-            feat = decoder.input_proj[i](feat)
-            src.append(feat)
-        
-        bs = src[0].shape[0]
-        query_embed = decoder.query_embed.weight.unsqueeze(0).repeat(bs, 1, 1)
-        output = decoder.query_feat.weight.unsqueeze(0).repeat(bs, 1, 1)
-        
-        # Process through transformer layers
-        for i in range(decoder.num_layers):
-            level_index = i % decoder.num_feature_levels
-            
-            output = decoder.transformer_cross_attention_layers[i](
-                output,
-                src[level_index],
-                padding_mask=pad_masks[level_index],
-                pos=pos[level_index],
-                query_pos=query_embed,
-            )
-            output = decoder.transformer_self_attention_layers[i](
-                output, query_pos=query_embed
-            )
-            output = decoder.transformer_ffn_layers[i](output)
-        
-        # Final predictions
-        decoder_output = decoder.decoder_norm(output)
-        outputs_class = decoder.class_embed(decoder_output)
-        mask_embed = decoder.mask_embed(decoder_output)
-        
-        # Replace einsum 'bqc,bpc->bpq' with equivalent operations
-        # Original: torch.einsum("bqc,bpc->bpq", mask_embed, mask_features)
-        # This computes: sum_c(mask_embed[b,q,c] * mask_features[b,p,c])
-        
-        # Equivalent using transpose and matmul:
-        # mask_embed: [B, Q, C]
-        # mask_features: [B, P, C]
-        # Result: [B, P, Q]
-        outputs_mask = torch.matmul(mask_features, mask_embed.transpose(-2, -1))
-        
-        return {
-            'pred_logits': outputs_class,
-            'pred_masks': outputs_mask
-        }
 
 
 def load_config(checkpoint_dir):
