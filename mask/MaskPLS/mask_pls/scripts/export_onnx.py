@@ -113,6 +113,138 @@ class SimplifiedSemanticModel(nn.Module):
         return sem_logits
 
 
+class CPUBackboneWrapper(nn.Module):
+    """
+    Wrapper that patches the backbone's forward method to work on CPU for ONNX export
+    """
+    def __init__(self, original_backbone):
+        super().__init__()
+        # Copy all attributes from original backbone
+        for name, module in original_backbone.named_children():
+            self.add_module(name, module)
+        
+        # Copy non-module attributes
+        for attr_name in dir(original_backbone):
+            if not attr_name.startswith('_') and not hasattr(self, attr_name):
+                attr = getattr(original_backbone, attr_name)
+                if not callable(attr) and not isinstance(attr, nn.Module):
+                    setattr(self, attr_name, attr)
+        
+        self.eval()
+    
+    def forward(self, x):
+        """CPU-compatible version of backbone forward"""
+        coords_list = x['pt_coord']
+        feats_list = x['feats']
+        
+        batch_size = len(coords_list)
+        
+        # Clear subsample tracking
+        self.subsample_indices = {}
+        
+        # Process each point cloud
+        all_features = []
+        all_coords = []
+        all_masks = []
+        
+        for b in range(batch_size):
+            # Use CPU instead of hardcoded CUDA
+            device = next(self.parameters()).device
+            coords = torch.from_numpy(coords_list[b]).float().to(device)
+            feats = torch.from_numpy(feats_list[b]).float().to(device)
+            
+            # Subsample if needed
+            max_points = 30000  # Use smaller number for export
+            if coords.shape[0] > max_points:
+                indices = torch.randperm(coords.shape[0], device=coords.device)[:max_points]
+                indices = indices.sort()[0]
+                coords = coords[indices]
+                feats = feats[indices]
+                self.subsample_indices[b] = indices
+            else:
+                self.subsample_indices[b] = torch.arange(coords.shape[0], device=coords.device)
+            
+            # Process through DGCNN
+            N = coords.shape[0]
+            
+            # Prepare input: [1, 4, N] (xyz + intensity)
+            if feats.dim() == 1:
+                feats = feats.unsqueeze(1)
+            x_input = torch.cat([coords, feats], dim=1).T.unsqueeze(0)
+            
+            # Import graph feature function
+            from mask_pls.models.dgcnn.dgcnn_backbone_efficient import get_graph_feature
+            
+            # Process through edge convolutions
+            # Conv1: 4 -> 64
+            x1 = get_graph_feature(x_input, k=self.k)
+            x1 = self.edge_conv1(x1)
+            x1 = x1.max(dim=-1, keepdim=False)[0]
+            
+            # Conv2: 64 -> 64
+            x2 = get_graph_feature(x1, k=self.k)
+            x2 = self.edge_conv2(x2)
+            x2 = x2.max(dim=-1, keepdim=False)[0]
+            
+            # Conv3: 64 -> 128
+            x3 = get_graph_feature(x2, k=self.k)
+            x3 = self.edge_conv3(x3)
+            x3 = x3.max(dim=-1, keepdim=False)[0]
+            
+            # Conv4: 128 -> 256
+            x4 = get_graph_feature(x3, k=self.k)
+            x4 = self.edge_conv4(x4)
+            x4 = x4.max(dim=-1, keepdim=False)[0]
+            
+            # Concatenate: 64+64+128+256 = 512
+            feat_concat = torch.cat((x1, x2, x3, x4), dim=1)
+            
+            # Conv5: 512 -> 512
+            x5 = self.conv5(feat_concat)
+            
+            # Multi-scale features
+            ms_features_b = []
+            ms_coords_b = []
+            ms_masks_b = []
+            
+            # Create features at different scales
+            for i, (feat_layer, out_bn) in enumerate(zip(self.feat_layers, self.out_bn)):
+                feat = feat_layer(x5)
+                feat = out_bn(feat)
+                ms_features_b.append(feat)
+                ms_coords_b.append(coords.unsqueeze(0))  # Add batch dim
+                ms_masks_b.append(torch.zeros(1, N, dtype=torch.bool, device=device))
+            
+            all_features.append(ms_features_b)
+            all_coords.append(ms_coords_b)
+            all_masks.append(ms_masks_b)
+            
+            # Semantic segmentation
+            if hasattr(self, 'sem_head'):
+                sem_feat = self.feat_layers[-1](x5)
+                sem_feat = self.out_bn[-1](sem_feat)
+                sem_feat = sem_feat.squeeze(0).T  # [N, C]
+                sem_logits = self.sem_head(sem_feat).unsqueeze(0)  # Add batch dim
+        
+        # Combine batch results
+        ms_features = []
+        ms_coords = []
+        ms_masks = []
+        
+        # Transpose from [batch][scale] to [scale][batch]
+        num_scales = len(all_features[0])
+        for scale in range(num_scales):
+            scale_features = torch.cat([all_features[b][scale] for b in range(batch_size)], dim=0)
+            scale_coords = torch.cat([all_coords[b][scale] for b in range(batch_size)], dim=0)
+            scale_masks = torch.cat([all_masks[b][scale] for b in range(batch_size)], dim=0)
+            
+            ms_features.append(scale_features)
+            ms_coords.append(scale_coords)
+            ms_masks.append(scale_masks)
+        
+        return ms_features, ms_coords, ms_masks, sem_logits
+
+
 class FullModelWithoutEinsum(nn.Module):
     """
     Full model that replaces einsum with matmul for ONNX compatibility
@@ -121,7 +253,8 @@ class FullModelWithoutEinsum(nn.Module):
         super().__init__()
         
         self.num_classes = original_model.num_classes
-        self.backbone = original_model.backbone
+        # Use CPU-compatible backbone wrapper
+        self.backbone = CPUBackboneWrapper(original_model.backbone)
         
         # Copy decoder but we'll override the mask computation
         self.decoder = original_model.decoder
@@ -139,6 +272,10 @@ class FullModelWithoutEinsum(nn.Module):
             pred_masks: [N, Q]
             sem_logits: [N, num_classes]
         """
+        # Ensure tensors are on CPU for ONNX export
+        point_coords = point_coords.cpu()
+        point_features = point_features.cpu()
+        
         # Create batch format expected by backbone
         x = {
             'pt_coord': [point_coords.detach().cpu().numpy()],
@@ -303,6 +440,9 @@ def export_onnx(checkpoint, output, num_points, opset, mode, validate):
     
     model.load_state_dict(state_dict, strict=False)
     model.eval()
+    
+    # Move model to CPU for ONNX export to avoid device mismatches
+    model = model.cpu()
     
     # Create ONNX model based on mode
     if mode == 'semantic':
