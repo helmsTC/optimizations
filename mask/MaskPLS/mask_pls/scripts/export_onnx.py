@@ -277,9 +277,10 @@ class FullModelWithoutEinsum(nn.Module):
         point_features = point_features.cpu()
         
         # Create batch format expected by backbone
+        # point_features should contain only intensity (1 channel), not all 4 channels
         x = {
             'pt_coord': [point_coords.detach().cpu().numpy()],
-            'feats': [point_features.detach().cpu().numpy()]
+            'feats': [point_features[:, 3:4].detach().cpu().numpy()]  # Only intensity channel
         }
         
         # Process through backbone
@@ -468,9 +469,10 @@ def export_onnx(checkpoint, output, num_points, opset, mode, validate):
         print("\nCreating full model (with instance segmentation)...")
         onnx_model = FullModelWithoutEinsum(model)
         
-        # Test inputs
+        # Test inputs - features should be [xyz + intensity]
         dummy_points = torch.randn(num_points, 3)
-        dummy_features = torch.randn(num_points, 4)
+        dummy_intensity = torch.randn(num_points, 1)
+        dummy_features = torch.cat([dummy_points, dummy_intensity], dim=1)  # [N, 4]
         
         input_names = ['point_coords', 'point_features']
         output_names = ['pred_logits', 'pred_masks', 'sem_logits']
