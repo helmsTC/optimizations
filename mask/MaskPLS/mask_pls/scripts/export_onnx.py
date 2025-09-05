@@ -245,6 +245,132 @@ class CPUBackboneWrapper(nn.Module):
         return ms_features, ms_coords, ms_masks, sem_logits
 
 
+class SimpleONNXModel(nn.Module):
+    """
+    Heavily simplified model that should export to ONNX successfully
+    """
+    def __init__(self, original_model):
+        super().__init__()
+        
+        self.num_classes = original_model.num_classes
+        
+        # Just copy the backbone layers we need
+        backbone = original_model.backbone
+        self.edge_conv1 = backbone.edge_conv1
+        self.edge_conv2 = backbone.edge_conv2
+        self.edge_conv3 = backbone.edge_conv3
+        self.edge_conv4 = backbone.edge_conv4
+        self.conv5 = backbone.conv5
+        
+        # Just the semantic head
+        self.feat_layer = backbone.feat_layers[-1]
+        self.out_bn = backbone.out_bn[-1]
+        self.sem_head = backbone.sem_head
+        
+        self.k = 20
+        self.eval()
+    
+    def knn_onnx_compatible(self, x, k):
+        """ONNX-compatible version of KNN"""
+        batch_size, num_dims, num_points = x.size()
+        
+        # Compute pairwise distances
+        x_norm = torch.sum(x * x, dim=1, keepdim=True)  # [B, 1, N]
+        x_t = x.transpose(1, 2)  # [B, N, D]
+        inner = torch.matmul(x_t, x)  # [B, N, N]
+        
+        pairwise_distance = x_norm.transpose(1, 2) + x_norm - 2 * inner
+        
+        # Get top-k (smallest distances)
+        _, idx = torch.topk(-pairwise_distance, k, dim=-1)
+        return idx
+    
+    def get_graph_feature_onnx(self, x, k=20):
+        """ONNX-compatible graph feature construction"""
+        batch_size, num_dims, num_points = x.size()
+        
+        # Get KNN indices
+        idx = self.knn_onnx_compatible(x, k)
+        
+        # Gather neighbors - use simpler indexing
+        x_reshaped = x.transpose(1, 2).contiguous()  # [B, N, D]
+        
+        # Create neighbor features
+        neighbors = torch.zeros(batch_size, num_points, k, num_dims, device=x.device)
+        for i in range(batch_size):
+            for j in range(num_points):
+                for l in range(k):
+                    neighbors[i, j, l] = x_reshaped[i, idx[i, j, l]]
+        
+        # Center point repeated
+        center = x_reshaped.unsqueeze(2).repeat(1, 1, k, 1)
+        
+        # Edge features: [neighbor - center, center]
+        edge_feat = torch.cat([neighbors - center, center], dim=-1)
+        edge_feat = edge_feat.permute(0, 3, 1, 2).contiguous()  # [B, 2*D, N, K]
+        
+        return edge_feat
+        
+    def forward(self, point_coords, point_features):
+        """
+        Simplified forward pass
+        Args:
+            point_coords: [N, 3]
+            point_features: [N, 4] - [xyz + intensity]
+        Returns:
+            sem_logits: [N, num_classes]
+        """
+        N = point_coords.shape[0]
+        
+        # Subsample for ONNX export
+        max_points = 5000  # Much smaller for ONNX compatibility
+        if N > max_points:
+            indices = torch.arange(0, N, N // max_points, device=point_coords.device)[:max_points]
+            point_coords = point_coords[indices]
+            point_features = point_features[indices]
+            N = point_coords.shape[0]
+        
+        # Prepare input: [1, 4, N] (xyz + intensity)
+        intensity = point_features[:, 3:4]  # Only intensity
+        x = torch.cat([point_coords, intensity], dim=1).T.unsqueeze(0)  # [1, 4, N]
+        
+        # Process through simplified DGCNN
+        # Edge conv 1
+        x1 = self.get_graph_feature_onnx(x, k=self.k)
+        x1 = self.edge_conv1(x1)
+        x1 = torch.max(x1, dim=-1)[0]  # [B, C, N]
+        
+        # Edge conv 2
+        x2 = self.get_graph_feature_onnx(x1, k=self.k)
+        x2 = self.edge_conv2(x2)
+        x2 = torch.max(x2, dim=-1)[0]
+        
+        # Edge conv 3
+        x3 = self.get_graph_feature_onnx(x2, k=self.k)
+        x3 = self.edge_conv3(x3)
+        x3 = torch.max(x3, dim=-1)[0]
+        
+        # Edge conv 4
+        x4 = self.get_graph_feature_onnx(x3, k=self.k)
+        x4 = self.edge_conv4(x4)
+        x4 = torch.max(x4, dim=-1)[0]
+        
+        # Concatenate features
+        x = torch.cat((x1, x2, x3, x4), dim=1)
+        
+        # Conv5
+        x = self.conv5(x)
+        
+        # Project to feature space and get semantic logits
+        feat = self.feat_layer(x)
+        feat = self.out_bn(feat)
+        feat = feat.squeeze(0).permute(1, 0)  # [N, C]
+        
+        sem_logits = self.sem_head(feat)
+        
+        return sem_logits
+
+
 class FullModelWithoutEinsum(nn.Module):
     """
     Full model that replaces einsum with matmul for ONNX compatibility
@@ -408,8 +534,8 @@ def load_config(checkpoint_dir):
 @click.option('--output', '-o', default=None, help='Output ONNX path')
 @click.option('--num-points', '-n', default=10000, help='Number of test points')
 @click.option('--opset', default=12, help='ONNX opset version (12+ for full model)')
-@click.option('--mode', type=click.Choice(['semantic', 'full']), default='semantic',
-              help='Export mode: semantic only or full model')
+@click.option('--mode', type=click.Choice(['semantic', 'full', 'simple']), default='semantic',
+              help='Export mode: semantic only, full model, or simple ONNX-compatible model')
 @click.option('--validate', is_flag=True, help='Validate after export')
 def export_onnx(checkpoint, output, num_points, opset, mode, validate):
     """Export MaskPLS-DGCNN to ONNX - Final Fixed Version"""
@@ -428,7 +554,7 @@ def export_onnx(checkpoint, output, num_points, opset, mode, validate):
     # Output path
     if output is None:
         checkpoint_path = Path(checkpoint)
-        suffix = "_semantic.onnx" if mode == 'semantic' else "_full.onnx"
+        suffix = f"_{mode}.onnx"
         output = checkpoint_path.parent / f"{checkpoint_path.stem}{suffix}"
     
     print(f"Checkpoint: {checkpoint}")
@@ -478,6 +604,26 @@ def export_onnx(checkpoint, output, num_points, opset, mode, validate):
         }
         
         dummy_input = (dummy_points, dummy_intensity)
+        
+    elif mode == 'simple':
+        print("\nCreating simple ONNX-compatible model...")
+        onnx_model = SimpleONNXModel(model)
+        
+        # Test inputs - features should be [xyz + intensity]
+        dummy_points = torch.randn(num_points, 3)
+        dummy_intensity = torch.randn(num_points, 1)
+        dummy_features = torch.cat([dummy_points, dummy_intensity], dim=1)  # [N, 4]
+        
+        input_names = ['point_coords', 'point_features']
+        output_names = ['sem_logits']
+        
+        dynamic_axes = {
+            'point_coords': {0: 'num_points'},
+            'point_features': {0: 'num_points'},
+            'sem_logits': {0: 'num_points'}
+        }
+        
+        dummy_input = (dummy_points, dummy_features)
         
     else:  # full
         print("\nCreating full model (with instance segmentation)...")
