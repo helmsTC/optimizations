@@ -531,34 +531,53 @@ def export_onnx(checkpoint, output, num_points, opset, mode, validate):
         print(f"Model device: {next(onnx_model.parameters()).device}")
         print(f"Input shapes: {[inp.shape if hasattr(inp, 'shape') else type(inp) for inp in dummy_input]}")
         
+        # First, test the model with JIT tracing to catch ONNX incompatibilities early
+        print("Testing model with JIT tracing...")
+        try:
+            with torch.no_grad():
+                traced_model = torch.jit.trace(onnx_model, dummy_input)
+                traced_output = traced_model(*dummy_input)
+                print("✓ JIT tracing successful")
+        except Exception as trace_error:
+            print(f"⚠ JIT tracing failed: {trace_error}")
+            print("This may indicate ONNX incompatibilities")
+        
+        # Now attempt ONNX export with explicit file handling
+        temp_output = str(output_path) + '.tmp'
+        
         torch.onnx.export(
             onnx_model,
             dummy_input,
-            str(output_path),
+            temp_output,  # Use temp file first
             export_params=True,
             opset_version=opset,
-            do_constant_folding=True,
+            do_constant_folding=False,  # Disable this to avoid potential issues
             input_names=input_names,
             output_names=output_names,
             dynamic_axes=dynamic_axes,
-            verbose=True,  # Enable verbose output to see what's happening
-            training=torch.onnx.TrainingMode.EVAL
+            verbose=False,  # Disable verbose to avoid wall of text
+            training=torch.onnx.TrainingMode.EVAL,
+            operator_export_type=torch.onnx.OperatorExportTypes.ONNX
         )
+        
+        # Move temp file to final location only if it's actually ONNX
+        if Path(temp_output).exists():
+            with open(temp_output, 'rb') as f:
+                header = f.read(16)
+                if header.startswith(b'\x08\x07\x12\x07pyto'):
+                    Path(temp_output).unlink()
+                    raise RuntimeError("torch.onnx.export created PyTorch file instead of ONNX!")
+                else:
+                    Path(temp_output).rename(output_path)
+        else:
+            raise RuntimeError("torch.onnx.export did not create any output file!")
         
         print(f"✓ Exported to {output_path}")
         
-        # Check if file was actually created and is ONNX format
-        if not output_path.exists():
-            raise RuntimeError(f"Output file was not created: {output_path}")
-        
-        # Check file header
+        # Final verification - check file header
         with open(output_path, 'rb') as f:
             header = f.read(16)
-            print(f"File header: {header.hex()}")
-            
-            # ONNX files should start with protobuf header, not PyTorch header
-            if header.startswith(b'\x08\x07\x12\x07pyto'):
-                raise RuntimeError("File appears to be PyTorch format, not ONNX!")
+            print(f"Final file header: {header.hex()}")
         
         # Verify with ONNX
         try:
