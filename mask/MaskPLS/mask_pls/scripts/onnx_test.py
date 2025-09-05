@@ -69,12 +69,24 @@ class ONNXModelTester:
     def detect_model_type(self):
         """Detect if this is semantic-only or full model"""
         if len(self.input_names) == 2:
-            if 'intensity' in self.input_names[1]:
+            # Check input names to determine model type
+            if ('intensity' in self.input_names[1]) or ('points' in self.input_names[0] and 'intensity' in self.input_names[1]):
                 self.model_type = 'semantic'
                 print("Detected model type: Semantic segmentation only")
-            else:
+            elif ('point_coords' in self.input_names[0] and 'point_features' in self.input_names[1]):
                 self.model_type = 'full'
                 print("Detected model type: Full (with instance segmentation)")
+            else:
+                # Fallback: check output count
+                if len(self.output_names) == 1:
+                    self.model_type = 'semantic'
+                    print("Detected model type: Semantic segmentation only (by output count)")
+                elif len(self.output_names) == 3:
+                    self.model_type = 'full'
+                    print("Detected model type: Full (by output count)")
+                else:
+                    self.model_type = 'unknown'
+                    print("Warning: Unknown model type")
         else:
             self.model_type = 'unknown'
             print("Warning: Unknown model type")
