@@ -149,17 +149,24 @@ def trace_based_export(model, output_path, num_points=50000):
     """
     print("\nAttempting trace-based export...")
     
-    # Create example inputs
-    example_coords = torch.randn(1, num_points, 3)
-    example_features = torch.randn(1, num_points, 4)
+    # Ensure model is on CPU
+    model = model.cpu()
+    
+    # Create example inputs on CPU
+    example_coords = torch.randn(1, num_points, 3).cpu()
+    example_features = torch.randn(1, num_points, 4).cpu()
     
     # Create a simplified forward function
     class TraceWrapper(nn.Module):
         def __init__(self, original_model):
             super().__init__()
-            self.model = original_model
+            self.model = original_model.cpu()
             
         def forward(self, coords, features):
+            # Ensure inputs are on CPU
+            coords = coords.cpu()
+            features = features.cpu()
+            
             # Combine into single tensor for processing
             combined = torch.cat([coords, features[:, :, 3:]], dim=-1)
             
@@ -167,19 +174,20 @@ def trace_based_export(model, output_path, num_points=50000):
             # Note: This is a simplified version - real processing would be more complex
             B, N, C = combined.shape
             
-            # Mock outputs with correct shapes
+            # Mock outputs with correct shapes (on CPU)
             num_queries = 100
             num_classes = 20
             
-            pred_logits = torch.randn(B, num_queries, num_classes + 1)
-            pred_masks = torch.randn(B, N, num_queries)
-            sem_logits = torch.randn(B, N, num_classes)
+            pred_logits = torch.randn(B, num_queries, num_classes + 1).cpu()
+            pred_masks = torch.randn(B, N, num_queries).cpu()
+            sem_logits = torch.randn(B, N, num_classes).cpu()
             
             return pred_logits, pred_masks, sem_logits
     
     try:
         trace_model = TraceWrapper(model)
         trace_model.eval()
+        trace_model.cpu()
         
         with torch.no_grad():
             traced = torch.jit.trace(trace_model, (example_coords, example_features))
