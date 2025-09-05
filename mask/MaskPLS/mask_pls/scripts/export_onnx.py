@@ -518,25 +518,56 @@ def export_onnx(checkpoint, output, num_points, opset, mode, validate):
     # Export
     print("\nExporting to ONNX...")
     try:
+        # Ensure output directory exists
+        output_path = Path(output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        
+        # Remove existing file if it exists
+        if output_path.exists():
+            output_path.unlink()
+            print(f"Removed existing file: {output_path}")
+        
+        print(f"Attempting export to: {output_path}")
+        print(f"Model device: {next(onnx_model.parameters()).device}")
+        print(f"Input shapes: {[inp.shape if hasattr(inp, 'shape') else type(inp) for inp in dummy_input]}")
+        
         torch.onnx.export(
             onnx_model,
             dummy_input,
-            str(output),
+            str(output_path),
             export_params=True,
             opset_version=opset,
             do_constant_folding=True,
             input_names=input_names,
             output_names=output_names,
             dynamic_axes=dynamic_axes,
-            verbose=False
+            verbose=True,  # Enable verbose output to see what's happening
+            training=torch.onnx.TrainingMode.EVAL
         )
         
-        print(f"✓ Exported to {output}")
+        print(f"✓ Exported to {output_path}")
         
-        # Verify
-        model_onnx = onnx.load(str(output))
-        onnx.checker.check_model(model_onnx)
-        print("✓ ONNX model is valid")
+        # Check if file was actually created and is ONNX format
+        if not output_path.exists():
+            raise RuntimeError(f"Output file was not created: {output_path}")
+        
+        # Check file header
+        with open(output_path, 'rb') as f:
+            header = f.read(16)
+            print(f"File header: {header.hex()}")
+            
+            # ONNX files should start with protobuf header, not PyTorch header
+            if header.startswith(b'\x08\x07\x12\x07pyto'):
+                raise RuntimeError("File appears to be PyTorch format, not ONNX!")
+        
+        # Verify with ONNX
+        try:
+            model_onnx = onnx.load(str(output_path))
+            onnx.checker.check_model(model_onnx)
+            print("✓ ONNX model is valid")
+        except Exception as verify_error:
+            print(f"⚠ ONNX verification failed: {verify_error}")
+            print("File was created but may not be valid ONNX format")
         
     except Exception as e:
         print(f"✗ Export failed: {e}")

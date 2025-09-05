@@ -71,32 +71,33 @@ class ONNXModelTester:
         print(f"Debug: Input names: {self.input_names}")
         print(f"Debug: Output names: {self.output_names}")
         
-        if len(self.input_names) == 2:
-            # Check input names to determine model type
+        # Primary detection: use output count (most reliable)
+        if len(self.output_names) == 1:
+            self.model_type = 'semantic'
+            print("Detected model type: Semantic segmentation only (1 output)")
+        elif len(self.output_names) == 3:
+            self.model_type = 'full'
+            print("Detected model type: Full model (3 outputs: logits, masks, semantic)")
+        elif len(self.input_names) == 2:
+            # Secondary detection: check input names
             input_0, input_1 = self.input_names[0], self.input_names[1]
             
             # Semantic model: points + intensity
             if ('intensity' in input_1.lower()) or ('points' in input_0.lower() and 'intensity' in input_1.lower()):
                 self.model_type = 'semantic'
-                print("Detected model type: Semantic segmentation only")
+                print("Detected model type: Semantic segmentation only (by input names)")
             # Full model: point_coords + point_features  
             elif ('point_coords' in input_0.lower() and 'point_features' in input_1.lower()) or ('coord' in input_0.lower() and 'feature' in input_1.lower()):
                 self.model_type = 'full'
-                print("Detected model type: Full (with instance segmentation)")
+                print("Detected model type: Full model (by input names)")
             else:
-                # Fallback: check output count
-                if len(self.output_names) == 1:
-                    self.model_type = 'semantic'
-                    print("Detected model type: Semantic segmentation only (by output count)")
-                elif len(self.output_names) == 3:
-                    self.model_type = 'full'
-                    print("Detected model type: Full (by output count)")
-                else:
-                    self.model_type = 'unknown'
-                    print(f"Warning: Unknown model type - inputs: {self.input_names}, outputs: {self.output_names}")
+                # Default to full model if we have 2 inputs and can't determine otherwise
+                self.model_type = 'full'
+                print(f"Assuming full model type (2 inputs, unknown names: {self.input_names})")
         else:
-            self.model_type = 'unknown'
-            print(f"Warning: Unknown model type - expected 2 inputs, got {len(self.input_names)}")
+            # Default fallback
+            self.model_type = 'full' if len(self.input_names) == 2 else 'unknown'
+            print(f"Fallback model type: {self.model_type} (inputs: {len(self.input_names)}, outputs: {len(self.output_names)})")
     
     def print_model_info(self):
         """Print model information"""
