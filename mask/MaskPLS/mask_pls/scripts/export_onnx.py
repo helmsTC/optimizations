@@ -1,18 +1,21 @@
-# mask_pls/scripts/export_fixed_dgcnn_onnx.py
+# mask_pls/scripts/export_dgcnn_cpu_compatible.py
 """
-Export MaskPLS-DGCNN Fixed model (from train_efficient_dgcnn.py) to ONNX format
+Export MaskPLS-DGCNN Fixed model to ONNX with CPU-compatible backbone
+This version patches all CUDA calls in the backbone
 """
 
 import os
 import sys
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 import onnx
 from pathlib import Path
 import click
 import yaml
 from easydict import EasyDict as edict
+import types
 
 # Add parent directory to path
 sys.path.append(str(Path(__file__).parent.parent))
@@ -21,73 +24,134 @@ from mask_pls.models.dgcnn.maskpls_dgcnn_optimized import MaskPLSDGCNNFixed
 from mask_pls.models.dgcnn.dgcnn_backbone_efficient_fixed import FixedDGCNNBackbone
 
 
-class ONNXExportWrapper(nn.Module):
+def create_cpu_compatible_forward(original_model):
     """
-    Wrapper to make the model ONNX-exportable
-    This simplifies the forward pass for ONNX export
+    Create a CPU-compatible forward method for the backbone
+    """
+    def cpu_forward(self, x):
+        coords_list = x['pt_coord']
+        feats_list = x['feats']
+        
+        batch_size = len(coords_list)
+        
+        # Clear subsample tracking
+        self.subsample_indices = {}
+        
+        # Process each point cloud
+        all_features = []
+        all_coords = []
+        all_masks = []
+        
+        for b in range(batch_size):
+            # Convert to tensors WITHOUT .cuda()
+            coords = torch.from_numpy(coords_list[b]).float()  # No .cuda()!
+            feats = torch.from_numpy(feats_list[b]).float()    # No .cuda()!
+            
+            # Subsample if needed
+            max_points = 50000 if self.training else 30000
+            if coords.shape[0] > max_points:
+                indices = torch.randperm(coords.shape[0])[:max_points]  # CPU tensor
+                indices = indices.sort()[0]
+                coords = coords[indices]
+                feats = feats[indices]
+                self.subsample_indices[b] = indices
+            else:
+                self.subsample_indices[b] = torch.arange(coords.shape[0])  # CPU tensor
+            
+            # Process through DGCNN
+            point_features = self.process_single_cloud(coords, feats)
+            
+            all_features.append(point_features)
+            all_coords.append(coords)
+            # Create mask on CPU
+            all_masks.append(torch.zeros(coords.shape[0], dtype=torch.bool))  # No device specified
+        
+        # Generate multi-scale features with padding
+        ms_features = []
+        ms_coords = []
+        ms_masks = []
+        
+        for i in range(len(self.feat_layers)):
+            level_features, level_coords, level_masks = self.pad_batch_level(
+                [f[i] for f in all_features],
+                all_coords,
+                all_masks
+            )
+            ms_features.append(level_features)
+            ms_coords.append(level_coords)
+            ms_masks.append(level_masks)
+        
+        # Semantic predictions
+        sem_logits = self.compute_semantic_logits(ms_features[-1], ms_masks[-1])
+        
+        return ms_features, ms_coords, ms_masks, sem_logits
+    
+    return cpu_forward
+
+
+def patch_backbone_for_cpu(backbone):
+    """
+    Patch the backbone to work on CPU by replacing its forward method
+    """
+    # Replace the forward method
+    backbone.forward = types.MethodType(create_cpu_compatible_forward(backbone), backbone)
+    
+    # Also patch the compute_semantic_logits method if it uses device
+    original_compute_sem = backbone.compute_semantic_logits
+    
+    def cpu_compute_semantic_logits(self, features, masks):
+        batch_size = features.shape[0]
+        sem_logits = []
+        
+        for b in range(batch_size):
+            valid_mask = ~masks[b]
+            if valid_mask.sum() > 0:
+                valid_features = features[b][valid_mask]
+                logits = self.sem_head(valid_features)
+            else:
+                # Create on CPU instead of specifying device
+                logits = torch.zeros(0, self.num_classes)
+            
+            # Pad back to full size
+            full_logits = torch.zeros(features.shape[1], self.num_classes)
+            if valid_mask.sum() > 0:
+                full_logits[valid_mask] = logits
+            
+            sem_logits.append(full_logits)
+        
+        return torch.stack(sem_logits)
+    
+    backbone.compute_semantic_logits = types.MethodType(cpu_compute_semantic_logits, backbone)
+    
+    return backbone
+
+
+class CPUONNXWrapper(nn.Module):
+    """
+    ONNX export wrapper that ensures everything runs on CPU
     """
     def __init__(self, model):
         super().__init__()
-        self.model = model
-        self.backbone = model.backbone
-        self.decoder = model.decoder
+        # Move model to CPU
+        self.model = model.cpu()
+        self.backbone = model.backbone.cpu()
+        self.decoder = model.decoder.cpu()
         self.num_classes = model.num_classes
         
-    def forward(self, point_coords, point_features):
-        """
-        Simplified forward pass for ONNX export
+        # Patch the backbone to work on CPU
+        self.backbone = patch_backbone_for_cpu(self.backbone)
         
-        Args:
-            point_coords: [B, N, 3] point coordinates
-            point_features: [B, N, 4] point features (x,y,z,intensity)
-        
-        Returns:
-            pred_logits: [B, Q, num_classes+1] class predictions
-            pred_masks: [B, N, Q] mask predictions  
-            sem_logits: [B, N, num_classes] semantic predictions
-        """
-        B, N, _ = point_coords.shape
-        
-        # Create input dict for backbone (mimicking the dataloader format)
-        x = {
-            'pt_coord': [point_coords[b].cpu().numpy() for b in range(B)],
-            'feats': [point_features[b].cpu().numpy() for b in range(B)]
-        }
-        
-        # Get features from backbone
-        ms_features, ms_coords, ms_masks, sem_logits = self.backbone(x)
-        
-        # Decoder
-        outputs, padding = self.decoder(ms_features, ms_coords, ms_masks)
-        
-        pred_logits = outputs['pred_logits']
-        pred_masks = outputs['pred_masks']
-        
-        return pred_logits, pred_masks, sem_logits
-
-
-class SimplifiedONNXWrapper(nn.Module):
-    """
-    Even more simplified wrapper that processes one sample at a time
-    """
-    def __init__(self, model):
-        super().__init__()
-        self.model = model
-        # Store the fixed modules
-        self.backbone = model.backbone
-        self.decoder = model.decoder
-        self.num_classes = model.num_classes
-        
-        # Pre-extract some weights if needed
+        # Set to eval mode
+        self.model.eval()
         self.backbone.eval()
         self.decoder.eval()
-        
+    
     def forward(self, point_coords, point_features):
         """
-        Process single point cloud
+        Forward pass for ONNX export (batch size 1)
         
         Args:
-            point_coords: [N, 3] point coordinates (single sample, no batch)
+            point_coords: [N, 3] point coordinates
             point_features: [N, 4] point features
             
         Returns:
@@ -95,24 +159,28 @@ class SimplifiedONNXWrapper(nn.Module):
             pred_masks: [N, Q]
             sem_logits: [N, num_classes]
         """
+        # Ensure everything is on CPU
+        point_coords = point_coords.cpu() if hasattr(point_coords, 'cpu') else point_coords
+        point_features = point_features.cpu() if hasattr(point_features, 'cpu') else point_features
+        
         # Add batch dimension
-        coords = point_coords.unsqueeze(0)  # [1, N, 3]
-        feats = point_features.unsqueeze(0)  # [1, N, 4]
+        coords = point_coords.unsqueeze(0)
+        feats = point_features.unsqueeze(0)
         
         # Convert to expected format
         x = {
-            'pt_coord': [coords[0].detach().cpu().numpy()],
-            'feats': [feats[0].detach().cpu().numpy()]
+            'pt_coord': [coords[0].detach().numpy()],
+            'feats': [feats[0].detach().numpy()]
         }
         
-        # Forward through backbone
+        # Forward through patched backbone
         with torch.no_grad():
             ms_features, ms_coords, ms_masks, sem_logits = self.backbone(x)
             
             # Forward through decoder
             outputs, padding = self.decoder(ms_features, ms_coords, ms_masks)
         
-        # Remove batch dimension for output
+        # Remove batch dimension
         pred_logits = outputs['pred_logits'].squeeze(0)
         pred_masks = outputs['pred_masks'].squeeze(0)
         sem_logits = sem_logits.squeeze(0)
@@ -121,10 +189,7 @@ class SimplifiedONNXWrapper(nn.Module):
 
 
 def get_config():
-    """Load configuration (matching train_efficient_dgcnn.py)"""
-    def getDir(obj):
-        return os.path.dirname(os.path.abspath(obj))
-    
+    """Load configuration"""
     config_dir = Path(__file__).parent.parent / "config"
     
     model_cfg = edict(yaml.safe_load(open(config_dir / "model.yaml")))
@@ -133,7 +198,6 @@ def get_config():
     
     cfg = edict({**model_cfg, **backbone_cfg, **decoder_cfg})
     
-    # Adjust parameters to match training
     cfg.TRAIN.BATCH_SIZE = 2
     cfg.TRAIN.WARMUP_STEPS = 500
     cfg.TRAIN.SUBSAMPLE = True
@@ -143,129 +207,57 @@ def get_config():
     return cfg
 
 
-def trace_based_export(model, output_path, num_points=50000):
-    """
-    Export using torch.jit.trace (more reliable for complex models)
-    """
-    print("\nAttempting trace-based export...")
-    
-    # Ensure model is on CPU
-    model = model.cpu()
-    
-    # Create example inputs on CPU
-    example_coords = torch.randn(1, num_points, 3).cpu()
-    example_features = torch.randn(1, num_points, 4).cpu()
-    
-    # Create a simplified forward function
-    class TraceWrapper(nn.Module):
-        def __init__(self, original_model):
-            super().__init__()
-            self.model = original_model.cpu()
-            
-        def forward(self, coords, features):
-            # Ensure inputs are on CPU
-            coords = coords.cpu()
-            features = features.cpu()
-            
-            # Combine into single tensor for processing
-            combined = torch.cat([coords, features[:, :, 3:]], dim=-1)
-            
-            # Simple placeholder processing
-            # Note: This is a simplified version - real processing would be more complex
-            B, N, C = combined.shape
-            
-            # Mock outputs with correct shapes (on CPU)
-            num_queries = 100
-            num_classes = 20
-            
-            pred_logits = torch.randn(B, num_queries, num_classes + 1).cpu()
-            pred_masks = torch.randn(B, N, num_queries).cpu()
-            sem_logits = torch.randn(B, N, num_classes).cpu()
-            
-            return pred_logits, pred_masks, sem_logits
-    
-    try:
-        trace_model = TraceWrapper(model)
-        trace_model.eval()
-        trace_model.cpu()
-        
-        with torch.no_grad():
-            traced = torch.jit.trace(trace_model, (example_coords, example_features))
-        
-        # Convert to ONNX
-        torch.onnx.export(
-            traced,
-            (example_coords, example_features),
-            output_path,
-            export_params=True,
-            opset_version=14,
-            do_constant_folding=True,
-            input_names=['point_coords', 'point_features'],
-            output_names=['pred_logits', 'pred_masks', 'sem_logits'],
-            dynamic_axes={
-                'point_coords': {0: 'batch_size', 1: 'num_points'},
-                'point_features': {0: 'batch_size', 1: 'num_points'},
-                'pred_logits': {0: 'batch_size'},
-                'pred_masks': {0: 'batch_size', 1: 'num_points'},
-                'sem_logits': {0: 'batch_size', 1: 'num_points'}
-            }
-        )
-        
-        return True
-        
-    except Exception as e:
-        print(f"Trace-based export failed: {e}")
-        return False
-
-
 @click.command()
-@click.option('--checkpoint', '-c', required=True, help='Path to checkpoint file (.ckpt)')
+@click.option('--checkpoint', '-c', required=True, help='Path to checkpoint file')
 @click.option('--output', '-o', default=None, help='Output ONNX file path')
-@click.option('--batch_size', default=1, help='Batch size for export')
-@click.option('--num_points', default=50000, help='Number of points in point cloud')
-@click.option('--opset', default=14, help='ONNX opset version')
-@click.option('--simplify', is_flag=True, help='Simplify ONNX model after export')
-@click.option('--fp16', is_flag=True, help='Convert to FP16 precision')
+@click.option('--num_points', default=10000, help='Number of points (start small!)')
+@click.option('--opset', default=11, help='ONNX opset version')
 @click.option('--validate', is_flag=True, help='Validate exported model')
-@click.option('--use_trace', is_flag=True, help='Use torch.jit.trace instead of direct export')
-def export_onnx(checkpoint, output, batch_size, num_points, opset, simplify, fp16, validate, use_trace):
-    """Export MaskPLS-DGCNN Fixed model to ONNX format"""
+@click.option('--debug', is_flag=True, help='Enable debug mode')
+def export_onnx(checkpoint, output, num_points, opset, validate, debug):
+    """Export MaskPLS-DGCNN to ONNX with CPU compatibility"""
     
     print("="*60)
-    print("MaskPLS-DGCNN Fixed Model ONNX Export")
+    print("CPU-Compatible DGCNN ONNX Export")
     print("="*60)
     
-    # Determine output path
+    # Set up paths
     if output is None:
         checkpoint_path = Path(checkpoint)
-        output = checkpoint_path.parent / f"{checkpoint_path.stem}.onnx"
+        output = checkpoint_path.parent / f"{checkpoint_path.stem}_cpu.onnx"
     
-    print(f"\nInput checkpoint: {checkpoint}")
-    print(f"Output ONNX file: {output}")
-    print(f"Batch size: {batch_size}")
-    print(f"Number of points: {num_points}")
-    print(f"ONNX opset: {opset}")
+    print(f"\nCheckpoint: {checkpoint}")
+    print(f"Output: {output}")
+    print(f"Points: {num_points}")
     
-    # Load configuration
+    # Load config
     print("\nLoading configuration...")
     cfg = get_config()
     
-    # Try to load config from checkpoint directory if it exists
+    # Check for saved hparams
     checkpoint_dir = Path(checkpoint).parent
     hparams_file = checkpoint_dir.parent / 'hparams.yaml'
     if hparams_file.exists():
-        print(f"Found hparams.yaml, loading...")
+        print(f"Loading saved hyperparameters...")
         with open(hparams_file, 'r') as f:
             saved_cfg = edict(yaml.safe_load(f))
-        # Update config with saved hyperparameters
         cfg.update(saved_cfg)
     
-    # Create model
+    # Create model on CPU
     print("\nCreating model...")
-    model = MaskPLSDGCNNFixed(cfg)
     
-    # Load checkpoint
-    print(f"Loading checkpoint...")
+    # Temporarily disable CUDA to force CPU initialization
+    original_cuda_available = torch.cuda.is_available
+    torch.cuda.is_available = lambda: False
+    
+    try:
+        model = MaskPLSDGCNNFixed(cfg)
+    finally:
+        # Restore original CUDA availability check
+        torch.cuda.is_available = original_cuda_available
+    
+    # Load checkpoint to CPU
+    print("Loading checkpoint (CPU only)...")
     checkpoint_data = torch.load(checkpoint, map_location='cpu')
     
     if 'state_dict' in checkpoint_data:
@@ -275,170 +267,103 @@ def export_onnx(checkpoint, output, batch_size, num_points, opset, simplify, fp1
     
     # Load weights
     model.load_state_dict(state_dict, strict=False)
+    model = model.cpu()
     model.eval()
     
-    print(f"✓ Model loaded successfully")
+    # Move all parameters to CPU explicitly
+    for param in model.parameters():
+        param.data = param.data.cpu()
     
-    # Export to ONNX
-    print("\nExporting to ONNX...")
+    print("✓ Model loaded on CPU")
     
-    if use_trace:
-        # Try trace-based export
-        success = trace_based_export(model, str(output), num_points)
-        if not success:
-            print("Falling back to standard export...")
+    # Create wrapper
+    print("\nCreating CPU-compatible wrapper...")
+    onnx_model = CPUONNXWrapper(model)
     
-    if not use_trace or not success:
-        # Standard export approach
+    # Create dummy inputs on CPU
+    dummy_coords = torch.randn(num_points, 3)
+    dummy_features = torch.randn(num_points, 4)
+    
+    if debug:
+        print("\nTesting forward pass on CPU...")
         try:
-            # Create wrapper for ONNX export
-            print("Creating ONNX wrapper...")
-            if batch_size == 1:
-                onnx_model = SimplifiedONNXWrapper(model)
-                example_inputs = (
-                    torch.randn(num_points, 3),
-                    torch.randn(num_points, 4)
-                )
-                dynamic_axes = {
-                    'point_coords': {0: 'num_points'},
-                    'point_features': {0: 'num_points'},
-                    'pred_masks': {0: 'num_points'},
-                    'sem_logits': {0: 'num_points'}
-                }
-            else:
-                onnx_model = ONNXExportWrapper(model)
-                example_inputs = (
-                    torch.randn(batch_size, num_points, 3),
-                    torch.randn(batch_size, num_points, 4)
-                )
-                dynamic_axes = {
-                    'point_coords': {0: 'batch_size', 1: 'num_points'},
-                    'point_features': {0: 'batch_size', 1: 'num_points'},
-                    'pred_logits': {0: 'batch_size'},
-                    'pred_masks': {0: 'batch_size', 1: 'num_points'},
-                    'sem_logits': {0: 'batch_size', 1: 'num_points'}
-                }
-            
-            onnx_model.eval()
-            
-            # Export
             with torch.no_grad():
-                torch.onnx.export(
-                    onnx_model,
-                    example_inputs,
-                    str(output),
-                    export_params=True,
-                    opset_version=opset,
-                    do_constant_folding=True,
-                    input_names=['point_coords', 'point_features'],
-                    output_names=['pred_logits', 'pred_masks', 'sem_logits'],
-                    dynamic_axes=dynamic_axes,
-                    verbose=False
-                )
-            
-            print(f"✓ Model exported to {output}")
-            
+                test_output = onnx_model(dummy_coords, dummy_features)
+            print(f"✓ Forward pass successful")
+            print(f"  Output shapes: {[t.shape for t in test_output]}")
         except Exception as e:
-            print(f"✗ Export failed: {e}")
-            print("\nTroubleshooting:")
-            print("1. The model may have operations not supported by ONNX")
-            print("2. Try using --use_trace flag for trace-based export")
-            print("3. Consider simplifying the model architecture")
+            print(f"✗ Forward pass failed: {e}")
             import traceback
             traceback.print_exc()
             return
     
-    # Verify the exported model
+    # Export to ONNX
+    print("\nExporting to ONNX...")
+    try:
+        with torch.no_grad():
+            torch.onnx.export(
+                onnx_model,
+                (dummy_coords, dummy_features),
+                str(output),
+                export_params=True,
+                opset_version=opset,
+                do_constant_folding=True,
+                input_names=['point_coords', 'point_features'],
+                output_names=['pred_logits', 'pred_masks', 'sem_logits'],
+                dynamic_axes={
+                    'point_coords': {0: 'num_points'},
+                    'point_features': {0: 'num_points'},
+                    'pred_masks': {0: 'num_points'},
+                    'sem_logits': {0: 'num_points'}
+                },
+                verbose=debug
+            )
+        
+        print(f"✓ Model exported to {output}")
+        
+    except Exception as e:
+        print(f"✗ Export failed: {e}")
+        if debug:
+            import traceback
+            traceback.print_exc()
+        
+        print("\nTips:")
+        print("1. Try reducing --num_points (e.g., 1000)")
+        print("2. Use --debug flag for more info")
+        print("3. Check that all model operations are ONNX-compatible")
+        return
+    
+    # Validate if requested
     if validate:
         print("\nValidating ONNX model...")
         try:
+            import onnxruntime as ort
+            
+            # Check model structure
             model_onnx = onnx.load(str(output))
             onnx.checker.check_model(model_onnx)
-            print("✓ ONNX model is valid")
+            print("✓ Model structure valid")
             
-            # Print model info
-            print(f"\nModel info:")
-            print(f"  IR version: {model_onnx.ir_version}")
-            print(f"  Producer: {model_onnx.producer_name}")
-            print(f"  Opset: {model_onnx.opset_import[0].version}")
+            # Test inference
+            session = ort.InferenceSession(str(output))
+            inputs = {
+                'point_coords': dummy_coords.numpy(),
+                'point_features': dummy_features.numpy()
+            }
+            outputs = session.run(None, inputs)
+            print(f"✓ Inference successful")
+            print(f"  Output shapes: {[o.shape for o in outputs]}")
             
-            # Get model size
+            # Check file size
             file_size = Path(output).stat().st_size / (1024 * 1024)
             print(f"  File size: {file_size:.2f} MB")
             
         except Exception as e:
             print(f"✗ Validation failed: {e}")
     
-    # Simplify if requested
-    if simplify:
-        print("\nSimplifying ONNX model...")
-        try:
-            import onnxsim
-            model_onnx = onnx.load(str(output))
-            model_simplified, check = onnxsim.simplify(model_onnx)
-            
-            if check:
-                output_simplified = str(output).replace('.onnx', '_simplified.onnx')
-                onnx.save(model_simplified, output_simplified)
-                print(f"✓ Simplified model saved to {output_simplified}")
-                
-                # Compare sizes
-                original_size = Path(output).stat().st_size / (1024 * 1024)
-                simplified_size = Path(output_simplified).stat().st_size / (1024 * 1024)
-                reduction = (1 - simplified_size / original_size) * 100
-                print(f"  Size reduction: {reduction:.1f}%")
-            else:
-                print("✗ Simplification check failed")
-                
-        except ImportError:
-            print("✗ onnx-simplifier not installed")
-            print("  Install with: pip install onnx-simplifier")
-        except Exception as e:
-            print(f"✗ Simplification failed: {e}")
-    
-    # Convert to FP16 if requested
-    if fp16:
-        print("\nConverting to FP16...")
-        try:
-            from onnxconverter_common import float16
-            
-            model_onnx = onnx.load(str(output))
-            model_fp16 = float16.convert_float_to_float16(model_onnx)
-            
-            output_fp16 = str(output).replace('.onnx', '_fp16.onnx')
-            onnx.save(model_fp16, output_fp16)
-            print(f"✓ FP16 model saved to {output_fp16}")
-            
-            # Compare sizes
-            original_size = Path(output).stat().st_size / (1024 * 1024)
-            fp16_size = Path(output_fp16).stat().st_size / (1024 * 1024)
-            reduction = (1 - fp16_size / original_size) * 100
-            print(f"  Size reduction: {reduction:.1f}%")
-            
-        except ImportError:
-            print("✗ onnxconverter-common not installed")
-            print("  Install with: pip install onnxconverter-common")
-        except Exception as e:
-            print(f"✗ FP16 conversion failed: {e}")
-    
     print("\n" + "="*60)
     print("Export completed!")
     print("="*60)
-    
-    # Print usage instructions
-    print("\nTo use the exported model:")
-    print("```python")
-    print("import onnxruntime as ort")
-    print("import numpy as np")
-    print()
-    print(f"session = ort.InferenceSession('{output}')")
-    print("inputs = {")
-    print("    'point_coords': np.random.randn(1, 50000, 3).astype(np.float32),")
-    print("    'point_features': np.random.randn(1, 50000, 4).astype(np.float32)")
-    print("}")
-    print("outputs = session.run(None, inputs)")
-    print("pred_logits, pred_masks, sem_logits = outputs")
-    print("```")
 
 
 if __name__ == "__main__":
