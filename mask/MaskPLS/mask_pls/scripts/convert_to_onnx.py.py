@@ -1,146 +1,153 @@
-# mask_pls/scripts/export_onnx_fixed_device.py
+# mask_pls/scripts/export_onnx_fixed_shapes.py
 """
-ONNX converter with proper device handling
-Ensures all components are on the same device
+ONNX converter using fixed shapes to avoid shape inference issues
 """
 
 import os
 import sys
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 import onnx
 import yaml
 from pathlib import Path
 from easydict import EasyDict as edict
 
-# Add parent directory to path
+# Force CPU mode
+os.environ['CUDA_VISIBLE_DEVICES'] = ''
+torch.Tensor.cuda = lambda self, *args, **kwargs: self
+torch.cuda.is_available = lambda: False
+
 sys.path.append(str(Path(__file__).parent.parent))
 
+from mask_pls.models.dgcnn.maskpls_dgcnn_optimized import MaskPLSDGCNNFixed
 
-class DeviceConsistentModel(nn.Module):
-    """Wrapper that ensures device consistency"""
+
+class FixedPointsWrapper(nn.Module):
+    """Wrapper that ensures fixed number of points throughout"""
     
-    def __init__(self, model):
+    def __init__(self, model, fixed_points=10000):
         super().__init__()
-        self.model = model
-        self.device = next(model.parameters()).device
+        self.model = model.cpu()
+        self.fixed_points = fixed_points
+        self.num_queries = model.decoder.num_queries
+        self.num_classes = model.num_classes
         
-        # Store original method
-        self._original_forward = model.backbone.forward.__func__
-        
-        # Patch the backbone
-        self._patch_backbone()
-    
-    def _patch_backbone(self):
-        """Patch backbone to handle device consistently"""
-        model = self.model
-        device = self.device
-        
-        # Define a new forward that handles devices properly
-        def consistent_forward(self, x):
-            coords_list = x['pt_coord']
-            feats_list = x['feats']
-            
-            batch_size = len(coords_list)
-            self.subsample_indices = {}
-            
-            all_features = []
-            all_coords = []
-            all_masks = []
-            
-            for b in range(batch_size):
-                # Convert to tensors on the model's device
-                coords = torch.from_numpy(coords_list[b]).float().to(device)
-                feats = torch.from_numpy(feats_list[b]).float().to(device)
-                
-                # Subsample if needed
-                max_points = 50000 if self.training else 30000
-                if coords.shape[0] > max_points:
-                    indices = torch.randperm(coords.shape[0], device=device)[:max_points]
-                    indices = indices.sort()[0]
-                    coords = coords[indices]
-                    feats = feats[indices]
-                    self.subsample_indices[b] = indices
-                else:
-                    self.subsample_indices[b] = torch.arange(coords.shape[0], device=device)
-                
-                # Process through DGCNN
-                point_features = self.process_single_cloud(coords, feats)
-                
-                all_features.append(point_features)
-                all_coords.append(coords)
-                all_masks.append(torch.zeros(coords.shape[0], dtype=torch.bool, device=device))
-            
-            # Generate multi-scale features with padding
-            ms_features = []
-            ms_coords = []
-            ms_masks = []
-            
-            for i in range(len(self.feat_layers)):
-                level_features, level_coords, level_masks = self.pad_batch_level(
-                    [f[i] for f in all_features],
-                    all_coords,
-                    all_masks
-                )
-                ms_features.append(level_features)
-                ms_coords.append(level_coords)
-                ms_masks.append(level_masks)
-            
-            # Semantic predictions
-            sem_logits = self.compute_semantic_logits(ms_features[-1], ms_masks[-1])
-            
-            return ms_features, ms_coords, ms_masks, sem_logits
-        
-        # Replace the method
-        model.backbone.forward = consistent_forward.__get__(model.backbone, model.backbone.__class__)
-    
-    def to(self, device):
-        """Override to() to update our device tracking"""
-        self.device = device
-        self.model = self.model.to(device)
-        self._patch_backbone()  # Re-patch with new device
-        return super().to(device)
-    
     def forward(self, coords, feats):
-        # Ensure inputs are on correct device
-        coords = coords.to(self.device)
-        feats = feats.to(self.device)
+        B, N, _ = coords.shape
         
-        B = coords.shape[0]
+        # Ensure we have exactly fixed_points
+        if N != self.fixed_points:
+            print(f"Warning: Expected {self.fixed_points} points, got {N}")
+            # Pad or truncate
+            if N < self.fixed_points:
+                pad_n = self.fixed_points - N
+                coords = F.pad(coords, (0, 0, 0, pad_n), value=0)
+                feats = F.pad(feats, (0, 0, 0, pad_n), value=0)
+            else:
+                coords = coords[:, :self.fixed_points]
+                feats = feats[:, :self.fixed_points]
         
         # Convert to expected format
         x = {
-            'pt_coord': [coords[b].detach().cpu().numpy() for b in range(B)],
-            'feats': [feats[b].detach().cpu().numpy() for b in range(B)]
+            'pt_coord': [coords[b].cpu().numpy() for b in range(B)],
+            'feats': [feats[b].cpu().numpy() for b in range(B)]
         }
         
         # Forward through model
-        outputs, _, sem_logits = self.model(x)
+        outputs, padding, sem_logits = self.model(x)
         
-        # Ensure outputs are on correct device
-        outputs['pred_logits'] = outputs['pred_logits'].to(self.device)
-        outputs['pred_masks'] = outputs['pred_masks'].to(self.device)
-        sem_logits = sem_logits.to(self.device)
+        pred_logits = outputs['pred_logits']  # [B, Q, C+1]
+        pred_masks = outputs['pred_masks']    # [B, N_backbone, Q]
         
-        return outputs['pred_logits'], outputs['pred_masks'], sem_logits
+        # Ensure outputs have fixed dimensions
+        B_out = pred_logits.shape[0]
+        Q = pred_logits.shape[1]
+        C = pred_logits.shape[2]
+        
+        # Fix pred_masks to have exactly fixed_points
+        N_mask = pred_masks.shape[1]
+        if N_mask != self.fixed_points:
+            if N_mask < self.fixed_points:
+                pad_n = self.fixed_points - N_mask
+                pred_masks = F.pad(pred_masks, (0, 0, 0, pad_n), value=0)
+            else:
+                pred_masks = pred_masks[:, :self.fixed_points, :]
+        
+        # Fix sem_logits similarly
+        N_sem = sem_logits.shape[1]
+        if N_sem != self.fixed_points:
+            if N_sem < self.fixed_points:
+                pad_n = self.fixed_points - N_sem
+                sem_logits = F.pad(sem_logits, (0, 0, 0, pad_n), value=0)
+            else:
+                sem_logits = sem_logits[:, :self.fixed_points, :]
+        
+        # Ensure fixed output shapes
+        pred_logits = pred_logits.reshape(B, Q, C)
+        pred_masks = pred_masks.reshape(B, self.fixed_points, Q)
+        sem_logits = sem_logits.reshape(B, self.fixed_points, self.num_classes)
+        
+        return pred_logits, pred_masks, sem_logits
 
 
-def convert_to_onnx(checkpoint_path, output_path=None, batch_size=1, num_points=10000):
-    """Main conversion function"""
+def simplify_model(input_path, output_path):
+    """Try to simplify the ONNX model"""
+    try:
+        import onnxsim
+        print("\nSimplifying ONNX model...")
+        
+        model = onnx.load(input_path)
+        model_simp, check = onnxsim.simplify(
+            model,
+            input_shapes={
+                'coords': [1, 10000, 3],
+                'features': [1, 10000, 4]
+            },
+            dynamic_input_shape=False
+        )
+        
+        if check:
+            onnx.save(model_simp, output_path)
+            print("  ✓ Simplification successful")
+            return True
+        else:
+            print("  ✗ Simplification check failed")
+            return False
+            
+    except ImportError:
+        print("  ⚠ onnx-simplifier not installed")
+        print("    Install with: pip install onnx-simplifier")
+        return False
+    except Exception as e:
+        print(f"  ✗ Simplification failed: {e}")
+        return False
+
+
+def main():
+    import argparse
     
-    if output_path is None:
-        output_path = Path(checkpoint_path).stem + ".onnx"
+    parser = argparse.ArgumentParser(
+        description="Export MaskPLS to ONNX with fixed shapes"
+    )
+    parser.add_argument('checkpoint', help='Path to checkpoint')
+    parser.add_argument('--output', '-o', help='Output ONNX file')
+    parser.add_argument('--batch-size', type=int, default=1, help='Fixed batch size')
+    parser.add_argument('--num-points', type=int, default=10000, help='Fixed number of points')
+    parser.add_argument('--simplify', action='store_true', help='Simplify model after export')
+    
+    args = parser.parse_args()
+    
+    output_path = args.output or Path(args.checkpoint).stem + "_fixed.onnx"
     
     print("="*60)
-    print("ONNX Export with Fixed Device Handling")
+    print("Fixed Shape ONNX Export")
     print("="*60)
-    
-    # Import model
-    from mask_pls.models.dgcnn.maskpls_dgcnn_optimized import MaskPLSDGCNNFixed
+    print(f"Batch size: {args.batch_size} (fixed)")
+    print(f"Num points: {args.num_points} (fixed)")
     
     # Load config
-    print("\n1. Loading configuration...")
     config_dir = Path(__file__).parent.parent / "config"
     cfg = {}
     for cfg_file in ['model.yaml', 'backbone.yaml', 'decoder.yaml']:
@@ -151,130 +158,141 @@ def convert_to_onnx(checkpoint_path, output_path=None, batch_size=1, num_points=
     cfg = edict(cfg)
     
     # Create model
-    print(f"\n2. Loading model from: {checkpoint_path}")
+    print(f"\n1. Loading model from: {args.checkpoint}")
     model = MaskPLSDGCNNFixed(cfg)
     
-    # Load checkpoint on CPU first
-    checkpoint = torch.load(checkpoint_path, map_location='cpu')
+    checkpoint = torch.load(args.checkpoint, map_location='cpu')
     state_dict = checkpoint['state_dict'] if 'state_dict' in checkpoint else checkpoint
     
     model.load_state_dict(state_dict, strict=False)
     model.eval()
-    
-    # Check if CUDA is available
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    print(f"   Initial device: {device}")
-    
-    # For ONNX export, always use CPU to avoid issues
-    print("\n3. Setting up for ONNX export (CPU mode)...")
     model = model.cpu()
     
     # Create wrapper
-    wrapped_model = DeviceConsistentModel(model)
+    print("\n2. Creating fixed-shape wrapper...")
+    wrapped_model = FixedPointsWrapper(model, fixed_points=args.num_points)
     wrapped_model.eval()
-    wrapped_model = wrapped_model.cpu()  # Ensure everything is on CPU
     
-    # Test forward pass
+    # Create fixed-size inputs
+    print(f"\n3. Creating fixed inputs...")
+    dummy_coords = torch.randn(args.batch_size, args.num_points, 3, dtype=torch.float32)
+    dummy_feats = torch.randn(args.batch_size, args.num_points, 4, dtype=torch.float32)
+    
+    # Test forward
     print("\n4. Testing forward pass...")
-    test_coords = torch.randn(batch_size, num_points, 3, device='cpu')
-    test_feats = torch.randn(batch_size, num_points, 4, device='cpu')
-    
     try:
         with torch.no_grad():
-            outputs = wrapped_model(test_coords, test_feats)
-        print(f"   ✓ Success! Output shapes: {[o.shape for o in outputs]}")
-        print(f"   Output devices: {[o.device for o in outputs]}")
+            outputs = wrapped_model(dummy_coords, dummy_feats)
+        print(f"   ✓ Success! Output shapes:")
+        for i, out in enumerate(outputs):
+            print(f"     Output {i}: {out.shape}")
     except Exception as e:
         print(f"   ✗ Failed: {e}")
-        import traceback
-        traceback.print_exc()
-        return False
+        return
     
-    # Export to ONNX
+    # Export with fixed shapes (no dynamic axes)
     print(f"\n5. Exporting to: {output_path}")
     try:
-        with torch.no_grad():
-            torch.onnx.export(
-                wrapped_model,
-                (test_coords, test_feats),
-                output_path,
-                export_params=True,
-                opset_version=17,
-                do_constant_folding=True,
-                input_names=['coords', 'features'],
-                output_names=['pred_logits', 'pred_masks', 'sem_logits'],
-                dynamic_axes={
-                    'coords': {0: 'batch', 1: 'points'},
-                    'features': {0: 'batch', 1: 'points'},
-                    'pred_logits': {0: 'batch'},
-                    'pred_masks': {0: 'batch', 1: 'points'},
-                    'sem_logits': {0: 'batch', 1: 'points'}
-                },
-                verbose=False
-            )
+        torch.onnx.export(
+            wrapped_model,
+            (dummy_coords, dummy_feats),
+            output_path,
+            export_params=True,
+            opset_version=17,
+            do_constant_folding=True,
+            input_names=['coords', 'features'],
+            output_names=['pred_logits', 'pred_masks', 'sem_logits'],
+            # NO dynamic axes - everything is fixed
+            verbose=False,
+            operator_export_type=torch.onnx.OperatorExportTypes.ONNX
+        )
         print("   ✓ Export successful!")
-        
-        # Verify
-        print("\n6. Verifying ONNX model...")
-        onnx_model = onnx.load(output_path)
-        onnx.checker.check_model(onnx_model)
-        
-        size_mb = Path(output_path).stat().st_size / 1024 / 1024
-        print(f"   ✓ Model verified! Size: {size_mb:.2f} MB")
-        
-        # Test with ONNX Runtime if available
-        try:
-            import onnxruntime as ort
-            session = ort.InferenceSession(output_path, providers=['CPUExecutionProvider'])
-            
-            # Test inference
-            test_outputs = session.run(None, {
-                'coords': test_coords.numpy(),
-                'features': test_feats.numpy()
-            })
-            print(f"   ✓ ONNX Runtime test passed!")
-            print(f"     Output shapes: {[o.shape for o in test_outputs]}")
-            
-        except ImportError:
-            print("   ⚠ ONNX Runtime not installed (optional)")
-        except Exception as e:
-            print(f"   ⚠ ONNX Runtime test failed: {e}")
-        
-        return True
         
     except Exception as e:
         print(f"   ✗ Export failed: {e}")
         import traceback
         traceback.print_exc()
-        return False
-
-
-def main():
-    import argparse
+        
+        # Try with ATEN fallback
+        print("\n   Trying with ATEN fallback...")
+        try:
+            torch.onnx.export(
+                wrapped_model,
+                (dummy_coords, dummy_feats),
+                output_path,
+                export_params=True,
+                opset_version=17,
+                input_names=['coords', 'features'],
+                output_names=['pred_logits', 'pred_masks', 'sem_logits'],
+                operator_export_type=torch.onnx.OperatorExportTypes.ONNX_ATEN_FALLBACK
+            )
+            print("   ✓ Export with ATEN fallback successful!")
+        except:
+            print("   ✗ ATEN fallback also failed")
+            return
     
-    parser = argparse.ArgumentParser(
-        description="Export MaskPLS DGCNN to ONNX with proper device handling"
-    )
-    parser.add_argument('checkpoint', help='Path to checkpoint file')
-    parser.add_argument('--output', '-o', help='Output ONNX file')
-    parser.add_argument('--batch-size', type=int, default=1)
-    parser.add_argument('--num-points', type=int, default=10000)
+    # Verify basic structure
+    print("\n6. Verifying ONNX model...")
+    try:
+        onnx_model = onnx.load(output_path)
+        onnx.checker.check_model(onnx_model)
+        print("   ✓ Model structure valid")
+        
+        size_mb = Path(output_path).stat().st_size / 1024 / 1024
+        print(f"   Size: {size_mb:.2f} MB")
+        
+    except Exception as e:
+        print(f"   ✗ Verification failed: {e}")
     
-    args = parser.parse_args()
+    # Simplify if requested
+    if args.simplify:
+        simplified_path = output_path.replace('.onnx', '_simplified.onnx')
+        if simplify_model(output_path, simplified_path):
+            output_path = simplified_path
     
-    success = convert_to_onnx(
-        args.checkpoint,
-        args.output,
-        args.batch_size,
-        args.num_points
-    )
+    # Test with ONNX Runtime
+    print("\n7. Testing with ONNX Runtime...")
+    try:
+        import onnxruntime as ort
+        
+        # More detailed error info
+        so = ort.SessionOptions()
+        so.log_severity_level = 1
+        
+        try:
+            session = ort.InferenceSession(output_path, so, providers=['CPUExecutionProvider'])
+            print("   ✓ Model loaded successfully")
+            
+            # Print input/output info
+            print("\n   Input shapes:")
+            for inp in session.get_inputs():
+                print(f"     {inp.name}: {inp.shape} ({inp.type})")
+            
+            print("\n   Output shapes:")
+            for out in session.get_outputs():
+                print(f"     {out.name}: {out.shape} ({out.type})")
+            
+            # Test inference
+            test_outputs = session.run(None, {
+                'coords': dummy_coords.numpy(),
+                'features': dummy_feats.numpy()
+            })
+            
+            print("\n   ✓ Inference successful!")
+            
+        except ort.capi.onnxruntime_pybind11_state.InvalidGraph as e:
+            print(f"   ✗ Graph validation error: {e}")
+            print("\n   This usually means there's a shape mismatch in the graph.")
+            print("   Try using --simplify flag or different num-points value")
+            
+    except ImportError:
+        print("   ⚠ ONNX Runtime not installed")
+    except Exception as e:
+        print(f"   ✗ Runtime error: {e}")
     
-    if success:
-        print("\n✅ Conversion completed successfully!")
-        print("   No source files were modified.")
-    else:
-        print("\n❌ Conversion failed!")
-        sys.exit(1)
+    print("\n✅ Done!")
+    print(f"   Output: {output_path}")
+    print(f"   Fixed shape: batch={args.batch_size}, points={args.num_points}")
 
 
 if __name__ == "__main__":
