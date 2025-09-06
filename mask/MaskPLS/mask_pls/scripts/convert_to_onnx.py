@@ -277,7 +277,13 @@ def main():
     if unexpected_keys:
         print(f"Unexpected keys: {len(unexpected_keys)}")
     
+    # IMPORTANT: Move model to CPU and set to eval mode
+    model = model.cpu()
     model.eval()
+    
+    # Ensure no gradients are computed
+    for param in model.parameters():
+        param.requires_grad = False
     
     # Create wrapper
     print("\n4. Creating ONNX-compatible wrapper...")
