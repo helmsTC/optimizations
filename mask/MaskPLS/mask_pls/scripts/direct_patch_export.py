@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-ONNX export that preserves KNN functionality using torch-native operations
-This maintains the graph neural network behavior while being ONNX-compatible
+Fixed ONNX export with KNN functionality - resolves type annotation issues
 """
 
 import torch
@@ -13,86 +12,87 @@ import onnx
 from pathlib import Path
 from easydict import EasyDict as edict
 import sys
+from typing import Optional
 
 sys.path.append(str(Path(__file__).parent.parent))
 
 from mask_pls.models.dgcnn.maskpls_dgcnn_optimized import MaskPLSDGCNNFixed
 
 
-def onnx_compatible_knn(x, k):
+class ONNXKNNOperations:
     """
-    KNN implementation using torch operations that ONNX can trace
-    This actually computes nearest neighbors, not just fake indices
+    Static methods for KNN operations that work with ONNX
     """
-    batch_size = x.size(0)
-    num_points = x.size(2)
-    num_dims = x.size(1)
     
-    # Reshape for distance computation
-    x = x.view(batch_size, -1, num_points)  # [B, C, N]
+    @staticmethod
+    def compute_knn(x: torch.Tensor, k: int) -> torch.Tensor:
+        """
+        KNN implementation using torch operations that ONNX can trace
+        No default parameters to avoid torch.jit issues
+        """
+        batch_size = x.size(0)
+        num_points = x.size(2)
+        num_dims = x.size(1)
+        
+        # Reshape for distance computation
+        x = x.view(batch_size, -1, num_points)  # [B, C, N]
+        
+        # Compute pairwise distances using torch operations
+        inner = -2 * torch.matmul(x.transpose(2, 1), x)  # [B, N, N]
+        xx = torch.sum(x**2, dim=1, keepdim=True)  # [B, 1, N]
+        pairwise_distance = -xx.transpose(2, 1) - inner - xx  # [B, N, N]
+        
+        # Get k-nearest neighbors
+        idx = pairwise_distance.topk(k=k, dim=-1, largest=True)[1]  # [B, N, k]
+        
+        return idx
     
-    # Compute pairwise distances using torch operations
-    # ||a-b||^2 = ||a||^2 + ||b||^2 - 2*a.b
-    inner = -2 * torch.matmul(x.transpose(2, 1), x)  # [B, N, N]
-    xx = torch.sum(x**2, dim=1, keepdim=True)  # [B, 1, N]
-    pairwise_distance = -xx.transpose(2, 1) - inner - xx  # [B, N, N]
-    
-    # Get k-nearest neighbors
-    # Use topk which is ONNX-compatible
-    idx = pairwise_distance.topk(k=k, dim=-1, largest=True)[1]  # [B, N, k]
-    
-    return idx
-
-
-def onnx_compatible_get_graph_feature(x, k=20, idx=None):
-    """
-    Graph feature extraction using ONNX-compatible operations
-    Preserves the DGCNN edge feature computation
-    """
-    batch_size = x.size(0)
-    num_points = x.size(2)
-    num_dims = x.size(1)
-    
-    x = x.view(batch_size, -1, num_points)
-    
-    if idx is None:
-        idx = onnx_compatible_knn(x, k)  # [B, N, k]
-    
-    device = x.device
-    
-    # Important: Use gather operations instead of advanced indexing
-    # This is the key to ONNX compatibility
-    
-    # Prepare indices for gathering
-    batch_idx = torch.arange(batch_size, device=device).view(-1, 1, 1)
-    batch_idx = batch_idx.repeat(1, num_points, k)  # [B, N, k]
-    
-    # Flatten and gather
-    x_flat = x.transpose(2, 1).contiguous()  # [B, N, C]
-    x_flat = x_flat.view(batch_size, -1)  # [B, N*C]
-    
-    # Create gather indices
-    idx_base = torch.arange(0, batch_size, device=device).view(-1, 1, 1) * num_points
-    idx_flat = (idx + idx_base).view(batch_size, -1)  # [B, N*k]
-    
-    # Expand indices for each dimension
-    idx_expanded = idx_flat.unsqueeze(1).repeat(1, num_dims, 1)  # [B, C, N*k]
-    
-    # Adjust indices for flattened x
-    for d in range(num_dims):
-        idx_expanded[:, d, :] = idx_flat * num_dims + d
-    
-    # Gather neighbor features
-    x_neighbors = torch.gather(x_flat.unsqueeze(1).expand(-1, num_dims, -1), 2, idx_expanded)
-    x_neighbors = x_neighbors.view(batch_size, num_dims, num_points, k)
-    
-    # Get center features
-    x_center = x.unsqueeze(-1).repeat(1, 1, 1, k)  # [B, C, N, k]
-    
-    # Compute edge features (relative position + center)
-    feature = torch.cat((x_center - x_neighbors, x_center), dim=1)  # [B, 2C, N, k]
-    
-    return feature
+    @staticmethod
+    def get_graph_feature(x: torch.Tensor, k: int, idx: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Graph feature extraction using ONNX-compatible operations
+        """
+        batch_size = x.size(0)
+        num_points = x.size(2)
+        num_dims = x.size(1)
+        
+        x = x.view(batch_size, -1, num_points)
+        
+        if idx is None:
+            idx = ONNXKNNOperations.compute_knn(x, k)  # [B, N, k]
+        
+        device = x.device
+        
+        # Use gather operations for ONNX compatibility
+        x_flat = x.transpose(2, 1).contiguous()  # [B, N, C]
+        
+        # Create batch indices
+        batch_idx = torch.arange(batch_size, device=device).view(-1, 1, 1)
+        batch_idx = batch_idx.expand(batch_size, num_points, k).reshape(-1)  # [B*N*k]
+        
+        # Flatten indices
+        idx_flat = idx.reshape(-1)  # [B*N*k]
+        
+        # Gather neighbor features
+        # We need to gather from [B, N, C] using indices [B*N*k]
+        x_gathered = []
+        for b in range(batch_size):
+            x_b = x_flat[b]  # [N, C]
+            idx_b = idx[b].reshape(-1)  # [N*k]
+            gathered = x_b[idx_b]  # [N*k, C]
+            gathered = gathered.view(num_points, k, num_dims)  # [N, k, C]
+            x_gathered.append(gathered)
+        
+        x_neighbors = torch.stack(x_gathered, dim=0)  # [B, N, k, C]
+        x_neighbors = x_neighbors.permute(0, 3, 1, 2).contiguous()  # [B, C, N, k]
+        
+        # Get center features
+        x_center = x.unsqueeze(-1).expand(-1, -1, -1, k)  # [B, C, N, k]
+        
+        # Compute edge features
+        feature = torch.cat((x_center - x_neighbors, x_center), dim=1)  # [B, 2C, N, k]
+        
+        return feature
 
 
 class ONNXCompatibleEdgeConv(nn.Module):
@@ -110,7 +110,8 @@ class ONNXCompatibleEdgeConv(nn.Module):
     
     def forward(self, x, idx=None):
         # Use ONNX-compatible graph feature extraction
-        x = onnx_compatible_get_graph_feature(x, k=self.k, idx=idx)
+        # Pass k as integer, not as default parameter
+        x = ONNXKNNOperations.get_graph_feature(x, self.k, idx)
         x = self.conv(x)
         x = x.max(dim=-1, keepdim=False)[0]
         return x
@@ -124,24 +125,25 @@ class ONNXDGCNNBackbone(nn.Module):
         super().__init__()
         
         # Copy configuration from original
-        self.k = original_backbone.k
+        self.k = 20  # Fixed k value
         self.num_classes = original_backbone.num_classes
         
         # Replace edge convolutions with ONNX-compatible versions
-        # Copy weights from original layers
         self.edge_conv1 = ONNXCompatibleEdgeConv(4, 64, k=self.k)
+        self.edge_conv2 = ONNXCompatibleEdgeConv(64, 64, k=self.k)
+        self.edge_conv3 = ONNXCompatibleEdgeConv(64, 128, k=self.k)
+        self.edge_conv4 = ONNXCompatibleEdgeConv(128, 256, k=self.k)
+        
+        # Copy weights from original
         self.edge_conv1.conv[0].load_state_dict(original_backbone.edge_conv1[0].state_dict())
         self.edge_conv1.conv[1].load_state_dict(original_backbone.edge_conv1[1].state_dict())
         
-        self.edge_conv2 = ONNXCompatibleEdgeConv(64, 64, k=self.k)
         self.edge_conv2.conv[0].load_state_dict(original_backbone.edge_conv2[0].state_dict())
         self.edge_conv2.conv[1].load_state_dict(original_backbone.edge_conv2[1].state_dict())
         
-        self.edge_conv3 = ONNXCompatibleEdgeConv(64, 128, k=self.k)
         self.edge_conv3.conv[0].load_state_dict(original_backbone.edge_conv3[0].state_dict())
         self.edge_conv3.conv[1].load_state_dict(original_backbone.edge_conv3[1].state_dict())
         
-        self.edge_conv4 = ONNXCompatibleEdgeConv(128, 256, k=self.k)
         self.edge_conv4.conv[0].load_state_dict(original_backbone.edge_conv4[0].state_dict())
         self.edge_conv4.conv[1].load_state_dict(original_backbone.edge_conv4[1].state_dict())
         
@@ -314,18 +316,10 @@ class KNNPreservingWrapper(nn.Module):
         for param in self.parameters():
             param.requires_grad = False
     
-    def forward(self, coords, feats):
+    def forward(self, coords: torch.Tensor, feats: torch.Tensor) -> tuple:
         """
         Forward pass with preserved KNN
-        
-        Args:
-            coords: [B, N, 3]
-            feats: [B, N, 4]
-        
-        Returns:
-            pred_logits: [B, Q, C+1]
-            pred_masks: [B, N, Q]
-            sem_logits: [B, N, C]
+        Type annotations help torch.jit
         """
         B, N, _ = coords.shape
         
@@ -377,7 +371,7 @@ def export_with_knn(checkpoint_path, output_path, num_points=10000):
     Export with preserved KNN functionality
     """
     print("="*60)
-    print("ONNX Export with Preserved KNN")
+    print("ONNX Export with Preserved KNN (Fixed)")
     print("="*60)
     
     # Load config
@@ -414,35 +408,53 @@ def export_with_knn(checkpoint_path, output_path, num_points=10000):
         outputs = wrapper(dummy_coords, dummy_feats)
         print(f"✓ Forward pass successful: {[out.shape for out in outputs]}")
     
-    # Export
-    print("Exporting to ONNX...")
+    # Export WITHOUT torch.jit.script - direct ONNX export
+    print("Exporting to ONNX (without scripting)...")
     
-    # Use script mode for better compatibility with complex operations
-    wrapper_scripted = torch.jit.script(wrapper)
-    
-    torch.onnx.export(
-        wrapper_scripted,
-        (dummy_coords, dummy_feats),
-        output_path,
-        export_params=True,
-        opset_version=13,  # Higher opset for better operation support
-        do_constant_folding=True,
-        input_names=['coords', 'features'],
-        output_names=['pred_logits', 'pred_masks', 'sem_logits'],
-        dynamic_axes={
-            'coords': {0: 'batch'},
-            'features': {0: 'batch'},
-            'pred_logits': {0: 'batch'},
-            'pred_masks': {0: 'batch'},
-            'sem_logits': {0: 'batch'}
-        },
-        verbose=False
-    )
-    
-    print(f"✓ Exported to: {output_path}")
+    try:
+        torch.onnx.export(
+            wrapper,
+            (dummy_coords, dummy_feats),
+            output_path,
+            export_params=True,
+            opset_version=11,  # Use stable opset
+            do_constant_folding=True,
+            input_names=['coords', 'features'],
+            output_names=['pred_logits', 'pred_masks', 'sem_logits'],
+            dynamic_axes={
+                'coords': {0: 'batch'},
+                'features': {0: 'batch'},
+                'pred_logits': {0: 'batch'},
+                'pred_masks': {0: 'batch'},
+                'sem_logits': {0: 'batch'}
+            },
+            verbose=False
+        )
+        
+        print(f"✓ Exported to: {output_path}")
+        
+    except Exception as e:
+        print(f"✗ Direct export failed: {e}")
+        print("\nTrying alternative export method...")
+        
+        # Alternative: Export with fixed batch size
+        torch.onnx.export(
+            wrapper,
+            (dummy_coords, dummy_feats),
+            output_path,
+            export_params=True,
+            opset_version=11,
+            do_constant_folding=True,
+            input_names=['coords', 'features'],
+            output_names=['pred_logits', 'pred_masks', 'sem_logits'],
+            dynamic_axes=None,  # Fixed dimensions
+            verbose=False
+        )
+        
+        print(f"✓ Exported with fixed dimensions to: {output_path}")
     
     # Verify
-    print("Verifying ONNX model...")
+    print("\nVerifying ONNX model...")
     try:
         model_onnx = onnx.load(output_path)
         onnx.checker.check_model(model_onnx)
@@ -460,7 +472,6 @@ def export_with_knn(checkpoint_path, output_path, num_points=10000):
         print("✓ ONNX Runtime test passed")
         print(f"  Output shapes: {[o.shape for o in outputs]}")
         
-        # The KNN functionality is preserved!
         print("\n✓ Successfully exported with preserved KNN functionality!")
         
     except Exception as e:
