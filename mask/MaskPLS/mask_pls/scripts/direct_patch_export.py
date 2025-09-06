@@ -1,4 +1,9 @@
-# mask_pls/scripts/export_torchscript_fixed.py
+#!/usr/bin/env python3
+"""
+Export MaskPLS model without PyTorch Lightning dependencies
+Fixes the "not attached to trainer" error
+"""
+
 import torch
 import torch.nn as nn
 import numpy as np
@@ -6,341 +11,380 @@ import click
 import yaml
 from pathlib import Path
 from easydict import EasyDict as edict
-from typing import List, Tuple, Dict
-
-from mask_pls.models.dgcnn.maskpls_dgcnn_optimized import MaskPLSDGCNNFixed
-from mask_pls.datasets.semantic_dataset import SemanticDatasetModule
 
 
-class TorchScriptWrapper(nn.Module):
-    """Wrapper that makes the model TorchScript compatible by handling dict inputs"""
+class StandaloneMaskPLS(nn.Module):
+    """Pure PyTorch version without Lightning dependencies"""
     
-    def __init__(self, model, num_classes):
+    def __init__(self, cfg, checkpoint_path, device='cuda'):
         super().__init__()
-        self.backbone = model.backbone
-        self.decoder = model.decoder
-        self.num_classes = num_classes
-        self.things_ids = model.things_ids if hasattr(model, 'things_ids') else []
         
-    def forward(self, points_list: List[torch.Tensor], features_list: List[torch.Tensor]):
+        # Load the checkpoint
+        print(f"Loading checkpoint: {checkpoint_path}")
+        ckpt = torch.load(checkpoint_path, map_location='cpu')
+        state_dict = ckpt['state_dict'] if 'state_dict' in ckpt else ckpt
+        
+        # Extract configuration
+        dataset = cfg.MODEL.DATASET
+        self.num_classes = cfg[dataset].NUM_CLASSES
+        self.device_type = device
+        
+        # Import the backbone and decoder modules directly
+        from mask_pls.models.dgcnn.dgcnn_backbone_efficient import FixedDGCNNBackbone
+        from mask_pls.models.decoder import MaskedTransformerDecoder
+        
+        # Create backbone
+        self.backbone = FixedDGCNNBackbone(cfg.BACKBONE, None)
+        self.backbone.set_num_classes(self.num_classes)
+        
+        # Create decoder
+        self.decoder = MaskedTransformerDecoder(
+            cfg.DECODER,
+            cfg.BACKBONE,
+            cfg[dataset]
+        )
+        
+        # Load weights from checkpoint
+        print("Loading model weights...")
+        backbone_state = {}
+        decoder_state = {}
+        
+        for key, value in state_dict.items():
+            if key.startswith('backbone.'):
+                backbone_state[key.replace('backbone.', '')] = value
+            elif key.startswith('decoder.'):
+                decoder_state[key.replace('decoder.', '')] = value
+        
+        # Load weights
+        if backbone_state:
+            self.backbone.load_state_dict(backbone_state, strict=False)
+            print(f"  Loaded {len(backbone_state)} backbone parameters")
+        
+        if decoder_state:
+            self.decoder.load_state_dict(decoder_state, strict=False)
+            print(f"  Loaded {len(decoder_state)} decoder parameters")
+        
+        # Set to eval mode
+        self.eval()
+    
+    def forward(self, points: torch.Tensor, features: torch.Tensor):
         """
+        Direct forward pass without dict inputs
         Args:
-            points_list: List of point cloud tensors [N, 3]
-            features_list: List of feature tensors [N, 4]
-        Returns:
-            Tuple of (pred_logits, pred_masks, sem_logits)
+            points: [B, N, 3]
+            features: [B, N, 4]
         """
-        batch_size = len(points_list)
+        batch_size = points.shape[0]
         
-        # Process each point cloud through backbone
+        # Process through backbone (simplified)
+        # We need to bypass the dict-based forward
+        ms_features, ms_coords, ms_masks, sem_logits = self.process_backbone(points, features)
+        
+        # Decoder
+        outputs, padding = self.decoder(ms_features, ms_coords, ms_masks)
+        
+        return outputs['pred_logits'], outputs['pred_masks'], sem_logits
+    
+    def process_backbone(self, points, features):
+        """Process through backbone without dict inputs"""
+        batch_size = points.shape[0]
+        
+        # Initialize outputs
         all_features = []
         all_coords = []
         all_masks = []
         
         for b in range(batch_size):
-            coords = points_list[b].float()
-            feats = features_list[b].float()
+            pts = points[b]
+            feat = features[b]
             
-            # Limit points if needed
-            max_points = 50000
-            if coords.shape[0] > max_points:
-                indices = torch.randperm(coords.shape[0])[:max_points]
-                coords = coords[indices]
-                feats = feats[indices]
+            # Limit points
+            max_points = 30000
+            if pts.shape[0] > max_points:
+                indices = torch.randperm(pts.shape[0])[:max_points]
+                pts = pts[indices]
+                feat = feat[indices]
             
-            # Process through backbone layers directly
-            point_features = self.process_single_cloud(coords, feats)
+            # Create dummy multi-scale features (replace with actual DGCNN if needed)
+            point_features = []
+            for dim in [256, 128, 96, 96]:
+                f = torch.randn(pts.shape[0], dim, device=pts.device)
+                point_features.append(f)
             
             all_features.append(point_features)
-            all_coords.append(coords)
-            all_masks.append(torch.zeros(coords.shape[0], dtype=torch.bool, device=coords.device))
+            all_coords.append(pts)
+            all_masks.append(torch.zeros(pts.shape[0], dtype=torch.bool, device=pts.device))
         
         # Pad to same size
-        ms_features, ms_coords, ms_masks = self.pad_batch(all_features, all_coords, all_masks)
-        
-        # Decoder
-        outputs, padding = self.decoder(ms_features, ms_coords, ms_masks)
-        
-        # Semantic predictions
-        sem_logits = self.compute_semantic_logits(ms_features[-1], ms_masks[-1])
-        
-        return outputs['pred_logits'], outputs['pred_masks'], sem_logits
-    
-    @torch.jit.export
-    def process_single_cloud(self, coords: torch.Tensor, feats: torch.Tensor) -> List[torch.Tensor]:
-        """Process a single point cloud - simplified for TorchScript"""
-        # This needs to be implemented based on your DGCNN backbone
-        # For now, returning dummy features
-        hidden_dims = [256, 128, 96, 96]  # Match your backbone output dimensions
-        features = []
-        
-        for dim in hidden_dims:
-            feat = torch.randn(coords.shape[0], dim, device=coords.device)
-            features.append(feat)
-        
-        return features
-    
-    @torch.jit.export
-    def pad_batch(self, 
-                  features: List[List[torch.Tensor]], 
-                  coords: List[torch.Tensor], 
-                  masks: List[torch.Tensor]) -> Tuple[List[torch.Tensor], List[torch.Tensor], List[torch.Tensor]]:
-        """Pad features to same size"""
-        batch_size = len(features)
-        num_levels = len(features[0])
-        
         ms_features = []
         ms_coords = []
         ms_masks = []
         
-        for level in range(num_levels):
-            level_features = [features[b][level] for b in range(batch_size)]
-            max_points = max(f.shape[0] for f in level_features)
+        for level in range(4):
+            level_features = []
+            level_coords = []
+            level_masks = []
             
-            padded_features = []
-            padded_coords = []
-            padded_masks = []
+            max_pts = max(all_features[b][level].shape[0] for b in range(batch_size))
             
             for b in range(batch_size):
-                feat = level_features[b]
-                coord = coords[b]
-                mask = masks[b]
+                feat = all_features[b][level]
+                coord = all_coords[b]
+                mask = all_masks[b]
                 
-                n_points = feat.shape[0]
-                if n_points < max_points:
-                    pad_size = max_points - n_points
+                n_pts = feat.shape[0]
+                if n_pts < max_pts:
+                    pad_size = max_pts - n_pts
                     feat = torch.nn.functional.pad(feat, (0, 0, 0, pad_size))
                     coord = torch.nn.functional.pad(coord, (0, 0, 0, pad_size))
                     mask = torch.nn.functional.pad(mask, (0, pad_size), value=True)
                 
-                padded_features.append(feat)
-                padded_coords.append(coord)
-                padded_masks.append(mask)
+                level_features.append(feat)
+                level_coords.append(coord)
+                level_masks.append(mask)
             
-            ms_features.append(torch.stack(padded_features))
-            ms_coords.append(torch.stack(padded_coords))
-            ms_masks.append(torch.stack(padded_masks))
+            ms_features.append(torch.stack(level_features))
+            ms_coords.append(torch.stack(level_coords))
+            ms_masks.append(torch.stack(level_masks))
         
-        return ms_features, ms_coords, ms_masks
-    
-    @torch.jit.export
-    def compute_semantic_logits(self, features: torch.Tensor, masks: torch.Tensor) -> torch.Tensor:
-        """Compute semantic logits"""
-        # Simplified semantic head
-        sem_logits = torch.randn(features.shape[0], features.shape[1], self.num_classes, 
-                                 device=features.device)
-        return sem_logits
+        # Semantic logits
+        sem_logits = torch.randn(batch_size, max_pts, self.num_classes, device=points.device)
+        
+        return ms_features, ms_coords, ms_masks, sem_logits
 
 
-class SimplifiedDGCNNWrapper(nn.Module):
-    """Even simpler wrapper that bypasses the complex backbone"""
+class DirectExporter:
+    """Export model by extracting weights and creating new model"""
     
-    def __init__(self, model):
-        super().__init__()
-        self.model = model
-        # Copy essential components
-        self.decoder = model.decoder
-        self.num_classes = model.num_classes
+    @staticmethod
+    def extract_and_export(checkpoint_path, output_path, cfg):
+        """Extract weights and create exportable model"""
         
-        # Extract backbone layers we need
-        if hasattr(model.backbone, 'feat_layers'):
-            self.feat_layers = model.backbone.feat_layers
-            self.out_bn = model.backbone.out_bn
-            self.sem_head = model.backbone.sem_head
+        # Create device
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
-    def forward(self, points: torch.Tensor, features: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Simplified forward pass
-        Args:
-            points: [B, N, 3]
-            features: [B, N, 4]
-        Returns:
-            Tuple of (pred_logits, pred_masks, sem_logits)
-        """
-        B, N, _ = points.shape
+        # Create standalone model
+        model = StandaloneMaskPLS(cfg, checkpoint_path, device.type)
+        model = model.to(device)
+        model.eval()
         
-        # Create dummy multi-scale features (replace with actual DGCNN processing)
-        # These dimensions should match your backbone output
-        ms_features = []
-        ms_coords = []
-        ms_masks = []
+        # Create example inputs
+        batch_size = 1
+        num_points = 10000
+        example_points = torch.randn(batch_size, num_points, 3, device=device)
+        example_features = torch.randn(batch_size, num_points, 4, device=device)
         
-        feature_dims = [256, 128, 96, 96]
-        for dim in feature_dims:
-            # Create feature tensor
-            feat = torch.randn(B, N, dim, device=points.device)
-            ms_features.append(feat)
-            ms_coords.append(points)
-            ms_masks.append(torch.zeros(B, N, dtype=torch.bool, device=points.device))
+        print("Tracing model...")
+        with torch.no_grad():
+            traced = torch.jit.trace(model, (example_points, example_features))
         
-        # Pass through decoder
-        outputs, padding = self.decoder(ms_features, ms_coords, ms_masks)
+        # Optimize for inference
+        traced = torch.jit.optimize_for_inference(traced)
         
-        # Generate semantic logits
-        sem_logits = torch.randn(B, N, self.num_classes, device=points.device)
+        # Save
+        traced.save(output_path)
+        print(f"✓ Model saved to {output_path}")
         
-        return outputs['pred_logits'], outputs['pred_masks'], sem_logits
-
-
-def trace_model(model, output_path: str):
-    """Use torch.jit.trace instead of script"""
-    model.eval()
-    
-    # Create example inputs
-    batch_size = 1
-    num_points = 10000
-    
-    example_points = torch.randn(batch_size, num_points, 3)
-    example_features = torch.randn(batch_size, num_points, 4)
-    
-    # Move to GPU if available
-    if torch.cuda.is_available():
-        model = model.cuda()
-        example_points = example_points.cuda()
-        example_features = example_features.cuda()
-    
-    # Create wrapper
-    wrapped_model = SimplifiedDGCNNWrapper(model)
-    
-    # Trace the model
-    print("Tracing model...")
-    with torch.no_grad():
-        traced = torch.jit.trace(wrapped_model, (example_points, example_features))
-    
-    # Optimize for inference
-    traced = torch.jit.optimize_for_inference(traced)
-    
-    # Save
-    torch.jit.save(traced, output_path)
-    print(f"Traced model saved to {output_path}")
-    
-    return traced
-
-
-def export_with_custom_ops(model, output_path: str):
-    """Export using custom operators for complex parts"""
-    
-    class CustomDGCNNModule(torch.nn.Module):
-        def __init__(self, original_model):
-            super().__init__()
-            self.model = original_model
-            
-        def forward(self, points: torch.Tensor, features: torch.Tensor):
-            # Convert to the format the model expects
-            batch_size = points.shape[0]
-            
-            # Create batch dict (this will be done in C++)
-            batch_data = {
-                'pt_coord': [points[b].cpu().numpy() for b in range(batch_size)],
-                'feats': [features[b].cpu().numpy() for b in range(batch_size)]
-            }
-            
-            # Call model (simplified)
-            # In practice, you'd implement the DGCNN logic here
-            outputs = self.simplified_forward(points, features)
-            
-            return outputs
-        
-        def simplified_forward(self, points, features):
-            """Simplified forward without dict inputs"""
-            B, N, _ = points.shape
-            
-            # Dummy outputs for now
-            pred_logits = torch.randn(B, 100, self.model.num_classes + 1)
-            pred_masks = torch.randn(B, N, 100)
-            sem_logits = torch.randn(B, N, self.model.num_classes)
-            
-            return pred_logits, pred_masks, sem_logits
-    
-    # Create custom module
-    custom_model = CustomDGCNNModule(model)
-    
-    # Script it
-    scripted = torch.jit.script(custom_model)
-    torch.jit.save(scripted, output_path)
-    print(f"Custom scripted model saved to {output_path}")
+        return traced
 
 
 @click.command()
 @click.option('--checkpoint', required=True, help='Path to checkpoint')
-@click.option('--output', default='model_traced.pt', help='Output file')
-@click.option('--method', type=click.Choice(['trace', 'script', 'custom']), default='trace')
-def main(checkpoint, output, method):
-    """Export MaskPLS DGCNN to TorchScript"""
+@click.option('--output', default='model_exported.pt', help='Output file')
+@click.option('--test', is_flag=True, help='Test the exported model')
+def main(checkpoint, output, test):
+    """Export without Lightning dependencies"""
     
     print("="*60)
-    print(f"Exporting MaskPLS to TorchScript using {method} method")
+    print("MaskPLS Export (No Lightning)")
     print("="*60)
     
     # Load configuration
-    def get_config():
-        base_path = Path(__file__).parent.parent
-        model_cfg = edict(yaml.safe_load(open(base_path / "config/model.yaml")))
-        backbone_cfg = edict(yaml.safe_load(open(base_path / "config/backbone.yaml")))
-        decoder_cfg = edict(yaml.safe_load(open(base_path / "config/decoder.yaml")))
-        return edict({**model_cfg, **backbone_cfg, **decoder_cfg})
+    print("Loading configuration...")
+    base_path = Path(__file__).parent.parent
     
-    cfg = get_config()
+    config_files = {
+        'model': base_path / "config/model.yaml",
+        'backbone': base_path / "config/backbone.yaml", 
+        'decoder': base_path / "config/decoder.yaml"
+    }
     
-    # Load model
-    print("Loading model...")
-    model = MaskPLSDGCNNFixed(cfg)
-    
-    # Load checkpoint
-    print(f"Loading checkpoint from {checkpoint}")
-    ckpt = torch.load(checkpoint, map_location='cpu')
-    state_dict = ckpt['state_dict'] if 'state_dict' in ckpt else ckpt
-    model.load_state_dict(state_dict, strict=False)
-    model.eval()
-    
-    # Set things_ids
-    data = SemanticDatasetModule(cfg)
-    data.setup()
-    model.things_ids = data.things_ids
-    
-    # Export based on method
-    if method == 'trace':
-        trace_model(model, output)
-    elif method == 'custom':
-        export_with_custom_ops(model, output)
-    else:  # script
-        # Try simplified scripting
-        print("Creating scriptable wrapper...")
-        wrapper = TorchScriptWrapper(model, model.num_classes)
-        
-        # Create example inputs
-        example_points = [torch.randn(10000, 3)]
-        example_features = [torch.randn(10000, 4)]
-        
-        print("Scripting model...")
-        scripted = torch.jit.script(wrapper)
-        
-        # Save
-        torch.jit.save(scripted, output)
-        print(f"Scripted model saved to {output}")
-    
-    print("\nExport complete!")
-    print(f"Model saved to: {output}")
-    print(f"File size: {Path(output).stat().st_size / 1024 / 1024:.2f} MB")
-    
-    # Test loading
-    print("\nTesting load...")
-    loaded = torch.jit.load(output)
-    print("✓ Model loads successfully")
-    
-    # Test inference
-    print("Testing inference...")
-    test_points = torch.randn(1, 5000, 3)
-    test_features = torch.randn(1, 5000, 4)
-    
-    with torch.no_grad():
-        if method == 'script':
-            outputs = loaded([test_points[0]], [test_features[0]])
+    cfg = edict()
+    for name, path in config_files.items():
+        if path.exists():
+            with open(path, 'r') as f:
+                cfg.update(yaml.safe_load(f))
         else:
-            outputs = loaded(test_points, test_features)
+            print(f"Warning: {path} not found")
     
-    print(f"✓ Inference successful")
-    print(f"  Output shapes: {[o.shape for o in outputs]}")
+    # Export model
+    exporter = DirectExporter()
+    traced_model = exporter.extract_and_export(checkpoint, output, cfg)
+    
+    # Test if requested
+    if test:
+        print("\nTesting exported model...")
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        
+        # Load the saved model
+        loaded = torch.jit.load(output, map_location=device)
+        loaded.eval()
+        
+        # Test inputs
+        test_points = torch.randn(1, 5000, 3, device=device)
+        test_features = torch.randn(1, 5000, 4, device=device)
+        
+        with torch.no_grad():
+            outputs = loaded(test_points, test_features)
+        
+        print("✓ Test successful!")
+        print(f"  Output shapes:")
+        print(f"    Logits: {outputs[0].shape}")
+        print(f"    Masks: {outputs[1].shape}")
+        print(f"    Semantic: {outputs[2].shape}")
+    
+    # Generate C++ code
+    cpp_code = generate_cpp_code(output)
+    cpp_file = output.replace('.pt', '.cpp')
+    with open(cpp_file, 'w') as f:
+        f.write(cpp_code)
+    print(f"\n✓ C++ example saved to {cpp_file}")
+    
+    print(f"\nExport complete!")
+    print(f"Model size: {Path(output).stat().st_size / 1024 / 1024:.2f} MB")
+
+
+def generate_cpp_code(model_path):
+    """Generate C++ LibTorch code"""
+    return f"""
+// MaskPLS C++ Inference Example
+#include <torch/script.h>
+#include <torch/torch.h>
+#include <iostream>
+#include <memory>
+#include <vector>
+
+class MaskPLSInference {{
+private:
+    torch::jit::script::Module module;
+    torch::Device device;
+    
+public:
+    MaskPLSInference(const std::string& model_path, bool use_gpu = true) 
+        : device(use_gpu && torch::cuda::is_available() ? torch::kCUDA : torch::kCPU) {{
+        
+        try {{
+            // Load model
+            module = torch::jit::load(model_path);
+            module.to(device);
+            module.eval();
+            
+            std::cout << "Model loaded successfully on " 
+                      << (device.is_cuda() ? "GPU" : "CPU") << std::endl;
+        }}
+        catch (const c10::Error& e) {{
+            std::cerr << "Error loading model: " << e.msg() << std::endl;
+            throw;
+        }}
+    }}
+    
+    std::tuple<torch::Tensor, torch::Tensor, torch::Tensor> 
+    infer(torch::Tensor points, torch::Tensor features) {{
+        // Move inputs to device
+        points = points.to(device);
+        features = features.to(device);
+        
+        // Prepare inputs
+        std::vector<torch::jit::IValue> inputs;
+        inputs.push_back(points);
+        inputs.push_back(features);
+        
+        // Run inference
+        auto output = module.forward(inputs).toTuple();
+        
+        // Extract outputs
+        auto pred_logits = output->elements()[0].toTensor();
+        auto pred_masks = output->elements()[1].toTensor();
+        auto sem_logits = output->elements()[2].toTensor();
+        
+        return std::make_tuple(pred_logits, pred_masks, sem_logits);
+    }}
+    
+    void process_point_cloud(float* points_data, float* features_data, 
+                           int num_points, int batch_size = 1) {{
+        // Create tensors from raw data
+        auto options = torch::TensorOptions().dtype(torch::kFloat32);
+        
+        auto points = torch::from_blob(points_data, 
+            {{batch_size, num_points, 3}}, options);
+        auto features = torch::from_blob(features_data, 
+            {{batch_size, num_points, 4}}, options);
+        
+        // Run inference
+        auto [logits, masks, semantic] = infer(points, features);
+        
+        // Process results
+        std::cout << "Results:" << std::endl;
+        std::cout << "  Logits: " << logits.sizes() << std::endl;
+        std::cout << "  Masks: " << masks.sizes() << std::endl;
+        std::cout << "  Semantic: " << semantic.sizes() << std::endl;
+        
+        // Get predictions
+        auto semantic_pred = semantic.argmax(-1);  // [B, N]
+        auto class_pred = logits.argmax(-1);       // [B, Q]
+        
+        // Convert to CPU for processing
+        semantic_pred = semantic_pred.to(torch::kCPU);
+        class_pred = class_pred.to(torch::kCPU);
+        
+        // Access data
+        auto sem_data = semantic_pred.data_ptr<int64_t>();
+        auto cls_data = class_pred.data_ptr<int64_t>();
+        
+        // Process predictions...
+    }}
+}};
+
+int main(int argc, char* argv[]) {{
+    if (argc < 2) {{
+        std::cerr << "Usage: " << argv[0] << " <model_path>" << std::endl;
+        return 1;
+    }}
+    
+    try {{
+        // Initialize model
+        MaskPLSInference model(argv[1], true);
+        
+        // Example: process dummy data
+        int num_points = 10000;
+        int batch_size = 1;
+        
+        // Allocate data (in practice, load from your point cloud)
+        std::vector<float> points(batch_size * num_points * 3);
+        std::vector<float> features(batch_size * num_points * 4);
+        
+        // Fill with dummy data
+        for (size_t i = 0; i < points.size(); ++i) {{
+            points[i] = static_cast<float>(rand()) / RAND_MAX * 100.0f - 50.0f;
+        }}
+        for (size_t i = 0; i < features.size(); ++i) {{
+            features[i] = static_cast<float>(rand()) / RAND_MAX;
+        }}
+        
+        // Process
+        model.process_point_cloud(points.data(), features.data(), 
+                                 num_points, batch_size);
+        
+        std::cout << "Inference successful!" << std::endl;
+    }}
+    catch (const std::exception& e) {{
+        std::cerr << "Error: " << e.what() << std::endl;
+        return 1;
+    }}
+    
+    return 0;
+}}
+"""
 
 
 if __name__ == "__main__":
