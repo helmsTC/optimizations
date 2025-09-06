@@ -272,8 +272,13 @@ def main():
         results = inferencer.process_bin_file(str(bin_file))
         
         # Prepare output paths
-        rel_path = bin_file.relative_to(input_path.parent) if input_path.is_dir() else bin_file.name
-        output_name = rel_path.stem
+        if input_path.is_dir():
+            # For directory input, preserve relative structure
+            rel_path = bin_file.relative_to(input_path)
+            output_name = str(rel_path.with_suffix('')).replace('/', '_').replace('\\', '_')
+        else:
+            # For single file input
+            output_name = bin_file.stem
         
         # Save PLY with semantic colors
         ply_path_sem = output_dir / f"{output_name}_semantic.ply"
