@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Export MaskPLS model by extracting core components without Lightning
+Correct export that preserves the actual model inference pipeline
 """
 
 import torch
@@ -10,12 +10,17 @@ import yaml
 from pathlib import Path
 from easydict import EasyDict as edict
 import click
+import sys
+import os
+
+# Add parent directory to path
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
-class StandaloneMaskPLS(nn.Module):
-    """Standalone model without Lightning dependencies"""
+class CorrectMaskPLSExport(nn.Module):
+    """Export wrapper that preserves exact inference pipeline"""
     
-    def __init__(self, checkpoint_path, cfg, device='cuda'):
+    def __init__(self, checkpoint_path, cfg):
         super().__init__()
         
         print(f"Loading checkpoint: {checkpoint_path}")
@@ -28,14 +33,15 @@ class StandaloneMaskPLS(nn.Module):
         dataset = cfg.MODEL.DATASET
         self.num_classes = cfg[dataset].NUM_CLASSES
         self.ignore_label = cfg[dataset].IGNORE_LABEL
-        self.things_ids = cfg[dataset].get('THINGS_IDS', [1, 2, 3, 4, 5, 6, 7, 8])
+        self.things_ids = [1, 2, 3, 4, 5, 6, 7, 8] if dataset == 'KITTI' else [2, 3, 4, 5, 6, 7, 9, 10]
         
-        # Import the actual backbone and decoder
+        # Import the actual model components
         from mask_pls.models.dgcnn.dgcnn_backbone_efficient import FixedDGCNNBackbone
         from mask_pls.models.decoder import MaskedTransformerDecoder
         
-        # Create backbone
-        self.backbone = FixedDGCNNBackbone(cfg.BACKBONE, None)
+        # Create the actual backbone with pretrained path if available
+        pretrained_path = cfg.get('PRETRAINED_PATH', None)
+        self.backbone = FixedDGCNNBackbone(cfg.BACKBONE, pretrained_path)
         self.backbone.set_num_classes(self.num_classes)
         
         # Create decoder
@@ -45,270 +51,244 @@ class StandaloneMaskPLS(nn.Module):
             cfg[dataset]
         )
         
-        # Load weights from checkpoint
-        print("Extracting model weights...")
-        backbone_state = {}
-        decoder_state = {}
-        
-        for key, value in state_dict.items():
-            if key.startswith('backbone.'):
-                new_key = key.replace('backbone.', '')
-                backbone_state[new_key] = value
-            elif key.startswith('decoder.'):
-                new_key = key.replace('decoder.', '')
-                decoder_state[new_key] = value
-        
         # Load weights
-        if backbone_state:
-            self.backbone.load_state_dict(backbone_state, strict=False)
-            print(f"  Loaded {len(backbone_state)} backbone parameters")
+        print("Loading model weights...")
+        loaded_backbone = 0
+        loaded_decoder = 0
         
-        if decoder_state:
-            self.decoder.load_state_dict(decoder_state, strict=False)
-            print(f"  Loaded {len(decoder_state)} decoder parameters")
+        # Load backbone weights
+        backbone_state_dict = self.backbone.state_dict()
+        for key in backbone_state_dict.keys():
+            full_key = f'backbone.{key}'
+            if full_key in state_dict:
+                backbone_state_dict[key] = state_dict[full_key]
+                loaded_backbone += 1
         
-        # Move to device and set to eval
-        self.device_type = device
+        self.backbone.load_state_dict(backbone_state_dict, strict=False)
+        print(f"  Loaded {loaded_backbone}/{len(backbone_state_dict)} backbone parameters")
+        
+        # Load decoder weights
+        decoder_state_dict = self.decoder.state_dict()
+        for key in decoder_state_dict.keys():
+            full_key = f'decoder.{key}'
+            if full_key in state_dict:
+                decoder_state_dict[key] = state_dict[full_key]
+                loaded_decoder += 1
+        
+        self.decoder.load_state_dict(decoder_state_dict, strict=False)
+        print(f"  Loaded {loaded_decoder}/{len(decoder_state_dict)} decoder parameters")
+        
+        # Verify critical layers are loaded
+        self.verify_weights_loaded()
+        
         self.eval()
+    
+    def verify_weights_loaded(self):
+        """Verify that critical layers have non-zero weights"""
+        print("\nVerifying loaded weights...")
+        
+        # Check backbone critical layers
+        critical_checks = [
+            ('backbone.edge_conv1.0.weight', self.backbone.edge_conv1[0].weight),
+            ('backbone.edge_conv2.0.weight', self.backbone.edge_conv2[0].weight),
+            ('backbone.edge_conv3.0.weight', self.backbone.edge_conv3[0].weight),
+            ('backbone.edge_conv4.0.weight', self.backbone.edge_conv4[0].weight),
+        ]
+        
+        for name, param in critical_checks:
+            if param.abs().max().item() < 1e-6:
+                print(f"  WARNING: {name} appears to be uninitialized!")
+            else:
+                print(f"  ✓ {name}: max weight = {param.abs().max().item():.4f}")
+        
+        # Check decoder
+        if hasattr(self.decoder, 'query_feat'):
+            print(f"  ✓ Decoder query_feat: max = {self.decoder.query_feat.weight.abs().max().item():.4f}")
     
     @torch.no_grad()
     def forward(self, points: torch.Tensor, features: torch.Tensor):
         """
-        Direct forward pass
+        Forward pass that exactly matches training inference
         Args:
             points: [B, N, 3]
             features: [B, N, 4]
         """
         batch_size = points.shape[0]
         
-        # Create input dict for backbone
+        # Create the exact input format expected by backbone
         x = {
             'pt_coord': [],
             'feats': []
         }
         
         for b in range(batch_size):
+            # Convert to numpy as expected by the dataloader
             x['pt_coord'].append(points[b].cpu().numpy())
             x['feats'].append(features[b].cpu().numpy())
         
-        # Process through backbone
+        # Run through the ACTUAL backbone forward pass
+        # This should use the real DGCNN processing, not random features!
         ms_features, ms_coords, ms_masks, sem_logits = self.backbone(x)
         
-        # Process through decoder
+        # Run through decoder
         outputs, padding = self.decoder(ms_features, ms_coords, ms_masks)
         
-        # Return outputs
         return outputs['pred_logits'], outputs['pred_masks'], sem_logits
 
 
-class SimplifiedExport(nn.Module):
-    """Even simpler wrapper for tracing"""
+class TracingWrapper(nn.Module):
+    """Wrapper optimized for tracing that avoids numpy conversions"""
     
-    def __init__(self, backbone, decoder, num_classes):
+    def __init__(self, model):
         super().__init__()
-        self.backbone = backbone
-        self.decoder = decoder
-        self.num_classes = num_classes
+        self.model = model
+        self.backbone = model.backbone
+        self.decoder = model.decoder
+        self.num_classes = model.num_classes
     
     @torch.no_grad()
     def forward(self, points: torch.Tensor, features: torch.Tensor):
-        """Simplified forward for tracing"""
-        batch_size = points.shape[0]
-        num_points = points.shape[1]
+        """Forward pass optimized for tracing"""
+        # Directly call backbone with tensors
+        # We need to modify this to work with tensors instead of numpy
         
-        # Process each sample
-        all_features = []
-        all_coords = []
-        all_masks = []
-        
-        for b in range(batch_size):
-            # Limit points if needed
-            pts = points[b]
-            feat = features[b]
-            
-            if pts.shape[0] > 30000:
-                indices = torch.randperm(pts.shape[0])[:30000]
-                pts = pts[indices]
-                feat = feat[indices]
-            
-            # Simple feature extraction (simplified for export)
-            # In practice, this goes through DGCNN
-            point_features = []
-            for dim in [256, 128, 96, 96]:
-                f = torch.randn(pts.shape[0], dim, device=pts.device)
-                point_features.append(f)
-            
-            all_features.append(point_features)
-            all_coords.append(pts)
-            all_masks.append(torch.zeros(pts.shape[0], dtype=torch.bool, device=pts.device))
-        
-        # Pad to same size for batching
-        ms_features = []
-        ms_coords = []
-        ms_masks = []
-        
-        for level in range(4):
-            level_features = []
-            level_coords = []
-            level_masks = []
-            
-            max_pts = max(all_features[b][level].shape[0] for b in range(batch_size))
-            
-            for b in range(batch_size):
-                feat = all_features[b][level]
-                coord = all_coords[b]
-                mask = all_masks[b]
-                
-                n_pts = feat.shape[0]
-                if n_pts < max_pts:
-                    pad_size = max_pts - n_pts
-                    feat = torch.nn.functional.pad(feat, (0, 0, 0, pad_size))
-                    coord = torch.nn.functional.pad(coord, (0, 0, 0, pad_size))
-                    mask = torch.nn.functional.pad(mask, (0, pad_size), value=True)
-                
-                level_features.append(feat)
-                level_coords.append(coord)
-                level_masks.append(mask)
-            
-            ms_features.append(torch.stack(level_features))
-            ms_coords.append(torch.stack(level_coords))
-            ms_masks.append(torch.stack(level_masks))
-        
-        # Decoder forward
-        outputs, padding = self.decoder(ms_features, ms_coords, ms_masks)
-        
-        # Semantic logits (simplified)
-        sem_logits = torch.randn(batch_size, max_pts, self.num_classes, device=points.device)
-        
-        return outputs['pred_logits'], outputs['pred_masks'], sem_logits
+        # Since the backbone expects numpy arrays, we need to handle this differently
+        # For now, we'll use the original model's forward
+        return self.model(points, features)
 
 
-def export_without_lightning(checkpoint_path, output_path, cfg):
-    """Export without Lightning dependencies"""
-    
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
-    print("Creating standalone model...")
-    model = StandaloneMaskPLS(checkpoint_path, cfg, device.type)
+def test_model_outputs(model, device='cuda'):
+    """Test that the model produces reasonable outputs"""
     model = model.to(device)
     model.eval()
     
-    # Test the model first
-    print("\nTesting model...")
-    test_points = torch.randn(1, 5000, 3, device=device)
-    test_features = torch.randn(1, 5000, 4, device=device)
+    # Create realistic test data
+    batch_size = 1
+    num_points = 5000
     
+    # Generate realistic point cloud
+    points = torch.randn(batch_size, num_points, 3, device=device) * 20
+    points[:, :, 2] = points[:, :, 2] * 0.5  # Compress Z axis
+    
+    features = torch.zeros(batch_size, num_points, 4, device=device)
+    features[:, :, :3] = points  # xyz
+    features[:, :, 3] = torch.rand(batch_size, num_points, device=device)  # intensity
+    
+    print("\nTesting model outputs...")
+    with torch.no_grad():
+        outputs = model(points, features)
+    
+    pred_logits, pred_masks, sem_logits = outputs
+    
+    print(f"Output shapes:")
+    print(f"  pred_logits: {pred_logits.shape}")
+    print(f"  pred_masks: {pred_masks.shape}")
+    print(f"  sem_logits: {sem_logits.shape}")
+    
+    # Check for reasonable values
+    print(f"\nOutput statistics:")
+    print(f"  pred_logits: min={pred_logits.min():.3f}, max={pred_logits.max():.3f}, mean={pred_logits.mean():.3f}")
+    print(f"  pred_masks: min={pred_masks.min():.3f}, max={pred_masks.max():.3f}, mean={pred_masks.mean():.3f}")
+    print(f"  sem_logits: min={sem_logits.min():.3f}, max={sem_logits.max():.3f}, mean={sem_logits.mean():.3f}")
+    
+    # Check semantic predictions
+    sem_pred = torch.argmax(sem_logits[0], dim=-1)
+    unique_classes = torch.unique(sem_pred)
+    print(f"\nPredicted classes: {unique_classes.cpu().numpy()}")
+    
+    # Check if outputs are reasonable (not all zeros or random)
+    if pred_logits.abs().max() < 0.01:
+        print("WARNING: pred_logits appears to be all zeros!")
+    if sem_logits.abs().max() < 0.01:
+        print("WARNING: sem_logits appears to be all zeros!")
+    
+    return True
+
+
+def export_with_verification(checkpoint_path, output_path, cfg):
+    """Export with verification steps"""
+    
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    # Create the correct model
+    print("\n" + "="*60)
+    print("Creating model with actual trained weights...")
+    print("="*60)
+    
+    model = CorrectMaskPLSExport(checkpoint_path, cfg)
+    
+    # Test the model
+    test_model_outputs(model, device.type)
+    
+    print("\n" + "="*60)
+    print("Exporting model...")
+    print("="*60)
+    
+    model = model.to(device)
+    model.eval()
+    
+    # Create example inputs
+    example_points = torch.randn(1, 10000, 3, device=device) * 20
+    example_features = torch.randn(1, 10000, 4, device=device)
+    example_features[:, :, :3] = example_points
+    
+    # Try to trace the model
+    print("Tracing model...")
     with torch.no_grad():
         try:
-            outputs = model(test_points, test_features)
-            print(f"Test successful! Output shapes: {[o.shape for o in outputs]}")
+            traced = torch.jit.trace(model, (example_points, example_features))
+            
+            # Verify traced model
+            print("Verifying traced model...")
+            traced_outputs = traced(example_points, example_features)
+            
+            # Compare with original
+            original_outputs = model(example_points, example_features)
+            
+            for i, (to, oo) in enumerate(zip(traced_outputs, original_outputs)):
+                diff = (to - oo).abs().max().item()
+                print(f"  Output {i} difference: {diff:.6f}")
+                if diff > 1e-3:
+                    print(f"    WARNING: Large difference detected!")
+            
+            # Save
+            traced.save(output_path)
+            print(f"\n✓ Model exported to {output_path}")
+            
         except Exception as e:
-            print(f"Test failed: {e}")
-            print("Attempting alternative export method...")
-            return export_alternative(checkpoint_path, output_path, cfg)
-    
-    # Script the model instead of tracing
-    print("\nScripting model...")
-    try:
-        scripted = torch.jit.script(model)
-        scripted.save(output_path)
-        print(f"✓ Model saved to {output_path}")
-        return scripted
-    except:
-        print("Scripting failed, trying tracing...")
-        
-        # Try tracing
-        with torch.no_grad():
-            traced = torch.jit.trace(model, (test_points, test_features))
-        
-        traced.save(output_path)
-        print(f"✓ Model traced and saved to {output_path}")
-        return traced
-
-
-def export_alternative(checkpoint_path, output_path, cfg):
-    """Alternative export method - direct component extraction"""
-    
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
-    print("\nUsing alternative export method...")
-    
-    # Load checkpoint
-    ckpt = torch.load(checkpoint_path, map_location='cpu')
-    state_dict = ckpt['state_dict'] if 'state_dict' in ckpt else ckpt
-    
-    # Import components
-    from mask_pls.models.dgcnn.dgcnn_backbone_efficient import FixedDGCNNBackbone
-    from mask_pls.models.decoder import MaskedTransformerDecoder
-    
-    dataset = cfg.MODEL.DATASET
-    
-    # Create components
-    backbone = FixedDGCNNBackbone(cfg.BACKBONE, None)
-    backbone.set_num_classes(cfg[dataset].NUM_CLASSES)
-    
-    decoder = MaskedTransformerDecoder(
-        cfg.DECODER,
-        cfg.BACKBONE,
-        cfg[dataset]
-    )
-    
-    # Load weights directly
-    backbone_dict = backbone.state_dict()
-    decoder_dict = decoder.state_dict()
-    
-    # Update backbone
-    for key in backbone_dict.keys():
-        full_key = f'backbone.{key}'
-        if full_key in state_dict:
-            backbone_dict[key] = state_dict[full_key]
-    
-    # Update decoder
-    for key in decoder_dict.keys():
-        full_key = f'decoder.{key}'
-        if full_key in state_dict:
-            decoder_dict[key] = state_dict[full_key]
-    
-    backbone.load_state_dict(backbone_dict, strict=False)
-    decoder.load_state_dict(decoder_dict, strict=False)
-    
-    # Create simplified wrapper
-    model = SimplifiedExport(backbone, decoder, cfg[dataset].NUM_CLASSES)
-    model = model.to(device)
-    model.eval()
-    
-    # Test
-    test_points = torch.randn(1, 5000, 3, device=device)
-    test_features = torch.randn(1, 5000, 4, device=device)
-    
-    with torch.no_grad():
-        outputs = model(test_points, test_features)
-        print(f"Alternative export test successful! Output shapes: {[o.shape for o in outputs]}")
-    
-    # Trace the model
-    with torch.no_grad():
-        traced = torch.jit.trace(model, (test_points, test_features))
-    
-    # Optimize
-    traced = torch.jit.optimize_for_inference(traced)
-    
-    # Save
-    traced.save(output_path)
-    print(f"✓ Alternative export saved to {output_path}")
+            print(f"Tracing failed: {e}")
+            print("Attempting to save as scripted module...")
+            
+            # Try scripting instead
+            try:
+                scripted = torch.jit.script(model)
+                scripted.save(output_path)
+                print(f"\n✓ Model scripted and saved to {output_path}")
+            except Exception as e2:
+                print(f"Scripting also failed: {e2}")
+                
+                # Last resort: save state dict
+                torch.save({
+                    'backbone_state_dict': model.backbone.state_dict(),
+                    'decoder_state_dict': model.decoder.state_dict(),
+                    'config': cfg
+                }, output_path.replace('.pt', '_state.pth'))
+                print(f"Saved state dict to {output_path.replace('.pt', '_state.pth')}")
+                return None
     
     return traced
 
 
 @click.command()
 @click.option('--checkpoint', required=True, help='Path to checkpoint')
-@click.option('--output', default='model_export.pt', help='Output file')
+@click.option('--output', default='model_correct.pt', help='Output file')
 @click.option('--config', help='Config directory path')
-@click.option('--test', is_flag=True, help='Test the exported model')
-def main(checkpoint, output, config, test):
-    """Export MaskPLS model without Lightning"""
+@click.option('--compare', is_flag=True, help='Compare with original checkpoint')
+def main(checkpoint, output, config, compare):
+    """Export MaskPLS model correctly"""
     
     print("="*60)
-    print("MaskPLS Export (No Lightning)")
+    print("MaskPLS Correct Export")
     print("="*60)
     
     # Load configuration
@@ -318,58 +298,53 @@ def main(checkpoint, output, config, test):
         config_dir = Path(__file__).parent.parent / "config"
     
     cfg = edict()
-    for config_file in ['model.yaml', 'backbone.yaml', 'decoder.yaml']:
+    config_files = ['model.yaml', 'backbone.yaml', 'decoder.yaml']
+    
+    for config_file in config_files:
         config_path = config_dir / config_file
         if config_path.exists():
             with open(config_path, 'r') as f:
-                cfg.update(yaml.safe_load(f))
-            print(f"Loaded config: {config_path}")
+                data = yaml.safe_load(f)
+                if data:
+                    cfg.update(data)
+            print(f"✓ Loaded config: {config_path}")
+        else:
+            print(f"✗ Config not found: {config_path}")
     
-    # Export
-    try:
-        traced_model = export_without_lightning(checkpoint, output, cfg)
-    except Exception as e:
-        print(f"Export failed: {e}")
-        print("Trying fallback method...")
-        traced_model = export_alternative(checkpoint, output, cfg)
+    # Export with verification
+    traced_model = export_with_verification(checkpoint, output, cfg)
     
-    # Test if requested
-    if test and traced_model:
+    if traced_model and compare:
         print("\n" + "="*60)
-        print("Testing exported model...")
+        print("Comparing with original checkpoint...")
         print("="*60)
         
+        # Load both models and compare on random data
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
-        # Load the saved model
-        loaded = torch.jit.load(output, map_location=device)
-        loaded.eval()
+        # Original model
+        original = CorrectMaskPLSExport(checkpoint, cfg).to(device)
+        original.eval()
         
-        # Test with different sizes
-        test_sizes = [1000, 5000, 10000]
+        # Exported model
+        exported = torch.jit.load(output, map_location=device)
+        exported.eval()
         
-        for size in test_sizes:
-            test_points = torch.randn(1, size, 3, device=device) * 20
-            test_features = torch.randn(1, size, 4, device=device)
-            test_features[:, :, :3] = test_points
-            
-            with torch.no_grad():
-                outputs = loaded(test_points, test_features)
-            
-            print(f"\nTest with {size} points:")
-            print(f"  Logits: {outputs[0].shape}")
-            print(f"  Masks: {outputs[1].shape}")
-            print(f"  Semantic: {outputs[2].shape}")
-            
-            # Check for valid outputs
-            for i, out in enumerate(outputs):
-                if torch.isnan(out).any():
-                    print(f"  WARNING: Output {i} contains NaN!")
-                else:
-                    print(f"  Output {i} range: [{out.min():.3f}, {out.max():.3f}]")
+        # Test data
+        test_points = torch.randn(1, 5000, 3, device=device) * 20
+        test_features = torch.randn(1, 5000, 4, device=device)
+        test_features[:, :, :3] = test_points
+        
+        with torch.no_grad():
+            orig_out = original(test_points, test_features)
+            exp_out = exported(test_points, test_features)
+        
+        print("Output comparison:")
+        for i in range(3):
+            diff = (orig_out[i] - exp_out[i]).abs()
+            print(f"  Output {i}: max_diff={diff.max():.6f}, mean_diff={diff.mean():.6f}")
     
     print(f"\n✓ Export complete!")
-    print(f"Model saved to: {output}")
     print(f"Model size: {Path(output).stat().st_size / 1024 / 1024:.2f} MB")
 
 
