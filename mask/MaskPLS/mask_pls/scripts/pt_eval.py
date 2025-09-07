@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Evaluation script for inference model (not traced)
+Evaluate direct model without Lightning
 """
 
 import torch
@@ -10,135 +10,156 @@ import click
 from pathlib import Path
 from tqdm import tqdm
 from easydict import EasyDict as edict
+import sys
+import os
+
+# Add parent directory to path
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from mask_pls.datasets.semantic_dataset import SemanticDatasetModule
 from mask_pls.utils.evaluate_panoptic import PanopticEvaluator
 
+# Import the model class
+from save_direct_model import DirectInferenceModel
 
-class InferenceEvaluator:
-    """Evaluate inference model"""
+
+class DirectModelEvaluator:
+    """Evaluate direct model"""
     
     def __init__(self, model_path, cfg, device='cuda'):
         self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
         
-        print(f"Loading inference model from {model_path}")
-        saved = torch.load(model_path, map_location=self.device)
+        print(f"Loading model from {model_path}")
         
-        self.model = saved['model']
-        self.model = self.model.to(self.device)
-        self.model.eval()
+        # Load saved model
+        checkpoint = torch.load(model_path, map_location=self.device)
+        
+        # Recreate model
+        if 'config' in checkpoint:
+            cfg = checkpoint['config']
+        
+        # Create model directly (not from checkpoint this time)
+        from mask_pls.models.dgcnn.dgcnn_backbone_efficient import FixedDGCNNBackbone
+        from mask_pls.models.decoder import MaskedTransformerDecoder
+        
+        dataset = cfg.MODEL.DATASET
+        
+        # Create components
+        self.backbone = FixedDGCNNBackbone(cfg.BACKBONE, None)
+        self.backbone.set_num_classes(cfg[dataset].NUM_CLASSES)
+        
+        self.decoder = MaskedTransformerDecoder(
+            cfg.DECODER,
+            cfg.BACKBONE,
+            cfg[dataset]
+        )
+        
+        # Load state dicts
+        if 'backbone_state_dict' in checkpoint:
+            self.backbone.load_state_dict(checkpoint['backbone_state_dict'])
+        if 'decoder_state_dict' in checkpoint:
+            self.decoder.load_state_dict(checkpoint['decoder_state_dict'])
+        
+        self.backbone = self.backbone.to(self.device)
+        self.decoder = self.decoder.to(self.device)
+        self.backbone.eval()
+        self.decoder.eval()
         
         # Setup evaluator
-        dataset = cfg.MODEL.DATASET
         self.evaluator = PanopticEvaluator(cfg[dataset], dataset)
-        self.num_classes = self.model.num_classes
-        self.things_ids = self.model.things_ids
+        self.num_classes = cfg[dataset].NUM_CLASSES
+        self.things_ids = [1, 2, 3, 4, 5, 6, 7, 8] if dataset == 'KITTI' else [2, 3, 4, 5, 6, 7, 9, 10]
         
         print(f"Model loaded on {self.device}")
     
     def process_batch(self, batch):
         """Process batch through model"""
         
-        # The model expects lists of numpy arrays
-        points_list = batch['pt_coord']
-        features_list = batch['feats']
-        
-        # Process through model
         with torch.no_grad():
-            pred_logits, pred_masks, sem_logits, padding = self.model.forward(
-                points_list, features_list
-            )
+            # Run through backbone
+            feats, coords, pad_masks, sem_logits = self.backbone(batch)
+            
+            # Run through decoder
+            outputs, padding = self.decoder(feats, coords, pad_masks)
         
-        # Convert to CPU for processing
-        pred_logits = pred_logits.cpu()
-        pred_masks = pred_masks.cpu()
-        sem_logits = sem_logits.cpu()
-        padding = padding.cpu()
+        # Process outputs
+        sem_pred, ins_pred = self.panoptic_inference(outputs, padding)
         
-        # Process predictions
+        return sem_pred, ins_pred
+    
+    def panoptic_inference(self, outputs, padding):
+        """Panoptic inference"""
+        mask_cls = outputs["pred_logits"]
+        mask_pred = outputs["pred_masks"]
+        
+        batch_size = mask_cls.shape[0]
         sem_pred = []
         ins_pred = []
         
-        batch_size = len(points_list)
-        
         for b in range(batch_size):
-            # Get valid mask
             valid_mask = ~padding[b]
-            n_valid = valid_mask.sum().item()
+            num_valid = valid_mask.sum().item()
             
-            if n_valid == 0:
+            if num_valid == 0:
                 sem_pred.append(np.zeros(0, dtype=np.int32))
                 ins_pred.append(np.zeros(0, dtype=np.int32))
                 continue
             
-            # Semantic prediction
-            sem_logit = sem_logits[b][valid_mask]
-            sem = torch.argmax(sem_logit, dim=-1).numpy()
+            scores, labels = mask_cls[b].max(-1)
             
-            # Instance prediction
-            ins = self.process_instance(
-                pred_logits[b],
-                pred_masks[b],
-                valid_mask
-            )
+            # Handle mask dimensions
+            if mask_pred.shape[1] == mask_cls.shape[1]:  # [B, Q, N]
+                mask_pred_b = mask_pred[b].transpose(0, 1)  # [N, Q]
+            else:  # [B, N, Q]
+                mask_pred_b = mask_pred[b]
             
-            # Match ground truth size
-            gt_size = len(batch['sem_label'][b])
-            if len(sem) > gt_size:
-                sem = sem[:gt_size]
-                ins = ins[:gt_size]
-            elif len(sem) < gt_size:
-                # This shouldn't happen if model is working correctly
-                print(f"Warning: Prediction size {len(sem)} < GT size {gt_size}")
+            # Extract valid points
+            mask_pred_b = mask_pred_b[valid_mask].sigmoid()
             
-            sem_pred.append(sem)
-            ins_pred.append(ins)
+            # Filter valid predictions
+            keep = labels.ne(self.num_classes)
+            
+            if keep.sum() == 0:
+                sem_pred.append(np.zeros(num_valid, dtype=np.int32))
+                ins_pred.append(np.zeros(num_valid, dtype=np.int32))
+                continue
+            
+            # Process predictions
+            keep_indices = torch.where(keep)[0]
+            cur_scores = scores[keep_indices]
+            cur_classes = labels[keep_indices]
+            cur_masks = mask_pred_b[:, keep_indices]
+            
+            # Weighted masks
+            cur_prob_masks = cur_scores.unsqueeze(0) * cur_masks
+            
+            # Assign classes
+            semantic_seg = torch.zeros(num_valid, dtype=torch.int32, device=cur_masks.device)
+            instance_seg = torch.zeros(num_valid, dtype=torch.int32, device=cur_masks.device)
+            
+            if cur_masks.shape[1] > 0:
+                cur_mask_ids = cur_prob_masks.argmax(1)
+                
+                current_segment_id = 0
+                
+                for k in range(cur_classes.shape[0]):
+                    pred_class = cur_classes[k].item()
+                    isthing = pred_class in self.things_ids
+                    
+                    mask = (cur_mask_ids == k) & (cur_masks[:, k] >= 0.5)
+                    mask_area = mask.sum().item()
+                    
+                    if mask_area > 0:
+                        semantic_seg[mask] = pred_class
+                        
+                        if isthing:
+                            current_segment_id += 1
+                            instance_seg[mask] = current_segment_id
+            
+            sem_pred.append(semantic_seg.cpu().numpy())
+            ins_pred.append(instance_seg.cpu().numpy())
         
         return sem_pred, ins_pred
-    
-    def process_instance(self, query_logits, mask_logits, valid_mask):
-        """Process instance predictions"""
-        
-        # Get query predictions
-        query_classes = torch.argmax(query_logits, dim=-1)
-        query_scores = torch.softmax(query_logits, dim=-1).max(dim=-1)[0]
-        
-        # Filter valid queries
-        valid_queries = query_classes < self.num_classes
-        
-        if not valid_queries.any():
-            return np.zeros(valid_mask.sum().item(), dtype=np.int32)
-        
-        # Handle mask dimensions
-        if mask_logits.shape[0] == query_logits.shape[0]:  # [Q, N]
-            mask_logits = mask_logits.transpose(0, 1)  # [N, Q]
-        
-        # Extract valid points
-        mask_logits_valid = mask_logits[valid_mask]
-        
-        # Get valid query indices
-        valid_query_indices = torch.where(valid_queries)[0]
-        
-        if len(valid_query_indices) == 0:
-            return np.zeros(valid_mask.sum().item(), dtype=np.int32)
-        
-        # Select valid query masks
-        mask_logits_valid = mask_logits_valid[:, valid_query_indices]
-        valid_query_scores = query_scores[valid_query_indices]
-        
-        # Apply sigmoid
-        mask_probs = torch.sigmoid(mask_logits_valid)
-        
-        # Weight by query scores
-        weighted_masks = mask_probs * valid_query_scores.unsqueeze(0)
-        
-        # Assign instances
-        max_scores, instance_ids = weighted_masks.max(dim=1)
-        
-        ins = instance_ids + 1
-        ins[max_scores < 0.5] = 0
-        
-        return ins.numpy()
     
     def evaluate(self, dataloader, max_batches=None):
         """Evaluate on dataloader"""
@@ -149,9 +170,6 @@ class InferenceEvaluator:
         total_batches = len(dataloader)
         if max_batches:
             total_batches = min(total_batches, max_batches)
-        
-        successful = 0
-        failed = 0
         
         with tqdm(total=total_batches, desc="Evaluating") as pbar:
             for i, batch in enumerate(dataloader):
@@ -165,18 +183,15 @@ class InferenceEvaluator:
                     # Update evaluator
                     self.evaluator.update(sem_pred, ins_pred, batch)
                     
-                    successful += 1
-                    
                 except Exception as e:
                     print(f"\nError in batch {i}: {e}")
-                    failed += 1
                     import traceback
                     traceback.print_exc()
                 
                 pbar.update(1)
                 
-                # Show intermediate metrics
-                if successful > 0 and successful % 10 == 0:
+                # Show metrics
+                if (i + 1) % 10 == 0:
                     pq = self.evaluator.get_mean_pq()
                     iou = self.evaluator.get_mean_iou()
                     rq = self.evaluator.get_mean_rq()
@@ -186,38 +201,31 @@ class InferenceEvaluator:
                         'RQ': f'{rq:.3f}'
                     })
         
-        print(f"\nProcessed {successful} batches successfully, {failed} failed")
-        
         # Final metrics
         print("\n" + "="*60)
-        print("Final Evaluation Metrics")
+        print("Final Metrics")
         print("="*60)
         
         pq = self.evaluator.get_mean_pq()
         iou = self.evaluator.get_mean_iou()
         rq = self.evaluator.get_mean_rq()
         
-        print(f"PQ (Panoptic Quality): {pq:.4f}")
-        print(f"IoU (Mean IoU): {iou:.4f}")
-        print(f"RQ (Recognition Quality): {rq:.4f}")
+        print(f"PQ: {pq:.4f}")
+        print(f"IoU: {iou:.4f}")
+        print(f"RQ: {rq:.4f}")
         
         self.evaluator.print_results()
         
-        return {
-            'PQ': float(pq),
-            'IoU': float(iou),
-            'RQ': float(rq)
-        }
+        return {'PQ': pq, 'IoU': iou, 'RQ': rq}
 
 
 @click.command()
-@click.option('--model', required=True, help='Path to inference model (.pth)')
-@click.option('--dataset', default='KITTI', type=click.Choice(['KITTI', 'NUSCENES']))
-@click.option('--batch-size', default=1, type=int)
-@click.option('--max-batches', type=int, help='Max batches to evaluate')
-@click.option('--split', default='valid', type=click.Choice(['train', 'valid', 'test']))
-def main(model, dataset, batch_size, max_batches, split):
-    """Evaluate inference model"""
+@click.option('--model', required=True, help='Path to model')
+@click.option('--dataset', default='KITTI')
+@click.option('--batch-size', default=1)
+@click.option('--max-batches', type=int)
+def main(model, dataset, batch_size, max_batches):
+    """Evaluate direct model"""
     
     # Load config
     config_dir = Path(__file__).parent.parent / "config"
@@ -235,22 +243,13 @@ def main(model, dataset, batch_size, max_batches, split):
     # Setup data
     data_module = SemanticDatasetModule(cfg)
     data_module.setup()
-    
-    if split == 'valid':
-        dataloader = data_module.val_dataloader()
-    else:
-        dataloader = data_module.train_dataloader()
+    dataloader = data_module.val_dataloader()
     
     # Evaluate
-    evaluator = InferenceEvaluator(model, cfg)
+    evaluator = DirectModelEvaluator(model, cfg)
     metrics = evaluator.evaluate(dataloader, max_batches)
     
-    # Save metrics
-    output_file = Path(model).stem + '_metrics.yaml'
-    with open(output_file, 'w') as f:
-        yaml.dump(metrics, f)
-    
-    print(f"\nMetrics saved to {output_file}")
+    print(f"\nFinal: PQ={metrics['PQ']:.4f}, IoU={metrics['IoU']:.4f}, RQ={metrics['RQ']:.4f}")
 
 
 if __name__ == "__main__":
