@@ -2,7 +2,20 @@
   "permissions": {
     "allow": [
       "Bash(python:*)",
-      "Bash(cp:*)"
+      "Bash(cp:*)",
+      "Read(/C:\\Users\\freer\\OneDrive\\Desktop\\New folder (5)\\optimizations\\mask\\MaskPLS\\mask_pls\\models\\dgcnn/**)",
+      "Read(/C:\\Users\\freer\\OneDrive\\Desktop\\New folder (5)\\optimizations\\mask\\MaskPLS\\mask_pls\\models\\dgcnn/**)",
+      "Read(/C:\\Users\\freer\\OneDrive\\Desktop\\New folder (5)\\optimizations\\mask\\MaskPLS\\mask_pls\\models\\dgcnn/**)",
+      "Read(/C:\\Users\\freer\\OneDrive\\Desktop\\New folder (5)\\optimizations\\mask\\MaskPLS\\mask_pls\\models\\dgcnn/**)",
+      "Read(/C:\\Users\\freer\\OneDrive\\Desktop\\New folder (5)\\optimizations\\mask\\MaskPLS\\mask_pls\\models\\dgcnn/**)",
+      "Read(/C:\\Users\\freer\\OneDrive\\Desktop\\New folder (5)\\optimizations\\mask\\MaskPLS\\mask_pls\\models\\dgcnn/**)",
+      "Read(/C:\\Users\\freer\\OneDrive\\Desktop\\New folder (5)\\optimizations\\mask\\MaskPLS\\mask_pls\\scripts/**)",
+      "Read(/C:\\Users\\freer\\OneDrive\\Desktop\\New folder (5)\\optimizations\\mask\\MaskPLS\\mask_pls\\scripts/**)",
+      "Read(/C:\\Users\\freer\\OneDrive\\Desktop\\New folder (5)\\optimizations\\mask\\MaskPLS\\mask_pls\\scripts/**)",
+      "Read(/C:\\Users\\freer\\OneDrive\\Desktop\\New folder (5)\\optimizations\\mask\\MaskPLS\\mask_pls\\scripts/**)",
+      "Read(/C:\\Users\\freer\\OneDrive\\Desktop\\New folder (5)\\optimizations\\mask\\MaskPLS\\mask_pls\\scripts/**)",
+      "Read(/C:\\Users\\freer\\OneDrive\\Desktop\\New folder (5)\\optimizations\\mask\\MaskPLS\\mask_pls\\scripts/**)",
+      "Read(/C:\\Users\\freer\\OneDrive\\Desktop\\New folder (5)\\optimizations\\mask\\MaskPLS\\mask_pls\\scripts/**)"
     ],
     "deny": [],
     "ask": []
