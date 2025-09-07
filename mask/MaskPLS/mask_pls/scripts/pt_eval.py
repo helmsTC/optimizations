@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Fixed evaluation script for .pt model with proper tensor indexing
+Fixed evaluation script with proper size handling
 """
 
 import torch
@@ -16,7 +16,7 @@ from mask_pls.utils.evaluate_panoptic import PanopticEvaluator
 
 
 class PTModelEvaluator:
-    """Evaluate exported .pt model with fixed tensor operations"""
+    """Evaluate exported .pt model with proper size handling"""
     
     def __init__(self, model_path, cfg, device='cuda'):
         self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
@@ -35,18 +35,16 @@ class PTModelEvaluator:
         print(f"Dataset: {dataset}, Num classes: {self.num_classes}")
     
     def process_batch(self, batch):
-        """Process a batch through the model with fixed indexing"""
+        """Process a batch through the model with proper size tracking"""
         
         # Prepare inputs
         points_list = []
         features_list = []
-        original_sizes = []
+        actual_sizes = []  # Track actual sizes before padding
         
         for i in range(len(batch['pt_coord'])):
             points = torch.from_numpy(batch['pt_coord'][i]).float()
             feats = torch.from_numpy(batch['feats'][i]).float()
-            
-            original_sizes.append(points.shape[0])
             
             # Subsample if needed
             max_points = 30000
@@ -55,23 +53,18 @@ class PTModelEvaluator:
                 points = points[indices]
                 feats = feats[indices]
             
+            actual_sizes.append(points.shape[0])  # Store actual size before padding
             points_list.append(points)
             features_list.append(feats)
         
-        # Pad to same size
+        # Find max size for padding
         max_pts = max(p.shape[0] for p in points_list)
         
         padded_points = []
         padded_features = []
-        valid_masks = []
         
         for points, feats in zip(points_list, features_list):
             n_pts = points.shape[0]
-            
-            # Create padding mask
-            mask = torch.ones(max_pts, dtype=torch.bool)
-            mask[:n_pts] = False
-            valid_masks.append(mask)
             
             if n_pts < max_pts:
                 pad_size = max_pts - n_pts
@@ -93,46 +86,44 @@ class PTModelEvaluator:
         pred_masks = outputs[1]   # [B, N, Q] or [B, Q, N]
         sem_logits = outputs[2]   # [B, N, C]
         
+        # Get actual output size from model
+        output_size = sem_logits.shape[1]  # Number of points in output
+        
         # Process predictions for each sample in batch
         sem_pred = []
         ins_pred = []
         
         for b in range(len(batch['pt_coord'])):
-            # Get the actual number of valid points
-            valid_mask = ~valid_masks[b]
-            n_valid = valid_mask.sum().item()
+            # Determine how many points to process
+            # The model might output fewer points than we padded to
+            actual_size = actual_sizes[b]
+            valid_output_size = min(actual_size, output_size)
             
-            # Process semantic prediction
-            sem_logit = sem_logits[b][valid_mask]  # Extract only valid points
+            # Process semantic prediction - take only valid points
+            sem_logit = sem_logits[b][:valid_output_size]  # [valid_size, C]
             sem = torch.argmax(sem_logit, dim=-1).cpu().numpy()
             
             # Process instance prediction
             ins = self.process_instance_prediction(
                 pred_logits[b], 
                 pred_masks[b],
-                valid_mask,
-                n_valid
+                valid_output_size
             )
-            
-            # Truncate to original size if it was subsampled
-            orig_size = min(original_sizes[b], len(sem))
-            sem = sem[:orig_size]
-            ins = ins[:orig_size]
             
             sem_pred.append(sem)
             ins_pred.append(ins)
         
         return sem_pred, ins_pred
     
-    def process_instance_prediction(self, query_logits, mask_logits, valid_mask, n_valid):
-        """Process instance predictions with proper tensor indexing"""
+    def process_instance_prediction(self, query_logits, mask_logits, n_valid):
+        """Process instance predictions for n_valid points"""
         
         # Get query predictions
         query_classes = torch.argmax(query_logits, dim=-1)  # [Q]
         query_scores = torch.softmax(query_logits, dim=-1).max(dim=-1)[0]  # [Q]
         
         # Filter valid queries (not background/no-object class)
-        valid_queries = query_classes < self.num_classes  # [Q] boolean mask
+        valid_queries = query_classes < self.num_classes
         
         if not valid_queries.any():
             return np.zeros(n_valid, dtype=np.int32)
@@ -141,29 +132,29 @@ class PTModelEvaluator:
         if mask_logits.shape[0] == query_logits.shape[0]:  # [Q, N]
             mask_logits = mask_logits.transpose(0, 1)  # Convert to [N, Q]
         
-        # Extract valid points and valid queries
-        mask_logits_valid = mask_logits[valid_mask]  # [n_valid, Q]
+        # Take only the valid points from mask predictions
+        mask_logits_valid = mask_logits[:n_valid]  # [n_valid, Q]
         
-        # Get indices of valid queries instead of boolean indexing
-        valid_query_indices = torch.where(valid_queries)[0]  # [num_valid_queries]
+        # Get indices of valid queries
+        valid_query_indices = torch.where(valid_queries)[0]
         
         if len(valid_query_indices) == 0:
             return np.zeros(n_valid, dtype=np.int32)
         
-        # Select only valid query masks using indices
+        # Select only valid query masks
         mask_logits_valid = mask_logits_valid[:, valid_query_indices]  # [n_valid, num_valid_queries]
         
         # Get scores for valid queries
-        valid_query_scores = query_scores[valid_query_indices]  # [num_valid_queries]
+        valid_query_scores = query_scores[valid_query_indices]
         
         # Apply sigmoid to get probabilities
-        mask_probs = torch.sigmoid(mask_logits_valid)  # [n_valid, num_valid_queries]
+        mask_probs = torch.sigmoid(mask_logits_valid)
         
         # Weight by query scores
-        weighted_masks = mask_probs * valid_query_scores.unsqueeze(0)  # [n_valid, num_valid_queries]
+        weighted_masks = mask_probs * valid_query_scores.unsqueeze(0)
         
         # Assign each point to the highest scoring mask
-        max_scores, instance_ids = weighted_masks.max(dim=1)  # [n_valid]
+        max_scores, instance_ids = weighted_masks.max(dim=1)
         
         # Create instance predictions (1-indexed)
         ins = instance_ids + 1
@@ -172,95 +163,6 @@ class PTModelEvaluator:
         ins[max_scores < 0.5] = 0
         
         return ins.cpu().numpy()
-    
-    def panoptic_inference_safe(self, outputs, padding):
-        """Safe panoptic inference with proper indexing"""
-        mask_cls = outputs["pred_logits"]
-        mask_pred = outputs["pred_masks"]
-        
-        batch_size = mask_cls.shape[0]
-        sem_pred = []
-        ins_pred = []
-        
-        for b in range(batch_size):
-            valid_mask = ~padding[b]
-            num_valid = valid_mask.sum().item()
-            
-            if num_valid == 0:
-                sem_pred.append(np.zeros(0, dtype=np.int32))
-                ins_pred.append(np.zeros(0, dtype=np.int32))
-                continue
-            
-            # Get predictions for this sample
-            scores, labels = mask_cls[b].max(-1)
-            
-            # Handle mask dimensions
-            if mask_pred.dim() == 3:
-                if mask_pred.shape[1] == mask_cls.shape[1]:  # [B, Q, N]
-                    mask_pred_b = mask_pred[b].transpose(0, 1)  # [N, Q]
-                else:  # [B, N, Q]
-                    mask_pred_b = mask_pred[b]  # [N, Q]
-            else:
-                mask_pred_b = mask_pred[b]
-            
-            # Extract valid points
-            mask_pred_b = mask_pred_b[valid_mask].sigmoid()  # [num_valid, Q]
-            
-            # Filter valid predictions (not background)
-            keep = labels.ne(self.num_classes)
-            
-            if keep.sum() == 0:
-                sem_pred.append(np.zeros(num_valid, dtype=np.int32))
-                ins_pred.append(np.zeros(num_valid, dtype=np.int32))
-                continue
-            
-            # Get indices of valid queries
-            keep_indices = torch.where(keep)[0]
-            
-            cur_scores = scores[keep_indices]
-            cur_classes = labels[keep_indices]
-            cur_masks = mask_pred_b[:, keep_indices]  # [num_valid, num_kept_queries]
-            
-            # Weighted masks
-            cur_prob_masks = cur_scores.unsqueeze(0) * cur_masks
-            
-            # Initialize outputs
-            semantic_seg = torch.zeros(num_valid, dtype=torch.int32, device=cur_masks.device)
-            instance_seg = torch.zeros(num_valid, dtype=torch.int32, device=cur_masks.device)
-            
-            if cur_masks.shape[1] > 0:
-                # Assign points to masks
-                cur_mask_ids = cur_prob_masks.argmax(1)
-                
-                current_segment_id = 0
-                stuff_memory_list = {}
-                
-                for k in range(cur_classes.shape[0]):
-                    pred_class = cur_classes[k].item()
-                    isthing = pred_class in self.things_ids
-                    
-                    # Points belonging to this mask
-                    mask = (cur_mask_ids == k) & (cur_masks[:, k] >= 0.5)
-                    mask_area = mask.sum().item()
-                    
-                    if mask_area > 0:
-                        semantic_seg[mask] = pred_class
-                        
-                        if isthing:
-                            current_segment_id += 1
-                            instance_seg[mask] = current_segment_id
-                        else:
-                            if pred_class not in stuff_memory_list:
-                                current_segment_id += 1
-                                stuff_memory_list[pred_class] = current_segment_id
-                            # For stuff classes, we typically don't assign instances
-                            # but you can uncomment the line below if needed
-                            # instance_seg[mask] = stuff_memory_list[pred_class]
-            
-            sem_pred.append(semantic_seg.cpu().numpy())
-            ins_pred.append(instance_seg.cpu().numpy())
-        
-        return sem_pred, ins_pred
     
     def evaluate(self, dataloader, max_batches=None):
         """Evaluate on dataloader"""
@@ -272,6 +174,11 @@ class PTModelEvaluator:
         if max_batches:
             total_batches = min(total_batches, max_batches)
         
+        # Track statistics
+        total_points_processed = 0
+        successful_batches = 0
+        failed_batches = 0
+        
         with tqdm(total=total_batches, desc="Evaluating") as pbar:
             for i, batch in enumerate(dataloader):
                 if max_batches and i >= max_batches:
@@ -281,11 +188,30 @@ class PTModelEvaluator:
                     # Process batch
                     sem_pred, ins_pred = self.process_batch(batch)
                     
+                    # Verify predictions match ground truth size
+                    for j in range(len(sem_pred)):
+                        gt_size = len(batch['sem_label'][j])
+                        pred_size = len(sem_pred[j])
+                        
+                        if pred_size != gt_size:
+                            # Adjust prediction size to match ground truth
+                            min_size = min(pred_size, gt_size)
+                            sem_pred[j] = sem_pred[j][:min_size]
+                            ins_pred[j] = ins_pred[j][:min_size]
+                            
+                            # Also adjust ground truth if needed
+                            batch['sem_label'][j] = batch['sem_label'][j][:min_size]
+                            batch['ins_label'][j] = batch['ins_label'][j][:min_size]
+                    
                     # Update evaluator
                     self.evaluator.update(sem_pred, ins_pred, batch)
                     
+                    successful_batches += 1
+                    total_points_processed += sum(len(sp) for sp in sem_pred)
+                    
                 except Exception as e:
                     print(f"\nError processing batch {i}: {e}")
+                    failed_batches += 1
                     import traceback
                     traceback.print_exc()
                     continue
@@ -293,15 +219,27 @@ class PTModelEvaluator:
                 pbar.update(1)
                 
                 # Print intermediate metrics every 10 batches
-                if (i + 1) % 10 == 0:
+                if successful_batches > 0 and successful_batches % 10 == 0:
                     pq = self.evaluator.get_mean_pq()
                     iou = self.evaluator.get_mean_iou()
                     rq = self.evaluator.get_mean_rq()
                     pbar.set_postfix({
                         'PQ': f'{pq:.3f}',
                         'IoU': f'{iou:.3f}',
-                        'RQ': f'{rq:.3f}'
+                        'RQ': f'{rq:.3f}',
+                        'OK': successful_batches,
+                        'Fail': failed_batches
                     })
+        
+        # Print statistics
+        print(f"\nProcessing complete:")
+        print(f"  Successful batches: {successful_batches}/{total_batches}")
+        print(f"  Failed batches: {failed_batches}")
+        print(f"  Total points processed: {total_points_processed:,}")
+        
+        if successful_batches == 0:
+            print("\nNo batches were successfully processed!")
+            return None
         
         # Final metrics
         print("\n" + "="*60)
@@ -323,7 +261,12 @@ class PTModelEvaluator:
             'PQ': float(pq),
             'IoU': float(iou),
             'RQ': float(rq),
-            'class_metrics': self.evaluator.get_class_metrics()
+            'class_metrics': self.evaluator.get_class_metrics(),
+            'statistics': {
+                'successful_batches': successful_batches,
+                'failed_batches': failed_batches,
+                'total_points': total_points_processed
+            }
         }
 
 
@@ -335,7 +278,8 @@ class PTModelEvaluator:
 @click.option('--num-workers', default=4, type=int)
 @click.option('--max-batches', type=int, help='Maximum batches to evaluate')
 @click.option('--split', default='valid', type=click.Choice(['train', 'valid', 'test']))
-def main(model, dataset, data_path, batch_size, num_workers, max_batches, split):
+@click.option('--debug', is_flag=True, help='Enable debug mode')
+def main(model, dataset, data_path, batch_size, num_workers, max_batches, split, debug):
     """Evaluate .pt model on dataset"""
     
     # Load configuration
@@ -373,15 +317,31 @@ def main(model, dataset, data_path, batch_size, num_workers, max_batches, split)
     evaluator = PTModelEvaluator(model, cfg)
     evaluator.things_ids = data_module.things_ids
     
+    # If debug mode, test with just one batch first
+    if debug:
+        print("\nDebug mode: Testing with one batch...")
+        for batch in dataloader:
+            try:
+                sem_pred, ins_pred = evaluator.process_batch(batch)
+                print(f"Success! Predictions shape: {[sp.shape for sp in sem_pred]}")
+                print(f"Ground truth shape: {[batch['sem_label'][i].shape for i in range(len(batch['sem_label']))]}")
+            except Exception as e:
+                print(f"Error: {e}")
+                import traceback
+                traceback.print_exc()
+            break
+        return
+    
     # Evaluate
     metrics = evaluator.evaluate(dataloader, max_batches)
     
-    # Save metrics
-    output_file = Path(model).stem + '_metrics.yaml'
-    with open(output_file, 'w') as f:
-        yaml.dump(metrics, f, default_flow_style=False)
-    
-    print(f"\nMetrics saved to {output_file}")
+    if metrics:
+        # Save metrics
+        output_file = Path(model).stem + '_metrics.yaml'
+        with open(output_file, 'w') as f:
+            yaml.dump(metrics, f, default_flow_style=False)
+        
+        print(f"\nMetrics saved to {output_file}")
 
 
 if __name__ == "__main__":
