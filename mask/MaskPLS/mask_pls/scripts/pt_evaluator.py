@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Test standalone .pt model to verify it matches checkpoint performance
+Enhanced standalone .pt model evaluator with timing and label saving
 """
 
 import os
@@ -12,6 +12,8 @@ from pathlib import Path
 from easydict import EasyDict as edict
 import click
 from tqdm import tqdm
+import time
+from collections import defaultdict
 
 from mask_pls.datasets.semantic_dataset import SemanticDatasetModule
 from mask_pls.utils.evaluate_panoptic import PanopticEvaluator
@@ -34,10 +36,143 @@ def get_config():
     cfg.TRAIN.ACCUMULATE_GRAD_BATCHES = 2
     cfg.TRAIN.WARMUP_STEPS = 500
     cfg.TRAIN.SUBSAMPLE = True
-    cfg.TRAIN.AUG = True
+    cfg.TRAIN.AUG = False  # No augmentation for evaluation
     cfg.TRAIN.LR = 0.0001
     
     return cfg
+
+
+def create_save_dirs(dataset, output_dir=None):
+    """Create directories for saving predictions"""
+    def getDir(obj):
+        return os.path.dirname(os.path.abspath(obj))
+    
+    if output_dir:
+        base_dir = output_dir
+    else:
+        base_dir = os.path.join(getDir(__file__), "..", "output")
+    
+    if dataset == "NUSCENES":
+        results_dir = os.path.join(base_dir, "nuscenes_test")
+        if not os.path.exists(results_dir):
+            os.makedirs(results_dir, exist_ok=True)
+    else:  # KITTI
+        results_dir = os.path.join(base_dir, "test", "sequences")
+        if not os.path.exists(results_dir):
+            os.makedirs(results_dir, exist_ok=True)
+        # Create subdirs for sequences 11-21
+        for i in range(11, 22):
+            sub_dir = os.path.join(results_dir, str(i).zfill(2), "predictions")
+            if not os.path.exists(sub_dir):
+                os.makedirs(sub_dir, exist_ok=True)
+    
+    return results_dir
+
+
+def save_predictions(sem_pred, ins_pred, batch, results_dir, dataset="KITTI"):
+    """Save predictions as .label files"""
+    for b in range(len(sem_pred)):
+        fname = batch['fname'][b]
+        
+        # Combine semantic and instance predictions into panoptic labels
+        # Format: upper 16 bits = instance, lower 16 bits = semantic
+        panoptic_labels = (ins_pred[b].astype(np.uint32) << 16) | sem_pred[b].astype(np.uint32)
+        
+        if dataset == "KITTI":
+            # Extract sequence and frame from filename
+            # Expected format: sequence_frame (e.g., "08_000000")
+            parts = fname.split('_')
+            if len(parts) == 2:
+                sequence = parts[0]
+                frame = parts[1]
+                save_path = os.path.join(results_dir, sequence, "predictions", f"{frame}.label")
+            else:
+                # Fallback
+                save_path = os.path.join(results_dir, f"{fname}.label")
+        else:  # NUSCENES
+            save_path = os.path.join(results_dir, f"{fname}.label")
+        
+        # Ensure directory exists
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        
+        # Save as binary file
+        panoptic_labels.astype(np.uint32).tofile(save_path)
+
+
+class TimingStats:
+    """Track and report timing statistics"""
+    def __init__(self):
+        self.backbone_times = []
+        self.decoder_times = []
+        self.inference_times = []
+        self.postprocess_times = []
+        self.total_times = []
+        
+    def add_sample(self, backbone_time, decoder_time, inference_time, postprocess_time, total_time):
+        self.backbone_times.append(backbone_time)
+        self.decoder_times.append(decoder_time)
+        self.inference_times.append(inference_time)
+        self.postprocess_times.append(postprocess_time)
+        self.total_times.append(total_time)
+    
+    def get_stats(self):
+        """Get timing statistics"""
+        if not self.total_times:
+            return {}
+        
+        def get_stat(times):
+            times = np.array(times) * 1000  # Convert to ms
+            return {
+                'mean': np.mean(times),
+                'std': np.std(times),
+                'min': np.min(times),
+                'max': np.max(times),
+                'median': np.median(times)
+            }
+        
+        return {
+            'backbone': get_stat(self.backbone_times),
+            'decoder': get_stat(self.decoder_times),
+            'inference': get_stat(self.inference_times),
+            'postprocess': get_stat(self.postprocess_times),
+            'total': get_stat(self.total_times),
+            'fps': 1000.0 / np.mean(np.array(self.total_times) * 1000)  # Hz
+        }
+    
+    def print_stats(self):
+        """Print formatted timing statistics"""
+        stats = self.get_stats()
+        if not stats:
+            return
+        
+        print("\n" + "="*60)
+        print("TIMING STATISTICS (ms per point cloud)")
+        print("="*60)
+        
+        components = ['backbone', 'decoder', 'inference', 'postprocess', 'total']
+        headers = ['Component', 'Mean±Std', 'Min', 'Max', 'Median']
+        
+        # Print header
+        row_format = "{:<15} {:<15} {:<10} {:<10} {:<10}"
+        print(row_format.format(*headers))
+        print("-" * 60)
+        
+        # Print each component
+        for comp in components:
+            if comp in stats:
+                s = stats[comp]
+                mean_std = f"{s['mean']:.2f}±{s['std']:.2f}"
+                print(row_format.format(
+                    comp.capitalize(),
+                    mean_std,
+                    f"{s['min']:.2f}",
+                    f"{s['max']:.2f}",
+                    f"{s['median']:.2f}"
+                ))
+        
+        print("-" * 60)
+        print(f"Average FPS: {stats['fps']:.2f} Hz")
+        print("="*60)
 
 
 class StandaloneInferenceModel(nn.Module):
@@ -62,14 +197,38 @@ class StandaloneInferenceModel(nn.Module):
         )
     
     @torch.no_grad()
-    def forward(self, batch_dict):
-        """Forward pass matching the training model"""
-        # Run through backbone
+    def forward_with_timing(self, batch_dict):
+        """Forward pass with detailed timing"""
+        # Backbone timing
+        torch.cuda.synchronize() if torch.cuda.is_available() else None
+        backbone_start = time.perf_counter()
+        
         feats, coords, pad_masks, sem_logits = self.backbone(batch_dict)
         
-        # Run through decoder
+        torch.cuda.synchronize() if torch.cuda.is_available() else None
+        backbone_time = time.perf_counter() - backbone_start
+        
+        # Decoder timing
+        decoder_start = time.perf_counter()
+        
         outputs, padding = self.decoder(feats, coords, pad_masks)
         
+        torch.cuda.synchronize() if torch.cuda.is_available() else None
+        decoder_time = time.perf_counter() - decoder_start
+        
+        inference_time = backbone_time + decoder_time
+        
+        return outputs, padding, sem_logits, {
+            'backbone_time': backbone_time,
+            'decoder_time': decoder_time,
+            'inference_time': inference_time
+        }
+    
+    @torch.no_grad()
+    def forward(self, batch_dict):
+        """Standard forward pass"""
+        feats, coords, pad_masks, sem_logits = self.backbone(batch_dict)
+        outputs, padding = self.decoder(feats, coords, pad_masks)
         return outputs, padding, sem_logits
     
     def panoptic_inference(self, outputs, padding):
@@ -180,8 +339,10 @@ class StandaloneInferenceModel(nn.Module):
         return eval_batch
 
 
-def test_standalone_model(model_path, cfg, data_module, max_batches=None):
-    """Test standalone model"""
+def test_standalone_model(model_path, cfg, data_module, max_batches=None, 
+                         save_predictions_flag=False, output_dir=None,
+                         warmup_batches=3):
+    """Test standalone model with timing and optional prediction saving"""
     
     print(f"Loading standalone model from {model_path}")
     
@@ -226,20 +387,15 @@ def test_standalone_model(model_path, cfg, data_module, max_batches=None):
     model.eval()
     
     print(f"\nModel loaded successfully")
+    print(f"  Device: {device}")
     print(f"  Things IDs: {model.things_ids}")
     print(f"  Num classes: {model.num_classes}")
     
-    # Verify weights
-    print("\nVerifying weights:")
-    if hasattr(model.backbone, 'edge_conv1'):
-        weight = model.backbone.edge_conv1[0].weight
-        print(f"  ✓ edge_conv1: max={weight.abs().max().item():.4f}")
-    if hasattr(model.backbone, 'conv5'):
-        weight = model.backbone.conv5[0].weight  
-        print(f"  ✓ conv5: max={weight.abs().max().item():.4f}")
-    if hasattr(model.decoder, 'query_feat'):
-        weight = model.decoder.query_feat.weight
-        print(f"  ✓ query_feat: max={weight.abs().max().item():.4f}")
+    # Create save directory if needed
+    results_dir = None
+    if save_predictions_flag:
+        results_dir = create_save_dirs(cfg.MODEL.DATASET, output_dir)
+        print(f"\nSaving predictions to: {results_dir}")
     
     # Get dataloader
     dataloader = data_module.val_dataloader()
@@ -249,22 +405,22 @@ def test_standalone_model(model_path, cfg, data_module, max_batches=None):
     evaluator = PanopticEvaluator(cfg[dataset], dataset)
     evaluator.reset()
     
-    # Test one batch first
-    print("\nTesting single batch...")
-    for batch in dataloader:
+    # Timing statistics
+    timing_stats = TimingStats()
+    
+    # Warmup runs (important for accurate timing)
+    print(f"\nWarming up with {warmup_batches} batches...")
+    for i, batch in enumerate(dataloader):
+        if i >= warmup_batches:
+            break
         with torch.no_grad():
             outputs, padding, sem_logits = model(batch)
             sem_pred, ins_pred = model.panoptic_inference(outputs, padding)
-        
-        print(f"  Batch processed successfully")
-        print(f"  pred_logits shape: {outputs['pred_logits'].shape}")
-        print(f"  pred_masks shape: {outputs['pred_masks'].shape}")
-        print(f"  sem_logits shape: {sem_logits.shape}")
-        print(f"  Semantic predictions: {len(np.unique(sem_pred[0]))} classes")
-        break
     
-    # Full evaluation
-    print("\nRunning full evaluation...")
+    torch.cuda.empty_cache()
+    
+    # Full evaluation with timing
+    print("\nRunning full evaluation with timing...")
     
     total_batches = len(dataloader)
     if max_batches:
@@ -278,9 +434,38 @@ def test_standalone_model(model_path, cfg, data_module, max_batches=None):
                 break
             
             try:
+                # Total timing
+                total_start = time.perf_counter()
+                
                 with torch.no_grad():
-                    outputs, padding, sem_logits = model(batch)
+                    # Inference with timing
+                    outputs, padding, sem_logits, timings = model.forward_with_timing(batch)
+                    
+                    # Post-processing timing
+                    torch.cuda.synchronize() if torch.cuda.is_available() else None
+                    postprocess_start = time.perf_counter()
+                    
                     sem_pred, ins_pred = model.panoptic_inference(outputs, padding)
+                    
+                    torch.cuda.synchronize() if torch.cuda.is_available() else None
+                    postprocess_time = time.perf_counter() - postprocess_start
+                
+                total_time = time.perf_counter() - total_start
+                
+                # Record timing for each sample in the batch
+                batch_size = len(sem_pred)
+                for _ in range(batch_size):
+                    timing_stats.add_sample(
+                        timings['backbone_time'] / batch_size,
+                        timings['decoder_time'] / batch_size,
+                        timings['inference_time'] / batch_size,
+                        postprocess_time / batch_size,
+                        total_time / batch_size
+                    )
+                
+                # Save predictions if requested
+                if save_predictions_flag and results_dir:
+                    save_predictions(sem_pred, ins_pred, batch, results_dir, dataset)
                 
                 # Prepare batch for evaluation
                 eval_batch = model.prepare_batch_for_eval(batch, sem_pred)
@@ -289,7 +474,7 @@ def test_standalone_model(model_path, cfg, data_module, max_batches=None):
                 evaluator.update(sem_pred, ins_pred, eval_batch)
                 successful += 1
                 
-                # Clear cache
+                # Clear cache periodically
                 if i % 10 == 0:
                     torch.cuda.empty_cache()
                 
@@ -307,19 +492,23 @@ def test_standalone_model(model_path, cfg, data_module, max_batches=None):
                     pq = evaluator.get_mean_pq()
                     iou = evaluator.get_mean_iou()
                     rq = evaluator.get_mean_rq()
+                    stats = timing_stats.get_stats()
                     pbar.set_postfix({
                         'PQ': f'{pq:.3f}',
                         'IoU': f'{iou:.3f}',
-                        'RQ': f'{rq:.3f}'
+                        'FPS': f'{stats["fps"]:.1f}'
                     })
                 except:
                     pass
     
     print(f"\nProcessed {successful}/{total_batches} batches successfully")
     
+    # Print timing statistics
+    timing_stats.print_stats()
+    
     # Final metrics
     print("\n" + "="*60)
-    print("Final Evaluation Metrics")
+    print("FINAL EVALUATION METRICS")
     print("="*60)
     
     pq = evaluator.get_mean_pq()
@@ -332,22 +521,31 @@ def test_standalone_model(model_path, cfg, data_module, max_batches=None):
     
     evaluator.print_results()
     
-    return {'PQ': pq, 'IoU': iou, 'RQ': rq}
+    if save_predictions_flag:
+        print(f"\nPredictions saved to: {results_dir}")
+    
+    return {'PQ': pq, 'IoU': iou, 'RQ': rq, 'timing': timing_stats.get_stats()}
 
 
 @click.command()
 @click.option('--model', required=True, type=str, help='Path to standalone .pt model')
 @click.option('--dataset', default='KITTI', type=click.Choice(['KITTI', 'NUSCENES']))
-@click.option('--batch-size', default=1, type=int)
+@click.option('--batch-size', default=1, type=int, help='Batch size for evaluation')
 @click.option('--max-batches', default=None, type=int, help='Max batches to evaluate')
-@click.option('--num-workers', default=4, type=int)
-def main(model, dataset, batch_size, max_batches, num_workers):
-    """Test standalone .pt model"""
+@click.option('--num-workers', default=4, type=int, help='Number of data loading workers')
+@click.option('--save-predictions', is_flag=True, help='Save predictions as .label files')
+@click.option('--output-dir', default=None, type=str, help='Output directory for predictions')
+@click.option('--warmup-batches', default=3, type=int, help='Number of warmup batches for timing')
+def main(model, dataset, batch_size, max_batches, num_workers, save_predictions, output_dir, warmup_batches):
+    """Test standalone .pt model with timing and optional prediction saving"""
     
     print("="*60)
-    print("Standalone Model Testing")
+    print("STANDALONE MODEL TESTING")
     print("="*60)
     print(f"Model path: {model}")
+    print(f"Dataset: {dataset}")
+    print(f"Batch size: {batch_size}")
+    print(f"Save predictions: {save_predictions}")
     
     # Load configuration
     cfg = get_config()
@@ -363,14 +561,29 @@ def main(model, dataset, batch_size, max_batches, num_workers):
     print(f"Data module things_ids: {data_module.things_ids}")
     
     # Test model
-    metrics = test_standalone_model(model, cfg, data_module, max_batches)
+    metrics = test_standalone_model(
+        model, cfg, data_module, 
+        max_batches=max_batches,
+        save_predictions_flag=save_predictions,
+        output_dir=output_dir,
+        warmup_batches=warmup_batches
+    )
     
     if metrics:
         print(f"\n" + "="*60)
-        print(f"Final Results:")
-        print(f"  PQ = {metrics['PQ']:.4f}")
+        print(f"SUMMARY")
+        print("="*60)
+        print(f"Accuracy Metrics:")
+        print(f"  PQ  = {metrics['PQ']:.4f}")
         print(f"  IoU = {metrics['IoU']:.4f}")
-        print(f"  RQ = {metrics['RQ']:.4f}")
+        print(f"  RQ  = {metrics['RQ']:.4f}")
+        
+        if 'timing' in metrics and metrics['timing']:
+            timing = metrics['timing']
+            print(f"\nTiming Performance:")
+            print(f"  Inference: {timing['inference']['mean']:.2f} ms/cloud")
+            print(f"  Total:     {timing['total']['mean']:.2f} ms/cloud")
+            print(f"  FPS:       {timing['fps']:.2f} Hz")
         print("="*60)
 
 
