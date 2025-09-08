@@ -3,6 +3,7 @@
 Exact replication of training inference - matching train_efficient_dgcnn.py exactly
 """
 
+import os
 import torch
 import torch.nn as nn
 import numpy as np
@@ -12,10 +13,32 @@ from easydict import EasyDict as edict
 import click
 from tqdm import tqdm
 
-# Import the EXACT model used in training - FIXED IMPORT!
-from mask_pls.models.dgcnn.maskpls_dgcnn_fixed import MaskPLSDGCNNFixed
+# Import the EXACT model used in training - from maskpls_dgcnn_optimized.py
+from mask_pls.models.dgcnn.maskpls_dgcnn_optimized import MaskPLSDGCNNFixed
 from mask_pls.datasets.semantic_dataset import SemanticDatasetModule
 from mask_pls.utils.evaluate_panoptic import PanopticEvaluator
+
+
+def get_config():
+    """Load configuration exactly as in train_efficient_dgcnn.py"""
+    def getDir(obj):
+        return os.path.dirname(os.path.abspath(obj))
+    
+    model_cfg = edict(yaml.safe_load(open(os.path.join(getDir(__file__), "../config/model.yaml"))))
+    backbone_cfg = edict(yaml.safe_load(open(os.path.join(getDir(__file__), "../config/backbone.yaml"))))
+    decoder_cfg = edict(yaml.safe_load(open(os.path.join(getDir(__file__), "../config/decoder.yaml"))))
+    
+    cfg = edict({**model_cfg, **backbone_cfg, **decoder_cfg})
+    
+    # Match training configuration exactly
+    cfg.TRAIN.BATCH_SIZE = 2  # Small batch size
+    cfg.TRAIN.ACCUMULATE_GRAD_BATCHES = 2  # Effective batch size of 4
+    cfg.TRAIN.WARMUP_STEPS = 500
+    cfg.TRAIN.SUBSAMPLE = True
+    cfg.TRAIN.AUG = True
+    cfg.TRAIN.LR = 0.0001  # Lower learning rate
+    
+    return cfg
 
 
 class ExactInferenceWrapper:
@@ -41,10 +64,11 @@ class ExactInferenceWrapper:
         # Handle different checkpoint formats
         if 'state_dict' in ckpt:
             state_dict = ckpt['state_dict']
-            print(f"Checkpoint epoch: {ckpt.get('epoch', 'unknown')}")
-            if 'callbacks' in ckpt:
-                # This is a Lightning checkpoint, might have metrics
-                print(f"Checkpoint has callbacks/metrics")
+            print(f"Checkpoint info:")
+            if 'epoch' in ckpt:
+                print(f"  Epoch: {ckpt['epoch']}")
+            if 'global_step' in ckpt:
+                print(f"  Global step: {ckpt['global_step']}")
         elif 'model_state_dict' in ckpt:
             state_dict = ckpt['model_state_dict']
         else:
@@ -74,14 +98,14 @@ class ExactInferenceWrapper:
         """Verify that weights are actually loaded"""
         print("\nVerifying loaded weights...")
         
-        # Check backbone weights
+        # Check backbone weights (FixedDGCNNBackbone from dgcnn_backbone_efficient.py)
         if hasattr(self.model, 'backbone'):
             backbone = self.model.backbone
             
-            # Check critical layers
+            # Check critical layers based on the actual backbone structure
             checks = []
             
-            # The FixedDGCNNBackbone uses edge_conv layers
+            # The FixedDGCNNBackbone uses edge_conv layers as Sequential modules
             if hasattr(backbone, 'edge_conv1'):
                 if isinstance(backbone.edge_conv1, nn.Sequential):
                     weight = backbone.edge_conv1[0].weight
@@ -124,7 +148,7 @@ class ExactInferenceWrapper:
     def process_batch(self, batch):
         """Process batch using exact training pipeline"""
         
-        # Move to GPU if needed (matching training)
+        # Clear GPU cache like in training
         if self.device.type == 'cuda':
             torch.cuda.empty_cache()
         
@@ -134,7 +158,7 @@ class ExactInferenceWrapper:
         # Use the model's panoptic_inference method
         sem_pred, ins_pred = self.model.panoptic_inference(outputs, padding)
         
-        return sem_pred, ins_pred
+        return sem_pred, ins_pred, outputs, padding
     
     def test_single_batch(self, batch):
         """Test a single batch and print detailed diagnostics"""
@@ -163,23 +187,17 @@ class ExactInferenceWrapper:
             print(f"  Class {cls}: {cnt} queries")
         
         # Check semantic predictions
-        sem_pred = torch.argmax(sem_logits[0], dim=-1)
-        valid_mask = ~padding[0]
-        if valid_mask.sum() > 0:
-            unique_classes, counts = torch.unique(sem_pred[valid_mask], return_counts=True)
-        else:
-            unique_classes, counts = torch.unique(sem_pred, return_counts=True)
-        
-        print(f"\nSemantic predictions (per point):")
-        for cls, cnt in zip(unique_classes, counts):
-            print(f"  Class {cls}: {cnt} points")
-        
-        # Check if predictions are reasonable
-        if len(unique_classes) == 1:
-            print("  ⚠️ WARNING: Only predicting a single semantic class!")
-        
-        if outputs['pred_logits'].abs().max() < 0.1:
-            print("  ⚠️ WARNING: pred_logits values are very small!")
+        for b in range(sem_logits.shape[0]):
+            sem_pred = torch.argmax(sem_logits[b], dim=-1)
+            valid_mask = ~padding[b]
+            if valid_mask.sum() > 0:
+                unique_classes, counts = torch.unique(sem_pred[valid_mask], return_counts=True)
+            else:
+                unique_classes, counts = torch.unique(sem_pred, return_counts=True)
+            
+            print(f"\nSemantic predictions for sample {b} (per point):")
+            for cls, cnt in zip(unique_classes, counts):
+                print(f"  Class {cls}: {cnt} points")
         
         # Get panoptic predictions
         sem_pred, ins_pred = self.model.panoptic_inference(outputs, padding)
@@ -213,7 +231,7 @@ def evaluate_with_exact_model(checkpoint_path, cfg, data_module, max_batches=Non
         wrapper.test_single_batch(batch)
         break
     
-    # Setup evaluator - use the same one from data module if available
+    # Setup evaluator - same as used in training
     dataset = cfg.MODEL.DATASET
     evaluator = PanopticEvaluator(cfg[dataset], dataset)
     evaluator.reset()
@@ -237,10 +255,18 @@ def evaluate_with_exact_model(checkpoint_path, cfg, data_module, max_batches=Non
             
             try:
                 # Process batch
-                sem_pred, ins_pred = wrapper.process_batch(batch)
+                sem_pred, ins_pred, outputs, padding = wrapper.process_batch(batch)
                 
-                # Prepare evaluation batch - handle subsampling from backbone
-                eval_batch = wrapper.model.prepare_batch_for_eval(batch, sem_pred)
+                # Use the model's prepare_batch_for_eval method if available
+                if hasattr(wrapper.model, 'prepare_batch_for_eval'):
+                    eval_batch = wrapper.model.prepare_batch_for_eval(batch, sem_pred)
+                else:
+                    # Fallback to simple approach
+                    eval_batch = {
+                        'fname': batch['fname'],
+                        'sem_label': batch['sem_label'],
+                        'ins_label': batch['ins_label']
+                    }
                 
                 # Update evaluator
                 evaluator.update(sem_pred, ins_pred, eval_batch)
@@ -297,55 +323,37 @@ def evaluate_with_exact_model(checkpoint_path, cfg, data_module, max_batches=Non
     return {'PQ': pq, 'IoU': iou, 'RQ': rq}
 
 
-def get_config():
-    """Load configuration exactly as in train_efficient_dgcnn.py"""
-    import os
-    
-    def getDir(obj):
-        return os.path.dirname(os.path.abspath(obj))
-    
-    model_cfg = edict(yaml.safe_load(open(os.path.join(getDir(__file__), "../config/model.yaml"))))
-    backbone_cfg = edict(yaml.safe_load(open(os.path.join(getDir(__file__), "../config/backbone.yaml"))))
-    decoder_cfg = edict(yaml.safe_load(open(os.path.join(getDir(__file__), "../config/decoder.yaml"))))
-    
-    cfg = edict({**model_cfg, **backbone_cfg, **decoder_cfg})
-    
-    # Match training configuration
-    cfg.TRAIN.BATCH_SIZE = 2
-    cfg.TRAIN.ACCUMULATE_GRAD_BATCHES = 2
-    cfg.TRAIN.WARMUP_STEPS = 500
-    cfg.TRAIN.SUBSAMPLE = True
-    cfg.TRAIN.AUG = True
-    cfg.TRAIN.LR = 0.0001
-    
-    return cfg
-
-
 @click.command()
 @click.option('--checkpoint', required=True, help='Path to checkpoint (.ckpt)')
 @click.option('--dataset', default='KITTI', type=click.Choice(['KITTI', 'NUSCENES']))
 @click.option('--batch-size', default=1, type=int)
 @click.option('--max-batches', type=int, help='Max batches to evaluate')
 @click.option('--num-workers', default=4, type=int)
-def main(checkpoint, dataset, batch_size, max_batches, num_workers):
+@click.option('--pretrained', type=str, default=None, help='Pre-trained DGCNN weights (unused in eval)')
+def main(checkpoint, dataset, batch_size, max_batches, num_workers, pretrained):
     """Evaluate using exact training model setup"""
     
     print("="*60)
     print("Model Evaluation - Exact Training Replication")
     print("="*60)
+    print(f"Using model: MaskPLSDGCNNFixed from maskpls_dgcnn_optimized.py")
+    print(f"Using backbone: FixedDGCNNBackbone from dgcnn_backbone_efficient.py")
     
     # Load configuration EXACTLY as in training
     cfg = get_config()
     
-    # Update with command line args
+    # Update with command line args (but keep training defaults where important)
     cfg.MODEL.DATASET = dataset
     cfg.TRAIN.BATCH_SIZE = batch_size
     cfg.TRAIN.NUM_WORKERS = num_workers
     
-    print(f"Configuration:")
+    # Keep other training settings
+    print(f"\nConfiguration:")
     print(f"  Dataset: {cfg.MODEL.DATASET}")
     print(f"  Batch Size: {batch_size}")
     print(f"  Workers: {num_workers}")
+    print(f"  Subsample: {cfg.TRAIN.SUBSAMPLE}")
+    print(f"  Aug: {cfg.TRAIN.AUG} (disabled for eval)")
     
     # Create data module EXACTLY as in training
     print("\nSetting up dataset...")
@@ -354,6 +362,9 @@ def main(checkpoint, dataset, batch_size, max_batches, num_workers):
     
     print(f"Data module things_ids: {data_module.things_ids}")
     print(f"Data module has {len(data_module.val_mask_set)} validation samples")
+    
+    # Note: Augmentation should not affect validation
+    # The val_mask_set already has aug=False in its setup
     
     # Evaluate
     metrics = evaluate_with_exact_model(checkpoint, cfg, data_module, max_batches)

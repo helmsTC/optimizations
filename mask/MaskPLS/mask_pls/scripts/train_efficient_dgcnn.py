@@ -10,7 +10,7 @@ from pytorch_lightning import loggers as pl_loggers
 from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint, EarlyStopping
 
 from mask_pls.datasets.semantic_dataset import SemanticDatasetModule
-from mask_pls.models.dgcnn.maskpls_dgcnn_fixed import MaskPLSDGCNNFixed
+from mask_pls.models.dgcnn.maskpls_dgcnn_optimized import MaskPLSDGCNNFixed
 
 def get_config():
     """Load and merge configuration files"""
