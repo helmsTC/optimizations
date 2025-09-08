@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Exact replication of training inference with proper class mappings from YAML
+Exact replication of training inference - matching train_efficient_dgcnn.py exactly
 """
 
 import torch
@@ -12,107 +12,16 @@ from easydict import EasyDict as edict
 import click
 from tqdm import tqdm
 
-# Import the EXACT model used in training
-from mask_pls.models.dgcnn.maskpls_dgcnn_optimized import MaskPLSDGCNNFixed
+# Import the EXACT model used in training - FIXED IMPORT!
+from mask_pls.models.dgcnn.maskpls_dgcnn_fixed import MaskPLSDGCNNFixed
 from mask_pls.datasets.semantic_dataset import SemanticDatasetModule
 from mask_pls.utils.evaluate_panoptic import PanopticEvaluator
 
 
-def get_things_stuff_from_yaml(yaml_path, dataset='KITTI'):
-    """
-    Extract things and stuff classes from the semantic YAML file
-    Based on the learning_map and typical KITTI/NuScenes class definitions
-    """
-    with open(yaml_path, 'r') as f:
-        data = yaml.safe_load(f)
-    
-    # Get the learning map inverse
-    learning_map_inv = data['learning_map_inv']
-    labels = data['labels']
-    
-    # Define which mapped classes are things vs stuff based on dataset
-    if dataset == 'KITTI':
-        # Mapped class IDs for things (have instances)
-        things_ids = [1, 2, 3, 4, 5, 6, 7, 8]  # car, bicycle, motorcycle, truck, other-vehicle, person, bicyclist, motorcyclist
-        stuff_ids = [9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]  # road, parking, sidewalk, etc.
-    else:  # NUSCENES
-        things_ids = [2, 3, 4, 5, 6, 7, 9, 10]  # bicycle, bus, car, construction_vehicle, motorcycle, pedestrian, trailer, truck
-        stuff_ids = [1, 8, 11, 12, 13, 14, 15, 16]  # barrier, traffic_cone, driveable_surface, etc.
-    
-    # Get the actual label names
-    things = []
-    stuff = []
-    
-    for mapped_id, original_id in learning_map_inv.items():
-        if mapped_id in things_ids:
-            label_name = labels[original_id]
-            # Clean up label name to match evaluator expectations
-            if dataset == 'KITTI':
-                things.append(label_name)
-            else:  # NUSCENES
-                # Map to simplified names used in evaluator
-                label_map = {
-                    'vehicle.bicycle': 'bicycle',
-                    'vehicle.bus.rigid': 'bus',
-                    'vehicle.car': 'car',
-                    'vehicle.construction': 'construction_vehicle',
-                    'vehicle.motorcycle': 'motorcycle',
-                    'human.pedestrian.adult': 'pedestrian',
-                    'pedestrian': 'pedestrian',
-                    'vehicle.trailer': 'trailer',
-                    'vehicle.truck': 'truck'
-                }
-                things.append(label_map.get(label_name, label_name))
-        elif mapped_id in stuff_ids:
-            label_name = labels[original_id]
-            # Clean up label name to match evaluator expectations
-            if dataset == 'NUSCENES':
-                label_map = {
-                    'movable_object.barrier': 'barrier',
-                    'barrier': 'barrier',
-                    'movable_object.trafficcone': 'traffic_cone',
-                    'traffic_cone': 'traffic_cone',
-                    'flat.driveable_surface': 'driveable_surface',
-                    'driveable_surface': 'driveable_surface',
-                    'flat.other': 'other_flat',
-                    'other_flat': 'other_flat',
-                    'flat.sidewalk': 'sidewalk',
-                    'sidewalk': 'sidewalk',
-                    'flat.terrain': 'terrain',
-                    'terrain': 'terrain',
-                    'static.manmade': 'manmade',
-                    'manmade': 'manmade',
-                    'static.vegetation': 'vegetation',
-                    'vegetation': 'vegetation'
-                }
-                stuff.append(label_map.get(label_name, label_name))
-            else:
-                stuff.append(label_name)
-    
-    return things, stuff, things_ids, stuff_ids
-
-
-class ImprovedPanopticEvaluator(PanopticEvaluator):
-    """Extended evaluator that loads things/stuff from YAML"""
-    
-    def __init__(self, cfg, dataset, yaml_path):
-        super().__init__(cfg, dataset)
-        
-        # Override the hardcoded things/stuff with YAML-based ones
-        self.things, self.stuff, self.things_ids_list, self.stuff_ids = get_things_stuff_from_yaml(yaml_path, dataset)
-        self.all_classes = self.things + self.stuff
-        
-        print(f"\nLoaded class mappings from {yaml_path}:")
-        print(f"  Things ({len(self.things)}): {self.things}")
-        print(f"  Things IDs: {self.things_ids_list}")
-        print(f"  Stuff ({len(self.stuff)}): {self.stuff}")
-        print(f"  Stuff IDs: {self.stuff_ids}")
-
-
 class ExactInferenceWrapper:
-    """Wrapper that uses the exact training model with proper class mappings"""
+    """Wrapper that uses the exact training model"""
     
-    def __init__(self, checkpoint_path, cfg, device='cuda'):
+    def __init__(self, checkpoint_path, cfg, data_module, device='cuda'):
         self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
         self.cfg = cfg
         
@@ -121,12 +30,21 @@ class ExactInferenceWrapper:
         # Create the EXACT model used in training
         self.model = MaskPLSDGCNNFixed(cfg)
         
+        # CRITICAL: Set things_ids from data module BEFORE loading checkpoint
+        # This matches exactly what train_efficient_dgcnn.py does
+        self.model.things_ids = data_module.things_ids
+        print(f"Set model.things_ids from data_module: {self.model.things_ids}")
+        
         # Load checkpoint
         ckpt = torch.load(checkpoint_path, map_location='cpu')
         
         # Handle different checkpoint formats
         if 'state_dict' in ckpt:
             state_dict = ckpt['state_dict']
+            print(f"Checkpoint epoch: {ckpt.get('epoch', 'unknown')}")
+            if 'callbacks' in ckpt:
+                # This is a Lightning checkpoint, might have metrics
+                print(f"Checkpoint has callbacks/metrics")
         elif 'model_state_dict' in ckpt:
             state_dict = ckpt['model_state_dict']
         else:
@@ -139,20 +57,15 @@ class ExactInferenceWrapper:
         print(f"  Missing keys: {len(missing_keys)}")
         print(f"  Unexpected keys: {len(unexpected_keys)}")
         
+        # Only print details if there are issues
         if missing_keys and len(missing_keys) < 10:
             print(f"  Missing: {missing_keys}")
+        if unexpected_keys and len(unexpected_keys) < 10:
+            print(f"  Unexpected: {unexpected_keys}")
         
         # Move to device and set to eval
         self.model = self.model.to(self.device)
         self.model.eval()
-        
-        # Load things_ids from YAML
-        dataset = cfg.MODEL.DATASET
-        yaml_path = cfg[dataset].CONFIG
-        _, _, things_ids, _ = get_things_stuff_from_yaml(yaml_path, dataset)
-        self.model.things_ids = things_ids
-        
-        print(f"Set model.things_ids to: {self.model.things_ids}")
         
         # Verify weights are loaded
         self._verify_weights()
@@ -167,13 +80,17 @@ class ExactInferenceWrapper:
             
             # Check critical layers
             checks = []
+            
+            # The FixedDGCNNBackbone uses edge_conv layers
             if hasattr(backbone, 'edge_conv1'):
-                weight = backbone.edge_conv1[0].weight
-                checks.append(('edge_conv1', weight.abs().max().item(), weight.abs().mean().item()))
+                if isinstance(backbone.edge_conv1, nn.Sequential):
+                    weight = backbone.edge_conv1[0].weight
+                    checks.append(('edge_conv1', weight.abs().max().item(), weight.abs().mean().item()))
             
             if hasattr(backbone, 'edge_conv2'):
-                weight = backbone.edge_conv2[0].weight
-                checks.append(('edge_conv2', weight.abs().max().item(), weight.abs().mean().item()))
+                if isinstance(backbone.edge_conv2, nn.Sequential):
+                    weight = backbone.edge_conv2[0].weight
+                    checks.append(('edge_conv2', weight.abs().max().item(), weight.abs().mean().item()))
             
             if hasattr(backbone, 'conv5'):
                 if isinstance(backbone.conv5, nn.Sequential):
@@ -197,10 +114,19 @@ class ExactInferenceWrapper:
                     print(f"  ❌ decoder.query_feat: appears uninitialized")
                 else:
                     print(f"  ✓ decoder.query_feat: max={max_val:.4f}, mean={mean_val:.4f}")
+            
+            if hasattr(decoder, 'class_embed'):
+                weight = decoder.class_embed.weight
+                max_val = weight.abs().max().item()
+                print(f"  ✓ decoder.class_embed: max={max_val:.4f}")
     
     @torch.no_grad()
     def process_batch(self, batch):
         """Process batch using exact training pipeline"""
+        
+        # Move to GPU if needed (matching training)
+        if self.device.type == 'cuda':
+            torch.cuda.empty_cache()
         
         # Use the model's forward method directly
         outputs, padding, sem_logits = self.model(batch)
@@ -225,21 +151,32 @@ class ExactInferenceWrapper:
         
         # Check values
         print(f"\nOutput statistics:")
-        print(f"  pred_logits: min={outputs['pred_logits'].min():.3f}, max={outputs['pred_logits'].max():.3f}")
-        print(f"  pred_masks: min={outputs['pred_masks'].min():.3f}, max={outputs['pred_masks'].max():.3f}")
-        print(f"  sem_logits: min={sem_logits.min():.3f}, max={sem_logits.max():.3f}")
+        print(f"  pred_logits: min={outputs['pred_logits'].min():.3f}, max={outputs['pred_logits'].max():.3f}, mean={outputs['pred_logits'].mean():.3f}")
+        print(f"  pred_masks: min={outputs['pred_masks'].min():.3f}, max={outputs['pred_masks'].max():.3f}, mean={outputs['pred_masks'].mean():.3f}")
+        print(f"  sem_logits: min={sem_logits.min():.3f}, max={sem_logits.max():.3f}, mean={sem_logits.mean():.3f}")
+        
+        # Check class predictions from decoder
+        pred_classes = outputs['pred_logits'].argmax(dim=-1)
+        unique_pred_classes, counts = torch.unique(pred_classes, return_counts=True)
+        print(f"\nDecoder class predictions (queries):")
+        for cls, cnt in zip(unique_pred_classes, counts):
+            print(f"  Class {cls}: {cnt} queries")
         
         # Check semantic predictions
         sem_pred = torch.argmax(sem_logits[0], dim=-1)
-        unique_classes, counts = torch.unique(sem_pred[~padding[0]], return_counts=True)
+        valid_mask = ~padding[0]
+        if valid_mask.sum() > 0:
+            unique_classes, counts = torch.unique(sem_pred[valid_mask], return_counts=True)
+        else:
+            unique_classes, counts = torch.unique(sem_pred, return_counts=True)
         
-        print(f"\nSemantic predictions:")
+        print(f"\nSemantic predictions (per point):")
         for cls, cnt in zip(unique_classes, counts):
             print(f"  Class {cls}: {cnt} points")
         
         # Check if predictions are reasonable
         if len(unique_classes) == 1:
-            print("  ⚠️ WARNING: Only predicting a single class!")
+            print("  ⚠️ WARNING: Only predicting a single semantic class!")
         
         if outputs['pred_logits'].abs().max() < 0.1:
             print("  ⚠️ WARNING: pred_logits values are very small!")
@@ -249,16 +186,23 @@ class ExactInferenceWrapper:
         
         print(f"\nPanoptic predictions:")
         for i, (sp, ip) in enumerate(zip(sem_pred, ins_pred)):
-            unique_sem = np.unique(sp)
-            unique_ins = np.unique(ip)
-            print(f"  Sample {i}: {len(unique_sem)} semantic classes, {len(unique_ins)} instances")
+            if len(sp) > 0:
+                unique_sem = np.unique(sp)
+                unique_ins = np.unique(ip[ip > 0])  # Only count non-zero instances
+                print(f"  Sample {i}: {len(unique_sem)} semantic classes, {len(unique_ins)} instances")
+                print(f"    Semantic classes: {unique_sem[:10]}...")  # Show first 10
+                if len(unique_ins) > 0:
+                    print(f"    Instance IDs: {unique_ins[:10]}...")  # Show first 10
 
 
-def evaluate_with_exact_model(checkpoint_path, cfg, dataloader, max_batches=None):
-    """Evaluate using exact training model with proper class mappings"""
+def evaluate_with_exact_model(checkpoint_path, cfg, data_module, max_batches=None):
+    """Evaluate using exact training model setup"""
     
-    # Create wrapper
-    wrapper = ExactInferenceWrapper(checkpoint_path, cfg)
+    # Get dataloader
+    dataloader = data_module.val_dataloader()
+    
+    # Create wrapper with data module
+    wrapper = ExactInferenceWrapper(checkpoint_path, cfg, data_module)
     
     # Test on one batch first
     print("\n" + "="*60)
@@ -269,10 +213,9 @@ def evaluate_with_exact_model(checkpoint_path, cfg, dataloader, max_batches=None
         wrapper.test_single_batch(batch)
         break
     
-    # Setup evaluator with YAML-based class mappings
+    # Setup evaluator - use the same one from data module if available
     dataset = cfg.MODEL.DATASET
-    yaml_path = cfg[dataset].CONFIG
-    evaluator = ImprovedPanopticEvaluator(cfg[dataset], dataset, yaml_path)
+    evaluator = PanopticEvaluator(cfg[dataset], dataset)
     evaluator.reset()
     
     # Evaluation loop
@@ -296,30 +239,16 @@ def evaluate_with_exact_model(checkpoint_path, cfg, dataloader, max_batches=None
                 # Process batch
                 sem_pred, ins_pred = wrapper.process_batch(batch)
                 
-                # Fix size mismatches
-                for j in range(len(batch['sem_label'])):
-                    gt_sem = batch['sem_label'][j]
-                    gt_ins = batch['ins_label'][j]
-                    
-                    if isinstance(gt_sem, np.ndarray):
-                        gt_sem = gt_sem.reshape(-1)
-                    if isinstance(gt_ins, np.ndarray):
-                        gt_ins = gt_ins.reshape(-1)
-                    
-                    if j < len(sem_pred):
-                        pred_size = len(sem_pred[j])
-                        gt_size = len(gt_sem)
-                        
-                        if pred_size != gt_size:
-                            min_size = min(pred_size, gt_size)
-                            sem_pred[j] = sem_pred[j][:min_size]
-                            ins_pred[j] = ins_pred[j][:min_size]
-                            batch['sem_label'][j] = gt_sem[:min_size]
-                            batch['ins_label'][j] = gt_ins[:min_size]
+                # Prepare evaluation batch - handle subsampling from backbone
+                eval_batch = wrapper.model.prepare_batch_for_eval(batch, sem_pred)
                 
                 # Update evaluator
-                evaluator.update(sem_pred, ins_pred, batch)
+                evaluator.update(sem_pred, ins_pred, eval_batch)
                 successful += 1
+                
+                # Clear cache periodically like in training
+                if i % 10 == 0:
+                    torch.cuda.empty_cache()
                 
             except Exception as e:
                 print(f"\nError in batch {i}: {e}")
@@ -368,54 +297,66 @@ def evaluate_with_exact_model(checkpoint_path, cfg, dataloader, max_batches=None
     return {'PQ': pq, 'IoU': iou, 'RQ': rq}
 
 
+def get_config():
+    """Load configuration exactly as in train_efficient_dgcnn.py"""
+    import os
+    
+    def getDir(obj):
+        return os.path.dirname(os.path.abspath(obj))
+    
+    model_cfg = edict(yaml.safe_load(open(os.path.join(getDir(__file__), "../config/model.yaml"))))
+    backbone_cfg = edict(yaml.safe_load(open(os.path.join(getDir(__file__), "../config/backbone.yaml"))))
+    decoder_cfg = edict(yaml.safe_load(open(os.path.join(getDir(__file__), "../config/decoder.yaml"))))
+    
+    cfg = edict({**model_cfg, **backbone_cfg, **decoder_cfg})
+    
+    # Match training configuration
+    cfg.TRAIN.BATCH_SIZE = 2
+    cfg.TRAIN.ACCUMULATE_GRAD_BATCHES = 2
+    cfg.TRAIN.WARMUP_STEPS = 500
+    cfg.TRAIN.SUBSAMPLE = True
+    cfg.TRAIN.AUG = True
+    cfg.TRAIN.LR = 0.0001
+    
+    return cfg
+
+
 @click.command()
-@click.option('--checkpoint', required=True, help='Path to checkpoint (.ckpt or .pth)')
+@click.option('--checkpoint', required=True, help='Path to checkpoint (.ckpt)')
 @click.option('--dataset', default='KITTI', type=click.Choice(['KITTI', 'NUSCENES']))
 @click.option('--batch-size', default=1, type=int)
 @click.option('--max-batches', type=int, help='Max batches to evaluate')
 @click.option('--num-workers', default=4, type=int)
 def main(checkpoint, dataset, batch_size, max_batches, num_workers):
-    """Evaluate using exact training model with proper YAML class mappings"""
+    """Evaluate using exact training model setup"""
     
     print("="*60)
-    print("Model Evaluation with YAML Class Mappings")
+    print("Model Evaluation - Exact Training Replication")
     print("="*60)
     
-    # Load configuration
-    config_dir = Path(__file__).parent.parent / "config"
-    cfg = edict()
+    # Load configuration EXACTLY as in training
+    cfg = get_config()
     
-    for config_file in ['model.yaml', 'backbone.yaml', 'decoder.yaml']:
-        config_path = config_dir / config_file
-        if config_path.exists():
-            with open(config_path, 'r') as f:
-                cfg.update(yaml.safe_load(f))
-            print(f"✓ Loaded: {config_path}")
-    
-    # Load dataset-specific config
-    dataset_config = Path(__file__).parent.parent / "datasets" / f"semantic-{dataset.lower()}.yaml"
-    if dataset_config.exists():
-        print(f"✓ Using dataset config: {dataset_config}")
-    
-    # Update config
+    # Update with command line args
     cfg.MODEL.DATASET = dataset
     cfg.TRAIN.BATCH_SIZE = batch_size
     cfg.TRAIN.NUM_WORKERS = num_workers
     
-    # Create data module
+    print(f"Configuration:")
+    print(f"  Dataset: {cfg.MODEL.DATASET}")
+    print(f"  Batch Size: {batch_size}")
+    print(f"  Workers: {num_workers}")
+    
+    # Create data module EXACTLY as in training
     print("\nSetting up dataset...")
     data_module = SemanticDatasetModule(cfg)
     data_module.setup()
     
-    # Set things_ids from YAML to data module
-    yaml_path = cfg[dataset].CONFIG
-    _, _, things_ids, _ = get_things_stuff_from_yaml(yaml_path, dataset)
-    data_module.things_ids = things_ids
-    
-    dataloader = data_module.val_dataloader()
+    print(f"Data module things_ids: {data_module.things_ids}")
+    print(f"Data module has {len(data_module.val_mask_set)} validation samples")
     
     # Evaluate
-    metrics = evaluate_with_exact_model(checkpoint, cfg, dataloader, max_batches)
+    metrics = evaluate_with_exact_model(checkpoint, cfg, data_module, max_batches)
     
     if metrics:
         print(f"\n" + "="*60)
