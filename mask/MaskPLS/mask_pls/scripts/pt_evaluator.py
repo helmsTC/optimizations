@@ -30,7 +30,23 @@ def get_config():
     backbone_cfg = edict(yaml.safe_load(open(os.path.join(getDir(__file__), "../config/backbone.yaml"))))
     decoder_cfg = edict(yaml.safe_load(open(os.path.join(getDir(__file__), "../config/decoder.yaml"))))
     
-    cfg = edict({**model_cfg, **backbone_cfg, **decoder_cfg})
+    # Try to load dataset-specific config (e.g., semantic-kitti-custom.yaml)
+    dataset_cfg = {}
+    possible_dataset_configs = [
+        "../config/dataset/semantic-kitti-custom.yaml",
+        "../config/dataset/semantic-kitti.yaml",
+        "../config/semantic-kitti-custom.yaml",
+        "../config/semantic-kitti.yaml"
+    ]
+    
+    for config_path in possible_dataset_configs:
+        full_path = os.path.join(getDir(__file__), config_path)
+        if os.path.exists(full_path):
+            print(f"Loading dataset config from: {config_path}")
+            dataset_cfg = edict(yaml.safe_load(open(full_path)))
+            break
+    
+    cfg = edict({**model_cfg, **backbone_cfg, **decoder_cfg, **dataset_cfg})
     
     cfg.TRAIN.BATCH_SIZE = 2
     cfg.TRAIN.ACCUMULATE_GRAD_BATCHES = 2
@@ -42,7 +58,20 @@ def get_config():
     return cfg
 
 
-def create_save_dirs(dataset, output_dir=None):
+def detect_sequences_from_dataloader(dataloader, max_batches=5):
+    """Detect which sequences are in the dataset by examining filenames"""
+    sequences = set()
+    for i, batch in enumerate(dataloader):
+        if i >= max_batches:
+            break
+        for fname in batch['fname']:
+            if '_' in fname:
+                seq = fname.split('_')[0]
+                sequences.add(seq)
+    return sorted(list(sequences))
+
+
+def create_save_dirs(dataset, output_dir=None, sequences=None):
     """Create directories for saving predictions"""
     def getDir(obj):
         return os.path.dirname(os.path.abspath(obj))
@@ -60,11 +89,26 @@ def create_save_dirs(dataset, output_dir=None):
         results_dir = os.path.join(base_dir, "test", "sequences")
         if not os.path.exists(results_dir):
             os.makedirs(results_dir, exist_ok=True)
-        # Create subdirs for sequences 11-21
-        for i in range(11, 22):
-            sub_dir = os.path.join(results_dir, str(i).zfill(2), "predictions")
-            if not os.path.exists(sub_dir):
-                os.makedirs(sub_dir, exist_ok=True)
+        
+        # If sequences provided, create dirs for those; otherwise use default test sequences
+        if sequences:
+            for seq in sequences:
+                # Ensure sequence is 2 digits
+                if isinstance(seq, int):
+                    seq_str = str(seq).zfill(2)
+                else:
+                    seq_str = str(seq).zfill(2) if seq.isdigit() else seq
+                sub_dir = os.path.join(results_dir, seq_str, "predictions")
+                if not os.path.exists(sub_dir):
+                    os.makedirs(sub_dir, exist_ok=True)
+                print(f"  Created directory for sequence {seq_str}")
+        else:
+            # Default to standard test sequences
+            print("  No sequences detected, using default test sequences 11-21")
+            for i in range(11, 22):
+                sub_dir = os.path.join(results_dir, str(i).zfill(2), "predictions")
+                if not os.path.exists(sub_dir):
+                    os.makedirs(sub_dir, exist_ok=True)
     
     return results_dir
 
@@ -80,14 +124,18 @@ def save_predictions(sem_pred, ins_pred, batch, results_dir, dataset="KITTI"):
         
         if dataset == "KITTI":
             # Extract sequence and frame from filename
-            # Expected format: sequence_frame (e.g., "08_000000")
-            parts = fname.split('_')
-            if len(parts) == 2:
-                sequence = parts[0]
-                frame = parts[1]
-                save_path = os.path.join(results_dir, sequence, "predictions", f"{frame}.label")
+            # Expected format: sequence_frame (e.g., "0_000000" or "00_000000")
+            if '_' in fname:
+                parts = fname.split('_')
+                if len(parts) == 2:
+                    sequence = parts[0].zfill(2)  # Ensure 2-digit sequence
+                    frame = parts[1]
+                    save_path = os.path.join(results_dir, sequence, "predictions", f"{frame}.label")
+                else:
+                    # Fallback for unexpected format
+                    save_path = os.path.join(results_dir, f"{fname}.label")
             else:
-                # Fallback
+                # No underscore, might be just a number or other format
                 save_path = os.path.join(results_dir, f"{fname}.label")
         else:  # NUSCENES
             save_path = os.path.join(results_dir, f"{fname}.label")
@@ -391,14 +439,32 @@ def test_standalone_model(model_path, cfg, data_module, max_batches=None,
     print(f"  Things IDs: {model.things_ids}")
     print(f"  Num classes: {model.num_classes}")
     
+    # Get dataloader
+    dataloader = data_module.val_dataloader()
+    
+    # Detect sequences from the actual data
+    sequences = None
+    if cfg.MODEL.DATASET == "KITTI" and save_predictions_flag:
+        # First try to get from config
+        if hasattr(cfg, 'KITTI') and hasattr(cfg.KITTI, 'TEST'):
+            sequences = cfg.KITTI.TEST
+            # Convert to strings if they're integers
+            sequences = [str(s) for s in sequences]
+            print(f"\nTest sequences from config: {sequences}")
+        else:
+            # Detect from dataloader
+            print("\nDetecting sequences from dataloader...")
+            sequences = detect_sequences_from_dataloader(dataloader)
+            if sequences:
+                print(f"  Detected sequences: {sequences}")
+            else:
+                print("  Warning: Could not detect sequences from data")
+    
     # Create save directory if needed
     results_dir = None
     if save_predictions_flag:
-        results_dir = create_save_dirs(cfg.MODEL.DATASET, output_dir)
+        results_dir = create_save_dirs(cfg.MODEL.DATASET, output_dir, sequences)
         print(f"\nSaving predictions to: {results_dir}")
-    
-    # Get dataloader
-    dataloader = data_module.val_dataloader()
     
     # Setup evaluator
     dataset = cfg.MODEL.DATASET
@@ -427,6 +493,7 @@ def test_standalone_model(model_path, cfg, data_module, max_batches=None,
         total_batches = min(total_batches, max_batches)
     
     successful = 0
+    saved_count = 0
     
     with tqdm(total=total_batches, desc="Evaluating") as pbar:
         for i, batch in enumerate(dataloader):
@@ -466,6 +533,7 @@ def test_standalone_model(model_path, cfg, data_module, max_batches=None,
                 # Save predictions if requested
                 if save_predictions_flag and results_dir:
                     save_predictions(sem_pred, ins_pred, batch, results_dir, dataset)
+                    saved_count += batch_size
                 
                 # Prepare batch for evaluation
                 eval_batch = model.prepare_batch_for_eval(batch, sem_pred)
@@ -496,7 +564,8 @@ def test_standalone_model(model_path, cfg, data_module, max_batches=None,
                     pbar.set_postfix({
                         'PQ': f'{pq:.3f}',
                         'IoU': f'{iou:.3f}',
-                        'FPS': f'{stats["fps"]:.1f}'
+                        'FPS': f'{stats["fps"]:.1f}',
+                        'Saved': saved_count if save_predictions_flag else 0
                     })
                 except:
                     pass
@@ -522,7 +591,9 @@ def test_standalone_model(model_path, cfg, data_module, max_batches=None,
     evaluator.print_results()
     
     if save_predictions_flag:
-        print(f"\nPredictions saved to: {results_dir}")
+        print(f"\nSaved {saved_count} predictions to: {results_dir}")
+        if sequences:
+            print(f"Sequences processed: {sequences}")
     
     return {'PQ': pq, 'IoU': iou, 'RQ': rq, 'timing': timing_stats.get_stats()}
 
@@ -536,7 +607,9 @@ def test_standalone_model(model_path, cfg, data_module, max_batches=None,
 @click.option('--save-predictions', is_flag=True, help='Save predictions as .label files')
 @click.option('--output-dir', default=None, type=str, help='Output directory for predictions')
 @click.option('--warmup-batches', default=3, type=int, help='Number of warmup batches for timing')
-def main(model, dataset, batch_size, max_batches, num_workers, save_predictions, output_dir, warmup_batches):
+@click.option('--sequences', default=None, type=str, help='Comma-separated list of sequences (e.g., "0,1,2" or "00,01,02")')
+@click.option('--dataset-config', default=None, type=str, help='Path to dataset config YAML file')
+def main(model, dataset, batch_size, max_batches, num_workers, save_predictions, output_dir, warmup_batches, sequences, dataset_config):
     """Test standalone .pt model with timing and optional prediction saving"""
     
     print("="*60)
@@ -547,11 +620,34 @@ def main(model, dataset, batch_size, max_batches, num_workers, save_predictions,
     print(f"Batch size: {batch_size}")
     print(f"Save predictions: {save_predictions}")
     
+    # Parse sequences if provided
+    if sequences:
+        sequences = [s.strip() for s in sequences.split(',')]
+        print(f"Manual sequences: {sequences}")
+    
     # Load configuration
     cfg = get_config()
+    
+    # Load custom dataset config if provided
+    if dataset_config and os.path.exists(dataset_config):
+        print(f"Loading custom dataset config from: {dataset_config}")
+        custom_cfg = edict(yaml.safe_load(open(dataset_config)))
+        cfg.update(custom_cfg)
+    
     cfg.MODEL.DATASET = dataset
     cfg.TRAIN.BATCH_SIZE = batch_size
     cfg.TRAIN.NUM_WORKERS = num_workers
+    
+    # Override sequences in config if manually specified
+    if sequences and dataset == "KITTI":
+        if 'KITTI' not in cfg:
+            cfg.KITTI = edict()
+        cfg.KITTI.TEST = sequences
+        print(f"Overriding test sequences to: {sequences}")
+    
+    # Print detected test sequences
+    if dataset == "KITTI" and hasattr(cfg, 'KITTI') and hasattr(cfg.KITTI, 'TEST'):
+        print(f"Test sequences from config: {cfg.KITTI.TEST}")
     
     # Create data module
     print("\nSetting up dataset...")
