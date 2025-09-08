@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Exact replication of training inference with proper class mappings from YAML
+Extract model components directly without Lightning
 """
 
 import torch
@@ -10,381 +10,304 @@ import yaml
 from pathlib import Path
 from easydict import EasyDict as edict
 import click
-from tqdm import tqdm
-
-# Import the EXACT model used in training
-from mask_pls.models.dgcnn.maskpls_dgcnn_optimized import MaskPLSDGCNNFixed
-from mask_pls.datasets.semantic_dataset import SemanticDatasetModule
-from mask_pls.utils.evaluate_panoptic import PanopticEvaluator
 
 
-def get_things_stuff_from_yaml(yaml_path, dataset='KITTI'):
-    """
-    Extract things and stuff classes from the semantic YAML file
-    Based on the learning_map and typical KITTI/NuScenes class definitions
-    """
-    with open(yaml_path, 'r') as f:
-        data = yaml.safe_load(f)
+class DirectInferenceModel(nn.Module):
+    """Direct inference without Lightning dependencies"""
     
-    # Get the learning map inverse
-    learning_map_inv = data['learning_map_inv']
-    labels = data['labels']
-    
-    # Define which mapped classes are things vs stuff based on dataset
-    if dataset == 'KITTI':
-        # Mapped class IDs for things (have instances)
-        things_ids = [1, 2, 3, 4, 5, 6, 7, 8]  # car, bicycle, motorcycle, truck, other-vehicle, person, bicyclist, motorcyclist
-        stuff_ids = [9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]  # road, parking, sidewalk, etc.
-    else:  # NUSCENES
-        things_ids = [2, 3, 4, 5, 6, 7, 9, 10]  # bicycle, bus, car, construction_vehicle, motorcycle, pedestrian, trailer, truck
-        stuff_ids = [1, 8, 11, 12, 13, 14, 15, 16]  # barrier, traffic_cone, driveable_surface, etc.
-    
-    # Get the actual label names
-    things = []
-    stuff = []
-    
-    for mapped_id, original_id in learning_map_inv.items():
-        if mapped_id in things_ids:
-            label_name = labels[original_id]
-            # Clean up label name to match evaluator expectations
-            if dataset == 'KITTI':
-                things.append(label_name)
-            else:  # NUSCENES
-                # Map to simplified names used in evaluator
-                label_map = {
-                    'vehicle.bicycle': 'bicycle',
-                    'vehicle.bus.rigid': 'bus',
-                    'vehicle.car': 'car',
-                    'vehicle.construction': 'construction_vehicle',
-                    'vehicle.motorcycle': 'motorcycle',
-                    'human.pedestrian.adult': 'pedestrian',
-                    'pedestrian': 'pedestrian',
-                    'vehicle.trailer': 'trailer',
-                    'vehicle.truck': 'truck'
-                }
-                things.append(label_map.get(label_name, label_name))
-        elif mapped_id in stuff_ids:
-            label_name = labels[original_id]
-            # Clean up label name to match evaluator expectations
-            if dataset == 'NUSCENES':
-                label_map = {
-                    'movable_object.barrier': 'barrier',
-                    'barrier': 'barrier',
-                    'movable_object.trafficcone': 'traffic_cone',
-                    'traffic_cone': 'traffic_cone',
-                    'flat.driveable_surface': 'driveable_surface',
-                    'driveable_surface': 'driveable_surface',
-                    'flat.other': 'other_flat',
-                    'other_flat': 'other_flat',
-                    'flat.sidewalk': 'sidewalk',
-                    'sidewalk': 'sidewalk',
-                    'flat.terrain': 'terrain',
-                    'terrain': 'terrain',
-                    'static.manmade': 'manmade',
-                    'manmade': 'manmade',
-                    'static.vegetation': 'vegetation',
-                    'vegetation': 'vegetation'
-                }
-                stuff.append(label_map.get(label_name, label_name))
-            else:
-                stuff.append(label_name)
-    
-    return things, stuff, things_ids, stuff_ids
-
-
-class ImprovedPanopticEvaluator(PanopticEvaluator):
-    """Extended evaluator that loads things/stuff from YAML"""
-    
-    def __init__(self, cfg, dataset, yaml_path):
-        super().__init__(cfg, dataset)
-        
-        # Override the hardcoded things/stuff with YAML-based ones
-        self.things, self.stuff, self.things_ids_list, self.stuff_ids = get_things_stuff_from_yaml(yaml_path, dataset)
-        self.all_classes = self.things + self.stuff
-        
-        print(f"\nLoaded class mappings from {yaml_path}:")
-        print(f"  Things ({len(self.things)}): {self.things}")
-        print(f"  Things IDs: {self.things_ids_list}")
-        print(f"  Stuff ({len(self.stuff)}): {self.stuff}")
-        print(f"  Stuff IDs: {self.stuff_ids}")
-
-
-class ExactInferenceWrapper:
-    """Wrapper that uses the exact training model with proper class mappings"""
-    
-    def __init__(self, checkpoint_path, cfg, device='cuda'):
-        self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
-        self.cfg = cfg
+    def __init__(self, checkpoint_path, cfg):
+        super().__init__()
         
         print(f"Loading checkpoint: {checkpoint_path}")
         
-        # Create the EXACT model used in training
-        self.model = MaskPLSDGCNNFixed(cfg)
-        
         # Load checkpoint
         ckpt = torch.load(checkpoint_path, map_location='cpu')
+        state_dict = ckpt['state_dict'] if 'state_dict' in ckpt else ckpt
         
-        # Handle different checkpoint formats
-        if 'state_dict' in ckpt:
-            state_dict = ckpt['state_dict']
-        elif 'model_state_dict' in ckpt:
-            state_dict = ckpt['model_state_dict']
-        else:
-            state_dict = ckpt
-        
-        # Load state dict
-        missing_keys, unexpected_keys = self.model.load_state_dict(state_dict, strict=False)
-        
-        print(f"Loaded checkpoint:")
-        print(f"  Missing keys: {len(missing_keys)}")
-        print(f"  Unexpected keys: {len(unexpected_keys)}")
-        
-        if missing_keys and len(missing_keys) < 10:
-            print(f"  Missing: {missing_keys}")
-        
-        # Move to device and set to eval
-        self.model = self.model.to(self.device)
-        self.model.eval()
-        
-        # Load things_ids from YAML
+        # Setup configuration
         dataset = cfg.MODEL.DATASET
-        yaml_path = cfg[dataset].CONFIG
-        _, _, things_ids, _ = get_things_stuff_from_yaml(yaml_path, dataset)
-        self.model.things_ids = things_ids
+        self.num_classes = cfg[dataset].NUM_CLASSES
+        self.ignore_label = cfg[dataset].IGNORE_LABEL
+        self.things_ids = [1, 2, 3, 4, 5, 6, 7, 8] if dataset == 'KITTI' else [2, 3, 4, 5, 6, 7, 9, 10]
         
-        print(f"Set model.things_ids to: {self.model.things_ids}")
+        # Import ONLY the backbone and decoder (not the Lightning wrapper)
+        from mask_pls.models.dgcnn.dgcnn_backbone_efficient import FixedDGCNNBackbone
+        from mask_pls.models.decoder import MaskedTransformerDecoder
+        from mask_pls.models.loss import MaskLoss, SemLoss
         
-        # Verify weights are loaded
+        # Create components directly
+        print("Creating model components...")
+        self.backbone = FixedDGCNNBackbone(cfg.BACKBONE, None)
+        self.backbone.set_num_classes(self.num_classes)
+        
+        self.decoder = MaskedTransformerDecoder(
+            cfg.DECODER,
+            cfg.BACKBONE,
+            cfg[dataset]
+        )
+        
+        # Create loss modules (for panoptic inference logic)
+        self.mask_loss = MaskLoss(cfg.LOSS, cfg[dataset])
+        
+        # Load weights from checkpoint
+        print("Loading weights from checkpoint...")
+        self._load_weights_from_checkpoint(state_dict)
+        
+        self.eval()
+    
+    def _load_weights_from_checkpoint(self, state_dict):
+        """Load weights from checkpoint state dict"""
+        
+        # Load backbone weights
+        backbone_state = {}
+        decoder_state = {}
+        
+        for key, value in state_dict.items():
+            if key.startswith('backbone.'):
+                new_key = key.replace('backbone.', '')
+                backbone_state[new_key] = value
+            elif key.startswith('decoder.'):
+                new_key = key.replace('decoder.', '')
+                decoder_state[new_key] = value
+        
+        # Load into modules
+        if backbone_state:
+            missing, unexpected = self.backbone.load_state_dict(backbone_state, strict=False)
+            print(f"  Backbone: loaded {len(backbone_state)} params")
+            if missing:
+                print(f"    Missing keys: {len(missing)}")
+            if unexpected:
+                print(f"    Unexpected keys: {len(unexpected)}")
+        
+        if decoder_state:
+            missing, unexpected = self.decoder.load_state_dict(decoder_state, strict=False)
+            print(f"  Decoder: loaded {len(decoder_state)} params")
+            if missing:
+                print(f"    Missing keys: {len(missing)}")
+            if unexpected:
+                print(f"    Unexpected keys: {len(unexpected)}")
+        
+        # Verify critical weights are loaded
         self._verify_weights()
     
     def _verify_weights(self):
-        """Verify that weights are actually loaded"""
+        """Verify critical weights are non-zero"""
         print("\nVerifying loaded weights...")
         
-        # Check backbone weights
-        if hasattr(self.model, 'backbone'):
-            backbone = self.model.backbone
-            
-            # Check critical layers
-            checks = []
-            if hasattr(backbone, 'edge_conv1'):
-                weight = backbone.edge_conv1[0].weight
-                checks.append(('edge_conv1', weight.abs().max().item(), weight.abs().mean().item()))
-            
-            if hasattr(backbone, 'edge_conv2'):
-                weight = backbone.edge_conv2[0].weight
-                checks.append(('edge_conv2', weight.abs().max().item(), weight.abs().mean().item()))
-            
-            if hasattr(backbone, 'conv5'):
-                if isinstance(backbone.conv5, nn.Sequential):
-                    weight = backbone.conv5[0].weight
-                    checks.append(('conv5', weight.abs().max().item(), weight.abs().mean().item()))
-            
-            for name, max_val, mean_val in checks:
-                if max_val < 1e-6:
-                    print(f"  ❌ {name}: appears uninitialized (max={max_val:.6f})")
-                else:
-                    print(f"  ✓ {name}: max={max_val:.4f}, mean={mean_val:.4f}")
+        # Check backbone
+        critical_params = [
+            ('edge_conv1', self.backbone.edge_conv1[0].weight if hasattr(self.backbone, 'edge_conv1') else None),
+            ('edge_conv2', self.backbone.edge_conv2[0].weight if hasattr(self.backbone, 'edge_conv2') else None),
+            ('edge_conv3', self.backbone.edge_conv3[0].weight if hasattr(self.backbone, 'edge_conv3') else None),
+            ('edge_conv4', self.backbone.edge_conv4[0].weight if hasattr(self.backbone, 'edge_conv4') else None),
+        ]
         
-        # Check decoder weights
-        if hasattr(self.model, 'decoder'):
-            decoder = self.model.decoder
-            if hasattr(decoder, 'query_feat'):
-                weight = decoder.query_feat.weight
-                max_val = weight.abs().max().item()
-                mean_val = weight.abs().mean().item()
+        for name, param in critical_params:
+            if param is not None:
+                max_val = param.abs().max().item()
                 if max_val < 1e-6:
-                    print(f"  ❌ decoder.query_feat: appears uninitialized")
+                    print(f"  WARNING: {name} appears uninitialized!")
                 else:
-                    print(f"  ✓ decoder.query_feat: max={max_val:.4f}, mean={mean_val:.4f}")
+                    print(f"  ✓ {name}: max weight = {max_val:.4f}")
+        
+        # Check decoder
+        if hasattr(self.decoder, 'query_feat'):
+            max_val = self.decoder.query_feat.weight.abs().max().item()
+            print(f"  ✓ Decoder query_feat: max = {max_val:.4f}")
     
     @torch.no_grad()
-    def process_batch(self, batch):
-        """Process batch using exact training pipeline"""
+    def forward(self, batch_dict):
+        """
+        Forward pass matching the original model
+        Args:
+            batch_dict: Dictionary with 'pt_coord' and 'feats' lists
+        """
+        # Run through backbone
+        feats, coords, pad_masks, sem_logits = self.backbone(batch_dict)
         
-        # Use the model's forward method directly
-        outputs, padding, sem_logits = self.model(batch)
+        # Run through decoder
+        outputs, padding = self.decoder(feats, coords, pad_masks)
         
-        # Use the model's panoptic_inference method
-        sem_pred, ins_pred = self.model.panoptic_inference(outputs, padding)
+        return outputs, padding, sem_logits
+    
+    @torch.no_grad()
+    def inference(self, points, features):
+        """
+        Inference for single point cloud
+        Args:
+            points: numpy array or tensor [N, 3]
+            features: numpy array or tensor [N, 4]
+        """
+        # Convert to numpy if needed
+        if isinstance(points, torch.Tensor):
+            points = points.cpu().numpy()
+        if isinstance(features, torch.Tensor):
+            features = features.cpu().numpy()
+        
+        # Create batch dict
+        batch_dict = {
+            'pt_coord': [points],
+            'feats': [features]
+        }
+        
+        # Forward pass
+        outputs, padding, sem_logits = self.forward(batch_dict)
+        
+        # Process outputs for single sample
+        pred_logits = outputs['pred_logits'][0]  # [Q, C+1]
+        pred_masks = outputs['pred_masks'][0]    # [N, Q]
+        sem_logits = sem_logits[0]               # [N, C]
+        padding = padding[0]                      # [N]
+        
+        return pred_logits, pred_masks, sem_logits, padding
+    
+    def panoptic_inference(self, outputs, padding):
+        """Panoptic segmentation inference (from original model)"""
+        mask_cls = outputs["pred_logits"]
+        mask_pred = outputs["pred_masks"]
+        
+        batch_size = mask_cls.shape[0]
+        sem_pred = []
+        ins_pred = []
+        
+        for b in range(batch_size):
+            valid_mask = ~padding[b]
+            num_valid = valid_mask.sum().item()
+            
+            if num_valid == 0:
+                sem_pred.append(np.zeros(0, dtype=np.int32))
+                ins_pred.append(np.zeros(0, dtype=np.int32))
+                continue
+            
+            scores, labels = mask_cls[b].max(-1)
+            
+            # Handle mask dimensions
+            if mask_pred.dim() == 3:
+                if mask_pred.shape[1] == mask_cls.shape[1]:  # [B, Q, N]
+                    mask_pred_b = mask_pred[b].transpose(0, 1)  # [N, Q]
+                else:  # [B, N, Q]
+                    mask_pred_b = mask_pred[b]
+            else:
+                mask_pred_b = mask_pred[b]
+            
+            # Extract valid points
+            mask_pred_b = mask_pred_b[valid_mask].sigmoid()
+            
+            # Filter valid predictions
+            keep = labels.ne(self.num_classes)
+            
+            if keep.sum() == 0:
+                sem_pred.append(np.zeros(num_valid, dtype=np.int32))
+                ins_pred.append(np.zeros(num_valid, dtype=np.int32))
+                continue
+            
+            # Get valid queries
+            keep_indices = torch.where(keep)[0]
+            cur_scores = scores[keep_indices]
+            cur_classes = labels[keep_indices]
+            cur_masks = mask_pred_b[:, keep_indices]
+            
+            # Weighted masks
+            cur_prob_masks = cur_scores.unsqueeze(0) * cur_masks
+            
+            # Initialize outputs
+            semantic_seg = torch.zeros(num_valid, dtype=torch.int32, device=cur_masks.device)
+            instance_seg = torch.zeros(num_valid, dtype=torch.int32, device=cur_masks.device)
+            
+            if cur_masks.shape[1] > 0:
+                cur_mask_ids = cur_prob_masks.argmax(1)
+                
+                current_segment_id = 0
+                stuff_memory_list = {}
+                
+                for k in range(cur_classes.shape[0]):
+                    pred_class = cur_classes[k].item()
+                    isthing = pred_class in self.things_ids
+                    
+                    mask = (cur_mask_ids == k) & (cur_masks[:, k] >= 0.5)
+                    mask_area = mask.sum().item()
+                    
+                    if mask_area > 0:
+                        semantic_seg[mask] = pred_class
+                        
+                        if isthing:
+                            current_segment_id += 1
+                            instance_seg[mask] = current_segment_id
+                        else:
+                            if pred_class not in stuff_memory_list:
+                                current_segment_id += 1
+                                stuff_memory_list[pred_class] = current_segment_id
+            
+            sem_pred.append(semantic_seg.cpu().numpy())
+            ins_pred.append(instance_seg.cpu().numpy())
         
         return sem_pred, ins_pred
-    
-    def test_single_batch(self, batch):
-        """Test a single batch and print detailed diagnostics"""
-        print("\nTesting single batch...")
-        
-        # Get predictions
-        with torch.no_grad():
-            outputs, padding, sem_logits = self.model(batch)
-        
-        print(f"Output shapes:")
-        print(f"  pred_logits: {outputs['pred_logits'].shape}")
-        print(f"  pred_masks: {outputs['pred_masks'].shape}")
-        print(f"  sem_logits: {sem_logits.shape}")
-        
-        # Check values
-        print(f"\nOutput statistics:")
-        print(f"  pred_logits: min={outputs['pred_logits'].min():.3f}, max={outputs['pred_logits'].max():.3f}")
-        print(f"  pred_masks: min={outputs['pred_masks'].min():.3f}, max={outputs['pred_masks'].max():.3f}")
-        print(f"  sem_logits: min={sem_logits.min():.3f}, max={sem_logits.max():.3f}")
-        
-        # Check semantic predictions
-        sem_pred = torch.argmax(sem_logits[0], dim=-1)
-        unique_classes, counts = torch.unique(sem_pred[~padding[0]], return_counts=True)
-        
-        print(f"\nSemantic predictions:")
-        for cls, cnt in zip(unique_classes, counts):
-            print(f"  Class {cls}: {cnt} points")
-        
-        # Check if predictions are reasonable
-        if len(unique_classes) == 1:
-            print("  ⚠️ WARNING: Only predicting a single class!")
-        
-        if outputs['pred_logits'].abs().max() < 0.1:
-            print("  ⚠️ WARNING: pred_logits values are very small!")
-        
-        # Get panoptic predictions
-        sem_pred, ins_pred = self.model.panoptic_inference(outputs, padding)
-        
-        print(f"\nPanoptic predictions:")
-        for i, (sp, ip) in enumerate(zip(sem_pred, ins_pred)):
-            unique_sem = np.unique(sp)
-            unique_ins = np.unique(ip)
-            print(f"  Sample {i}: {len(unique_sem)} semantic classes, {len(unique_ins)} instances")
 
 
-def evaluate_with_exact_model(checkpoint_path, cfg, dataloader, max_batches=None):
-    """Evaluate using exact training model with proper class mappings"""
+def save_model(checkpoint_path, output_path, cfg):
+    """Save model for inference"""
     
-    # Create wrapper
-    wrapper = ExactInferenceWrapper(checkpoint_path, cfg)
+    # Create model
+    model = DirectInferenceModel(checkpoint_path, cfg)
+    model.eval()
     
-    # Test on one batch first
-    print("\n" + "="*60)
-    print("Testing on single batch...")
-    print("="*60)
+    # Test the model
+    print("\nTesting model...")
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = model.to(device)
     
-    for batch in dataloader:
-        wrapper.test_single_batch(batch)
-        break
+    # Test input
+    test_points = np.random.randn(5000, 3).astype(np.float32) * 20
+    test_features = np.random.randn(5000, 4).astype(np.float32)
+    test_features[:, :3] = test_points
     
-    # Setup evaluator with YAML-based class mappings
-    dataset = cfg.MODEL.DATASET
-    yaml_path = cfg[dataset].CONFIG
-    evaluator = ImprovedPanopticEvaluator(cfg[dataset], dataset, yaml_path)
-    evaluator.reset()
+    with torch.no_grad():
+        pred_logits, pred_masks, sem_logits, padding = model.inference(test_points, test_features)
     
-    # Evaluation loop
-    print("\n" + "="*60)
-    print("Starting full evaluation...")
-    print("="*60)
+    print(f"Test output shapes:")
+    print(f"  pred_logits: {pred_logits.shape}")
+    print(f"  pred_masks: {pred_masks.shape}")
+    print(f"  sem_logits: {sem_logits.shape}")
     
-    total_batches = len(dataloader)
-    if max_batches:
-        total_batches = min(total_batches, max_batches)
+    # Check outputs
+    sem_pred = torch.argmax(sem_logits, dim=-1)
+    unique_classes = torch.unique(sem_pred[~padding])
+    print(f"Predicted classes: {unique_classes.cpu().numpy()}")
     
-    successful = 0
-    failed = 0
+    # Save
+    print(f"\nSaving model to {output_path}")
+    torch.save({
+        'model_state_dict': model.state_dict(),
+        'backbone_state_dict': model.backbone.state_dict(),
+        'decoder_state_dict': model.decoder.state_dict(),
+        'config': cfg,
+        'model_class': 'DirectInferenceModel'
+    }, output_path)
     
-    with tqdm(total=total_batches, desc="Evaluating") as pbar:
-        for i, batch in enumerate(dataloader):
-            if max_batches and i >= max_batches:
-                break
-            
-            try:
-                # Process batch
-                sem_pred, ins_pred = wrapper.process_batch(batch)
-                
-                # Fix size mismatches
-                for j in range(len(batch['sem_label'])):
-                    gt_sem = batch['sem_label'][j]
-                    gt_ins = batch['ins_label'][j]
-                    
-                    if isinstance(gt_sem, np.ndarray):
-                        gt_sem = gt_sem.reshape(-1)
-                    if isinstance(gt_ins, np.ndarray):
-                        gt_ins = gt_ins.reshape(-1)
-                    
-                    if j < len(sem_pred):
-                        pred_size = len(sem_pred[j])
-                        gt_size = len(gt_sem)
-                        
-                        if pred_size != gt_size:
-                            min_size = min(pred_size, gt_size)
-                            sem_pred[j] = sem_pred[j][:min_size]
-                            ins_pred[j] = ins_pred[j][:min_size]
-                            batch['sem_label'][j] = gt_sem[:min_size]
-                            batch['ins_label'][j] = gt_ins[:min_size]
-                
-                # Update evaluator
-                evaluator.update(sem_pred, ins_pred, batch)
-                successful += 1
-                
-            except Exception as e:
-                print(f"\nError in batch {i}: {e}")
-                failed += 1
-                if failed < 3:
-                    import traceback
-                    traceback.print_exc()
-            
-            pbar.update(1)
-            
-            # Show metrics periodically
-            if successful > 0 and successful % 10 == 0:
-                try:
-                    pq = evaluator.get_mean_pq()
-                    iou = evaluator.get_mean_iou()
-                    rq = evaluator.get_mean_rq()
-                    pbar.set_postfix({
-                        'PQ': f'{pq:.3f}',
-                        'IoU': f'{iou:.3f}',
-                        'RQ': f'{rq:.3f}'
-                    })
-                except:
-                    pass
+    print(f"✓ Model saved successfully")
+    print(f"File size: {Path(output_path).stat().st_size / 1024 / 1024:.2f} MB")
     
-    print(f"\nProcessed {successful}/{total_batches} batches successfully")
-    
-    if successful == 0:
-        print("No batches were processed successfully!")
-        return None
-    
-    # Final metrics
-    print("\n" + "="*60)
-    print("Final Evaluation Metrics")
-    print("="*60)
-    
-    pq = evaluator.get_mean_pq()
-    iou = evaluator.get_mean_iou()
-    rq = evaluator.get_mean_rq()
-    
-    print(f"PQ (Panoptic Quality): {pq:.4f}")
-    print(f"IoU (Mean IoU): {iou:.4f}")
-    print(f"RQ (Recognition Quality): {rq:.4f}")
-    
-    evaluator.print_results()
-    
-    return {'PQ': pq, 'IoU': iou, 'RQ': rq}
+    return model
 
 
 @click.command()
-@click.option('--checkpoint', required=True, help='Path to checkpoint (.ckpt or .pth)')
-@click.option('--dataset', default='KITTI', type=click.Choice(['KITTI', 'NUSCENES']))
-@click.option('--batch-size', default=1, type=int)
-@click.option('--max-batches', type=int, help='Max batches to evaluate')
-@click.option('--num-workers', default=4, type=int)
-def main(checkpoint, dataset, batch_size, max_batches, num_workers):
-    """Evaluate using exact training model with proper YAML class mappings"""
+@click.option('--checkpoint', required=True, help='Path to checkpoint')
+@click.option('--output', default='model_direct.pth', help='Output file')
+@click.option('--config', help='Config directory path')
+def main(checkpoint, output, config):
+    """Extract model without Lightning"""
     
     print("="*60)
-    print("Model Evaluation with YAML Class Mappings")
+    print("Direct Model Extraction (No Lightning)")
     print("="*60)
     
     # Load configuration
-    config_dir = Path(__file__).parent.parent / "config"
-    cfg = edict()
+    if config:
+        config_dir = Path(config)
+    else:
+        config_dir = Path(__file__).parent.parent / "config"
     
+    cfg = edict()
     for config_file in ['model.yaml', 'backbone.yaml', 'decoder.yaml']:
         config_path = config_dir / config_file
         if config_path.exists():
@@ -392,38 +315,10 @@ def main(checkpoint, dataset, batch_size, max_batches, num_workers):
                 cfg.update(yaml.safe_load(f))
             print(f"✓ Loaded: {config_path}")
     
-    # Load dataset-specific config
-    dataset_config = Path(__file__).parent.parent / "datasets" / f"semantic-{dataset.lower()}.yaml"
-    if dataset_config.exists():
-        print(f"✓ Using dataset config: {dataset_config}")
+    # Save model
+    model = save_model(checkpoint, output, cfg)
     
-    # Update config
-    cfg.MODEL.DATASET = dataset
-    cfg.TRAIN.BATCH_SIZE = batch_size
-    cfg.TRAIN.NUM_WORKERS = num_workers
-    
-    # Create data module
-    print("\nSetting up dataset...")
-    data_module = SemanticDatasetModule(cfg)
-    data_module.setup()
-    
-    # Set things_ids from YAML to data module
-    yaml_path = cfg[dataset].CONFIG
-    _, _, things_ids, _ = get_things_stuff_from_yaml(yaml_path, dataset)
-    data_module.things_ids = things_ids
-    
-    dataloader = data_module.val_dataloader()
-    
-    # Evaluate
-    metrics = evaluate_with_exact_model(checkpoint, cfg, dataloader, max_batches)
-    
-    if metrics:
-        print(f"\n" + "="*60)
-        print(f"Final Results:")
-        print(f"  PQ = {metrics['PQ']:.4f}")
-        print(f"  IoU = {metrics['IoU']:.4f}")
-        print(f"  RQ = {metrics['RQ']:.4f}")
-        print("="*60)
+    print("\n✓ Export complete!")
 
 
 if __name__ == "__main__":

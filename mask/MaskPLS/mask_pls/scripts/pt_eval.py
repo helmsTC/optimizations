@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Exact replication of training inference - no modifications
+Exact replication of training inference with proper class mappings from YAML
 """
 
 import torch
@@ -18,11 +18,103 @@ from mask_pls.datasets.semantic_dataset import SemanticDatasetModule
 from mask_pls.utils.evaluate_panoptic import PanopticEvaluator
 
 
+def get_things_stuff_from_yaml(yaml_path, dataset='KITTI'):
+    """
+    Extract things and stuff classes from the semantic YAML file
+    Based on the learning_map and typical KITTI/NuScenes class definitions
+    """
+    with open(yaml_path, 'r') as f:
+        data = yaml.safe_load(f)
+    
+    # Get the learning map inverse
+    learning_map_inv = data['learning_map_inv']
+    labels = data['labels']
+    
+    # Define which mapped classes are things vs stuff based on dataset
+    if dataset == 'KITTI':
+        # Mapped class IDs for things (have instances)
+        things_ids = [1, 2, 3, 4, 5, 6, 7, 8]  # car, bicycle, motorcycle, truck, other-vehicle, person, bicyclist, motorcyclist
+        stuff_ids = [9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]  # road, parking, sidewalk, etc.
+    else:  # NUSCENES
+        things_ids = [2, 3, 4, 5, 6, 7, 9, 10]  # bicycle, bus, car, construction_vehicle, motorcycle, pedestrian, trailer, truck
+        stuff_ids = [1, 8, 11, 12, 13, 14, 15, 16]  # barrier, traffic_cone, driveable_surface, etc.
+    
+    # Get the actual label names
+    things = []
+    stuff = []
+    
+    for mapped_id, original_id in learning_map_inv.items():
+        if mapped_id in things_ids:
+            label_name = labels[original_id]
+            # Clean up label name to match evaluator expectations
+            if dataset == 'KITTI':
+                things.append(label_name)
+            else:  # NUSCENES
+                # Map to simplified names used in evaluator
+                label_map = {
+                    'vehicle.bicycle': 'bicycle',
+                    'vehicle.bus.rigid': 'bus',
+                    'vehicle.car': 'car',
+                    'vehicle.construction': 'construction_vehicle',
+                    'vehicle.motorcycle': 'motorcycle',
+                    'human.pedestrian.adult': 'pedestrian',
+                    'pedestrian': 'pedestrian',
+                    'vehicle.trailer': 'trailer',
+                    'vehicle.truck': 'truck'
+                }
+                things.append(label_map.get(label_name, label_name))
+        elif mapped_id in stuff_ids:
+            label_name = labels[original_id]
+            # Clean up label name to match evaluator expectations
+            if dataset == 'NUSCENES':
+                label_map = {
+                    'movable_object.barrier': 'barrier',
+                    'barrier': 'barrier',
+                    'movable_object.trafficcone': 'traffic_cone',
+                    'traffic_cone': 'traffic_cone',
+                    'flat.driveable_surface': 'driveable_surface',
+                    'driveable_surface': 'driveable_surface',
+                    'flat.other': 'other_flat',
+                    'other_flat': 'other_flat',
+                    'flat.sidewalk': 'sidewalk',
+                    'sidewalk': 'sidewalk',
+                    'flat.terrain': 'terrain',
+                    'terrain': 'terrain',
+                    'static.manmade': 'manmade',
+                    'manmade': 'manmade',
+                    'static.vegetation': 'vegetation',
+                    'vegetation': 'vegetation'
+                }
+                stuff.append(label_map.get(label_name, label_name))
+            else:
+                stuff.append(label_name)
+    
+    return things, stuff, things_ids, stuff_ids
+
+
+class ImprovedPanopticEvaluator(PanopticEvaluator):
+    """Extended evaluator that loads things/stuff from YAML"""
+    
+    def __init__(self, cfg, dataset, yaml_path):
+        super().__init__(cfg, dataset)
+        
+        # Override the hardcoded things/stuff with YAML-based ones
+        self.things, self.stuff, self.things_ids_list, self.stuff_ids = get_things_stuff_from_yaml(yaml_path, dataset)
+        self.all_classes = self.things + self.stuff
+        
+        print(f"\nLoaded class mappings from {yaml_path}:")
+        print(f"  Things ({len(self.things)}): {self.things}")
+        print(f"  Things IDs: {self.things_ids_list}")
+        print(f"  Stuff ({len(self.stuff)}): {self.stuff}")
+        print(f"  Stuff IDs: {self.stuff_ids}")
+
+
 class ExactInferenceWrapper:
-    """Wrapper that uses the exact training model"""
+    """Wrapper that uses the exact training model with proper class mappings"""
     
     def __init__(self, checkpoint_path, cfg, device='cuda'):
         self.device = torch.device(device if torch.cuda.is_available() else 'cpu')
+        self.cfg = cfg
         
         print(f"Loading checkpoint: {checkpoint_path}")
         
@@ -31,7 +123,14 @@ class ExactInferenceWrapper:
         
         # Load checkpoint
         ckpt = torch.load(checkpoint_path, map_location='cpu')
-        state_dict = ckpt['state_dict'] if 'state_dict' in ckpt else ckpt
+        
+        # Handle different checkpoint formats
+        if 'state_dict' in ckpt:
+            state_dict = ckpt['state_dict']
+        elif 'model_state_dict' in ckpt:
+            state_dict = ckpt['model_state_dict']
+        else:
+            state_dict = ckpt
         
         # Load state dict
         missing_keys, unexpected_keys = self.model.load_state_dict(state_dict, strict=False)
@@ -40,20 +139,20 @@ class ExactInferenceWrapper:
         print(f"  Missing keys: {len(missing_keys)}")
         print(f"  Unexpected keys: {len(unexpected_keys)}")
         
-        if missing_keys:
-            print(f"  First 5 missing: {missing_keys[:5]}")
+        if missing_keys and len(missing_keys) < 10:
+            print(f"  Missing: {missing_keys}")
         
         # Move to device and set to eval
         self.model = self.model.to(self.device)
         self.model.eval()
         
-        # Set things_ids if not set
-        if not hasattr(self.model, 'things_ids') or not self.model.things_ids:
-            dataset = cfg.MODEL.DATASET
-            if dataset == 'KITTI':
-                self.model.things_ids = [1, 2, 3, 4, 5, 6, 7, 8]
-            else:
-                self.model.things_ids = [2, 3, 4, 5, 6, 7, 9, 10]
+        # Load things_ids from YAML
+        dataset = cfg.MODEL.DATASET
+        yaml_path = cfg[dataset].CONFIG
+        _, _, things_ids, _ = get_things_stuff_from_yaml(yaml_path, dataset)
+        self.model.things_ids = things_ids
+        
+        print(f"Set model.things_ids to: {self.model.things_ids}")
         
         # Verify weights are loaded
         self._verify_weights()
@@ -156,7 +255,7 @@ class ExactInferenceWrapper:
 
 
 def evaluate_with_exact_model(checkpoint_path, cfg, dataloader, max_batches=None):
-    """Evaluate using exact training model"""
+    """Evaluate using exact training model with proper class mappings"""
     
     # Create wrapper
     wrapper = ExactInferenceWrapper(checkpoint_path, cfg)
@@ -170,9 +269,10 @@ def evaluate_with_exact_model(checkpoint_path, cfg, dataloader, max_batches=None
         wrapper.test_single_batch(batch)
         break
     
-    # Setup evaluator
+    # Setup evaluator with YAML-based class mappings
     dataset = cfg.MODEL.DATASET
-    evaluator = PanopticEvaluator(cfg[dataset], dataset)
+    yaml_path = cfg[dataset].CONFIG
+    evaluator = ImprovedPanopticEvaluator(cfg[dataset], dataset, yaml_path)
     evaluator.reset()
     
     # Evaluation loop
@@ -230,7 +330,7 @@ def evaluate_with_exact_model(checkpoint_path, cfg, dataloader, max_batches=None
             
             pbar.update(1)
             
-            # Show metrics
+            # Show metrics periodically
             if successful > 0 and successful % 10 == 0:
                 try:
                     pq = evaluator.get_mean_pq()
@@ -269,16 +369,16 @@ def evaluate_with_exact_model(checkpoint_path, cfg, dataloader, max_batches=None
 
 
 @click.command()
-@click.option('--checkpoint', required=True, help='Path to checkpoint')
+@click.option('--checkpoint', required=True, help='Path to checkpoint (.ckpt or .pth)')
 @click.option('--dataset', default='KITTI', type=click.Choice(['KITTI', 'NUSCENES']))
 @click.option('--batch-size', default=1, type=int)
 @click.option('--max-batches', type=int, help='Max batches to evaluate')
 @click.option('--num-workers', default=4, type=int)
 def main(checkpoint, dataset, batch_size, max_batches, num_workers):
-    """Evaluate using exact training model"""
+    """Evaluate using exact training model with proper YAML class mappings"""
     
     print("="*60)
-    print("Exact Model Evaluation (No Export)")
+    print("Model Evaluation with YAML Class Mappings")
     print("="*60)
     
     # Load configuration
@@ -292,6 +392,11 @@ def main(checkpoint, dataset, batch_size, max_batches, num_workers):
                 cfg.update(yaml.safe_load(f))
             print(f"✓ Loaded: {config_path}")
     
+    # Load dataset-specific config
+    dataset_config = Path(__file__).parent.parent / "datasets" / f"semantic-{dataset.lower()}.yaml"
+    if dataset_config.exists():
+        print(f"✓ Using dataset config: {dataset_config}")
+    
     # Update config
     cfg.MODEL.DATASET = dataset
     cfg.TRAIN.BATCH_SIZE = batch_size
@@ -301,6 +406,12 @@ def main(checkpoint, dataset, batch_size, max_batches, num_workers):
     print("\nSetting up dataset...")
     data_module = SemanticDatasetModule(cfg)
     data_module.setup()
+    
+    # Set things_ids from YAML to data module
+    yaml_path = cfg[dataset].CONFIG
+    _, _, things_ids, _ = get_things_stuff_from_yaml(yaml_path, dataset)
+    data_module.things_ids = things_ids
+    
     dataloader = data_module.val_dataloader()
     
     # Evaluate
