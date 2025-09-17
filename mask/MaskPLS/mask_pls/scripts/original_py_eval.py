@@ -332,9 +332,17 @@ def test_model(model_path, cfg, data_module, max_batches=None,
             elif isinstance(checkpoint[key], dict):
                 print(f"  {key}: dict with {len(checkpoint[key])} items")
     
-    # Get configuration and metadata
-    if 'config' in checkpoint:
-        cfg = checkpoint['config']
+    # Handle configuration - use the passed cfg, only override if checkpoint has valid config
+    if 'config' in checkpoint and isinstance(checkpoint['config'], dict):
+        # Only use checkpoint config if it's a valid dict/edict
+        if hasattr(checkpoint['config'], 'get') or isinstance(checkpoint['config'], dict):
+            cfg_from_checkpoint = checkpoint['config']
+            # Update the passed cfg with checkpoint values if needed
+            if isinstance(cfg_from_checkpoint, dict):
+                for key in ['MODEL', 'BACKBONE', 'DECODER']:
+                    if key in cfg_from_checkpoint and key in cfg:
+                        cfg[key].update(cfg_from_checkpoint[key])
+    # Otherwise keep using the cfg passed to the function
     
     things_ids = checkpoint.get('things_ids', data_module.things_ids)
     print(f"\nUsing things_ids: {things_ids}")
