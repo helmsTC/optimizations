@@ -332,23 +332,44 @@ def test_model(model_path, cfg, data_module, max_batches=None,
             elif isinstance(checkpoint[key], dict):
                 print(f"  {key}: dict with {len(checkpoint[key])} items")
     
-    # Handle configuration - use the passed cfg, only override if checkpoint has valid config
-    if 'config' in checkpoint and isinstance(checkpoint['config'], dict):
-        # Only use checkpoint config if it's a valid dict/edict
-        if hasattr(checkpoint['config'], 'get') or isinstance(checkpoint['config'], dict):
-            cfg_from_checkpoint = checkpoint['config']
-            # Update the passed cfg with checkpoint values if needed
-            if isinstance(cfg_from_checkpoint, dict):
-                for key in ['MODEL', 'BACKBONE', 'DECODER']:
-                    if key in cfg_from_checkpoint and key in cfg:
-                        cfg[key].update(cfg_from_checkpoint[key])
-    # Otherwise keep using the cfg passed to the function
+    # Handle configuration properly
+    # Always use the passed cfg as base, don't replace it
+    model_cfg = cfg  # Use the configuration passed to the function
+    
+    # Get dataset name
+    dataset = model_cfg.MODEL.DATASET if hasattr(model_cfg, 'MODEL') and hasattr(model_cfg.MODEL, 'DATASET') else 'KITTI'
+    
+    # Ensure dataset config exists
+    if dataset not in model_cfg:
+        # Create dataset configuration if missing
+        if dataset == 'KITTI':
+            model_cfg[dataset] = edict({
+                'PATH': 'data/kitti',
+                'CONFIG': 'mask_pls/datasets/semantic-kitti.yaml',
+                'NUM_CLASSES': 20,
+                'IGNORE_LABEL': 0,
+                'MIN_POINTS': 10,
+                'SPACE': [[-48.0, 48.0], [-48.0, 48.0], [-4.0, 1.5]],
+                'SUB_NUM_POINTS': 80000
+            })
+        elif dataset == 'NUSCENES':
+            model_cfg[dataset] = edict({
+                'PATH': 'data/nuscenes',
+                'CONFIG': 'mask_pls/datasets/semantic-nuscenes.yaml',
+                'NUM_CLASSES': 17,
+                'IGNORE_LABEL': 0,
+                'MIN_POINTS': 10,
+                'SPACE': [[-50.0, 50.0], [-50.0, 50.0], [-5.0, 3]],
+                'SUB_NUM_POINTS': 50000
+            })
+    
+    dataset_cfg = model_cfg[dataset]
     
     things_ids = checkpoint.get('things_ids', data_module.things_ids)
     print(f"\nUsing things_ids: {things_ids}")
     
     # Create model
-    model = OriginalStandaloneModel(cfg, things_ids)
+    model = OriginalStandaloneModel(model_cfg, things_ids)
     
     # Load weights
     if 'model_state_dict' in checkpoint:
@@ -371,6 +392,7 @@ def test_model(model_path, cfg, data_module, max_batches=None,
     print(f"\nModel Configuration:")
     print(f"  Device: {device}")
     print(f"  Architecture: MinkowskiEngine")
+    print(f"  Dataset: {dataset}")
     print(f"  Num classes: {model.num_classes}")
     print(f"  Overlap threshold: {model.overlap_threshold}")
     
@@ -386,12 +408,11 @@ def test_model(model_path, cfg, data_module, max_batches=None,
             if hasattr(dataset_obj, 'split'):
                 sequences = dataset_obj.split.get('valid', None)
         
-        results_dir = create_save_dirs(cfg.MODEL.DATASET, output_dir, sequences)
+        results_dir = create_save_dirs(dataset, output_dir, sequences)
         print(f"\nSaving predictions to: {results_dir}")
     
-    # Setup evaluator
-    dataset = cfg.MODEL.DATASET
-    evaluator = PanopticEvaluator(cfg[dataset], dataset)
+    # Setup evaluator with proper configuration
+    evaluator = PanopticEvaluator(dataset_cfg, dataset)
     evaluator.reset()
     
     # Get class inverse lookup table
