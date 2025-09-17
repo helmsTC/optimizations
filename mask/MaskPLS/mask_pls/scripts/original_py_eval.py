@@ -341,11 +341,31 @@ def test_model(model_path, cfg, data_module, max_batches=None,
     
     # Ensure dataset config exists
     if dataset not in model_cfg:
+        # Try to find the semantic config file
+        config_file = None
+        possible_paths = [
+            f'../original/MaskPLS/mask_pls/datasets/semantic-{dataset.lower()}.yaml',
+            f'mask_pls/datasets/semantic-{dataset.lower()}.yaml',
+            f'../original/MaskPLS/mask_pls/datasets/semantic-kitti.yaml',
+            f'mask_pls/datasets/semantic-kitti.yaml'
+        ]
+        
+        import os
+        for path in possible_paths:
+            full_path = os.path.join(os.path.dirname(__file__), path)
+            if os.path.exists(full_path):
+                config_file = full_path
+                break
+        
+        if not config_file:
+            # Use first path as fallback
+            config_file = possible_paths[0]
+        
         # Create dataset configuration if missing
         if dataset == 'KITTI':
             model_cfg[dataset] = edict({
                 'PATH': 'data/kitti',
-                'CONFIG': 'mask_pls/datasets/semantic-kitti.yaml',
+                'CONFIG': config_file,
                 'NUM_CLASSES': 20,
                 'IGNORE_LABEL': 0,
                 'MIN_POINTS': 10,
@@ -355,7 +375,7 @@ def test_model(model_path, cfg, data_module, max_batches=None,
         elif dataset == 'NUSCENES':
             model_cfg[dataset] = edict({
                 'PATH': 'data/nuscenes',
-                'CONFIG': 'mask_pls/datasets/semantic-nuscenes.yaml',
+                'CONFIG': config_file,
                 'NUM_CLASSES': 17,
                 'IGNORE_LABEL': 0,
                 'MIN_POINTS': 10,
@@ -403,10 +423,24 @@ def test_model(model_path, cfg, data_module, max_batches=None,
     results_dir = None
     if save_predictions_flag:
         sequences = None
-        if hasattr(data_module, 'val_mask_set'):
-            dataset_obj = data_module.val_mask_set.dataset
-            if hasattr(dataset_obj, 'split'):
-                sequences = dataset_obj.split.get('valid', None)
+        try:
+            if hasattr(data_module, 'val_mask_set') and hasattr(data_module.val_mask_set, 'dataset'):
+                dataset_obj = data_module.val_mask_set.dataset
+                if hasattr(dataset_obj, 'split'):
+                    split_data = dataset_obj.split
+                    # Handle different types of split data
+                    if isinstance(split_data, dict) and 'valid' in split_data:
+                        sequences = split_data['valid']
+                    elif isinstance(split_data, str):
+                        # If split is a string like 'valid', use default sequences
+                        sequences = None
+                    elif isinstance(split_data, list):
+                        # If split is already a list of sequences
+                        sequences = split_data
+        except Exception as e:
+            print(f"  Note: Could not detect sequences from dataset: {e}")
+            sequences = None
+        
         
         results_dir = create_save_dirs(dataset, output_dir, sequences)
         print(f"\nSaving predictions to: {results_dir}")
